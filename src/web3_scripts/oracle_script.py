@@ -76,7 +76,7 @@ def _run_oracle_validation(
         source_nonces[0] != target_nonces[1] or source_nonces[1] != target_nonces[0]
     )
     almost_expired = remaining_time <= oracle_expiry_threshold_seconds
-    incorrect_value = oracle_value != secure_value
+    incorrect_value = is_oracle_value_incorrect(oracle_value, secure_value)
 
     recently_updated = (
         timestamp - oracle.lastUpdated().call()

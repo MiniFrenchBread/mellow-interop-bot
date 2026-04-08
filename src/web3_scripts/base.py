@@ -7,6 +7,12 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 BLOCK_GAP = 10000
 SECURE_INTERVAL = 15
+ORACLE_VALUE_TOLERANCE = 10**9  # 1 gwei
+
+
+def is_oracle_value_incorrect(oracle_value: int, actual_value: int, tolerance: int = ORACLE_VALUE_TOLERANCE) -> bool:
+    """Returns True if oracle_value deviates from actual_value beyond tolerance."""
+    return abs(oracle_value - actual_value) > tolerance
 
 
 def add_color(text: str, color="yellow") -> str:
