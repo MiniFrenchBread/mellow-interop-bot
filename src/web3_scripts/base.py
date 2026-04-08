@@ -113,7 +113,7 @@ def get_block_before_timestamp(w3: Web3, timestamp: int) -> int:
             prev_block = w3.eth.get_block(block.number - 1)
             if prev_block.timestamp <= timestamp:
                 return prev_block.number
-            block = prev_block
+            block = prev_bloc
     else:
         while block.timestamp <= timestamp:
             if block.number == latest_block.number:

@@ -5,73 +5,25 @@
   "telegram-proposal-message-prefix": "${TELEGRAM_PROPOSAL_MESSAGE_PREFIX}",
   "oracle-expiry-threshold-seconds": "${ORACLE_EXPIRY_THRESHOLD_SECONDS:3600}",
   "oracle-recent-update-threshold-seconds": "${ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS:0}",
-  "target-rpc": "${TARGET_RPC:https://eth.drpc.org}",
-  "target-core-helper": "0x649f34cfdc9bcaea43fe61b17ecfd601b444f45b",
+  "target-rpc": "${TARGET_RPC:}",
+  "target-core-helper": "0xb417a4a14047281608F83414f2770987ca0ca8F5",
   "sources": [
     {
-      "name": "BSC",
-      "rpc": "${BSC_RPC:https://bsc.drpc.org}",
-      "source-core-helper": "0xa5FAfF49394F1912a68E8F5bDD7BEED690eD22B3",
+      "name": "OG",
+      "rpc": "${ZG_RPC:}",
+      "source-core-helper": "0x59890cDA7F434657F95341ADF7F861138a043DB5",
       "deployments": [
         {
-          "name": "CYC",
-          "source-core": "0xc8e046fe778BE29572016d1f703e9B2ff77a207D",
-          "target-core": "0xAdEcB7647C3370A40c9F06FB8F5F709c87324932"
+          "name": "OG",
+          "source-core": "0x4B3c2f55fa67679b382c979A082Df1B32079B4cB",
+          "target-core": "0xd46E464c82643e6937838A94d40FD8D014A2EA26"
         }
       ],
       "safe-global": {
-        "safe-address": "0x3f31b8Ca3fD126aBe13931CB6bd9D53d9fBb6235",
-        "proposer-private-key": "${BSC_SAFE_PROPOSER_PK:${SAFE_PROPOSER_PK}}",
-        "api-url": "https://api.safe.global/tx-service/bnb",
-        "api-key": "${BSC_SAFE_API_KEY:${SAFE_API_KEY}}",
-        "web-client-url": "https://app.safe.global",
-        "eip-3770": "bnb"
-      }
-    },
-    {
-      "name": "FRAXTAL",
-      "rpc": "${FRAX_RPC:https://fraxtal.drpc.org}",
-      "source-core-helper": "0xDa938653F1F86989d0928CF38000022552f91698",
-      "deployments": [
-        {
-          "name": "FRAX",
-          "source-core": "0x24dD1eaBEad7b3cB07b7d162439ec0A4EEC703DF",
-          "target-core": "0x6408a5261578E17f858ADD039dEb72E1952E9Fe9"
-        }
-      ],
-      "safe-global": {
-        "safe-address": "0xF32fD742608c237D5a377838fa69837584cA9676",
-        "proposer-private-key": "${FRAX_SAFE_PROPOSER_PK:${SAFE_PROPOSER_PK}}",
-        "api-url": "https://safe-gateway.mainnet.frax.com",
-        "web-client-url": "https://safe.mainnet.frax.com"
-      }
-    },
-    {
-      "name": "LISK",
-      "rpc": "${LISK_RPC:https://lisk.drpc.org}",
-      "source-core-helper": "0xfefbd2a8e29402b61e7d78a8cb141ef809b5a56a",
-      "deployments": [
-        {
-          "name": "lskETH",
-          "source-core": "0x1b10E2270780858923cdBbC9B5423e29fffD1A44",
-          "target-core": "0x7E0E4B05898181a597673cD5a8FeF2B9E36bEC97"
-        },
-        {
-          "name": "M-BTC",
-          "source-core": "0xa67E8B2E43B70D98E1896D3f9d563f3ABdB8Adcd",
-          "target-core": "0xB2657a1EB016692509F321A4365551e2EC1173C2"
-        },
-        {
-          "name": "LSK",
-          "source-core": "0x8cf94b5A37b1835D634b7a3e6b1EE02Ce7F0CD30",
-          "target-core": "0xcc1D3926E079c826Cd807FdF825a6777846bb5C1"
-        }
-      ],
-      "safe-global": {
-        "safe-address": "0x62339BF5c4EB32EFAC9482F0277D68957A822641",
-        "proposer-private-key": "${LISK_SAFE_PROPOSER_PK:${SAFE_PROPOSER_PK}}",
-        "api-url": "https://gateway.safe.optimism.io",
-        "web-client-url": "https://safe.optimism.io"
+        "safe-address": "0xfc7350b0d7a358Db58875148faF3bDEAaFC82911",
+        "proposer-private-key": "${SAFE_PROPOSER_PK:${SAFE_PROPOSER_PK}}",
+        "api-url": "https://api.safe.global/tx-service/0g",
+        "web-client-url": "https://app.safe.global"
       }
     }
   ]
