@@ -6,7 +6,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 
 BLOCK_GAP = 10000
-SECURE_INTERVAL = 5 * 60  # 5 minutes
+SECURE_INTERVAL = 15
 
 
 def add_color(text: str, color="yellow") -> str:
@@ -49,7 +49,7 @@ def execute(contractFunction, value: int, operator_pk: str):
 
     base_fee = w3.eth.get_block("latest").baseFeePerGas * 105 // 100
     try:
-        max_priority_fee = min(w3.eth.max_priority_fee * 3, w3.to_wei(10, "gwei"))
+        max_priority_fee = min(w3.eth.max_priority_fee * 3, w3.to_wei(4, "gwei"))
     except:
         max_priority_fee = w3.to_wei(2, "gwei")
 
