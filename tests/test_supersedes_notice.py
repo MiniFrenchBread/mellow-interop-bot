@@ -41,7 +41,9 @@ def proposal(superseded=None) -> SafeProposal:
 
 
 def queued(nonce, data, tx_hash, to=ORACLE):
-    return {"nonce": nonce, "data": data, "to": to, "safeTxHash": tx_hash}
+    # The Safe service reports nonce as a string and may checksum addresses
+    # differently from the caller; both are reproduced here deliberately.
+    return {"nonce": str(nonce), "data": data, "to": to, "safeTxHash": tx_hash}
 
 
 class TestSupersededLookup(unittest.TestCase):
@@ -82,6 +84,14 @@ class TestSupersededLookup(unittest.TestCase):
 
     def test_a_different_target_is_ignored(self):
         self.queue = [queued(11, "0xOLD", OLD_HASH, to=SAFE_ADDRESS)]
+        self.assertEqual(self.find(), [])
+
+    def test_target_casing_does_not_matter(self):
+        self.queue = [queued(11, "0xOLD", OLD_HASH, to=ORACLE.lower())]
+        self.assertEqual([t["safeTxHash"] for t in self.find()], [OLD_HASH])
+
+    def test_an_unparseable_nonce_is_ignored(self):
+        self.queue = [queued("", "0xOLD", OLD_HASH)]
         self.assertEqual(self.find(), [])
 
 

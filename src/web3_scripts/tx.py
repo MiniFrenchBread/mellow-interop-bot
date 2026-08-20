@@ -144,6 +144,12 @@ def disable_send_retry(w3: Web3) -> None:
     answers the second attempt with "already known", which web3 raises as an
     error -- hiding the fact that the first attempt worked. Broadcast retries
     belong in send_and_confirm, which knows that answer means success.
+
+    No-ops for the multi-endpoint provider, which does its own failover and
+    carries no retry configuration to edit. That is fine, and desirable for a
+    broadcast: if one endpoint is unreachable the transaction should still reach
+    another. Whichever path a resend takes, the "already known" answer it may come
+    back with is handled below rather than treated as a failure.
     """
     provider = getattr(w3, "provider", None)
     config = getattr(provider, "exception_retry_configuration", None)

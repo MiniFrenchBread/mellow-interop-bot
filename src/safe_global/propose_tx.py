@@ -18,15 +18,20 @@ def _create_calldata(contract_name: str, method: str, args: list) -> str:
 
 
 def _create_signed_safe_tx(
-    rpc_url: str,
     safe_address: str,
     private_key: str,
     to: str,
     calldata: str,
     operation: int,
+    chain_id: int,
+    safe_version: str,
+    safe_nonce: int,
 ) -> SafeTx:
+    # chain_id, safe_version and safe_nonce are supplied explicitly so signing is
+    # fully offline: SafeTx never has to reach a node (which would bypass the
+    # fallback RPC handling in get_w3 and break on comma-separated RPC strings).
     safe_tx = SafeTx(
-        ethereum_client=EthereumClient(rpc_url),
+        ethereum_client=EthereumClient(),
         safe_address=safe_address,
         to=to,
         value=0,
@@ -37,6 +42,9 @@ def _create_signed_safe_tx(
         gas_price=0,
         gas_token=None,
         refund_receiver=None,
+        chain_id=chain_id,
+        safe_nonce=safe_nonce,
+        safe_version=safe_version,
     )
     safe_tx.sign(private_key)
     return safe_tx
@@ -45,13 +53,20 @@ def _create_signed_safe_tx(
 def _create_signed_safe_tx_for_safe(
     rpc: str, safe_global: SafeGlobal, to: str, calldata: str, operation: int
 ) -> SafeTx:
+    w3 = get_w3(rpc)
+    safe_contract = get_contract(w3, address=safe_global.safe_address, name="Safe")
+    chain_id = w3.eth.chain_id
+    safe_version = safe_contract.functions.VERSION().call()
+    safe_nonce = safe_contract.functions.nonce().call()
     safe_tx = _create_signed_safe_tx(
-        rpc,
         safe_global.safe_address,
         safe_global.proposer_private_key,
         to,
         calldata,
         operation,
+        chain_id,
+        safe_version,
+        safe_nonce,
     )
     return safe_tx
 
@@ -148,23 +163,24 @@ def _resolve_call(
 
 
 def _superseded_hashes(
-    to: str, calldata: str, source: SourceConfig, safe_global: SafeGlobal
+    to: str, calldata: str, safe_nonce: int, safe_global: SafeGlobal
 ) -> list:
     """safeTxHashes of queued proposals now competing for this proposal's nonce.
 
+    Takes the nonce the proposal was actually signed with rather than re-reading
+    it, so an execution landing in between cannot make this describe a different
+    position in the queue than the one just proposed.
+
     Only meaningful for the Transaction API; the Client Gateway path returns
     nothing rather than guessing. Never fatal: failing to describe the queue is
-    not a reason to fail a proposal that already succeeded.
+    not a reason to report a proposal that already succeeded as failed.
     """
     try:
-        w3 = get_w3(source.rpc)
-        safe_contract = get_contract(w3, address=safe_global.safe_address, name="Safe")
-        nonce = safe_contract.functions.nonce().call()
         superseded = transaction_api.get_superseded_transactions(
             safe_global.api_url,
             safe_global.api_key,
             safe_global.safe_address,
-            nonce,
+            safe_nonce,
             to,
             calldata,
         )
@@ -229,7 +245,7 @@ def propose_tx_if_needed(
             return (
                 transaction,
                 True,
-                _superseded_hashes(to, calldata, source, safe_global),
+                _superseded_hashes(to, calldata, safe_tx.safe_nonce, safe_global),
             )
 
     raise Exception(
