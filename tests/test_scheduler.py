@@ -84,6 +84,21 @@ class TestIntervalBuckets(unittest.TestCase):
         self.assertFalse(is_due(2 * DAY + 100, 2 * DAY + HOUR, DAY))
         self.assertTrue(is_due(2 * DAY + 100, 3 * DAY + 1, DAY))
 
+    def test_a_non_positive_interval_does_not_mean_run_constantly(self):
+        """The value an operator reaches for to stop a task must not start it.
+
+        Config rejects it; if one ever gets through, not running is the
+        direction that cannot cause harm.
+        """
+        self.assertFalse(is_due(1000, 10**9, 0))
+        self.assertFalse(is_due(1000, 10**9, -1))
+
+    def test_the_config_refuses_a_non_positive_interval(self):
+        from config.read_config import _create_scheduler_config
+
+        with self.assertRaises(ValueError):
+            _create_scheduler_config({"tasks": {"ascend": {"interval_seconds": 0}}})
+
     def test_next_due_lands_on_the_next_boundary(self):
         self.assertEqual(next_due(2 * DAY + 100, DAY), 3 * DAY)
 

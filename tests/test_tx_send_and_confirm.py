@@ -92,6 +92,9 @@ class FakeEth:
         return getattr(self, "nonce", 42)
 
     def get_transaction(self, _tx_hash):
+        error = getattr(self, "lookup_error", None)
+        if error is not None:
+            raise error
         # Present unless a test says the node has forgotten it.
         if getattr(self, "known", True):
             return {"blockNumber": None}
@@ -829,6 +832,25 @@ class TestNonceIsNotSharedAcrossOperations(unittest.TestCase):
         )
 
         self.assertEqual(len(w3.eth.sent), 1)
+
+    def test_an_unanswerable_node_does_not_free_the_nonce(self):
+        """A non-answer is not "dropped", and this is when it is likeliest.
+
+        The send that stranded the transaction probably timed out because the
+        RPC was struggling; asking the same endpoint moments later and reading
+        an error as proof of a drop would surrender the protection at exactly
+        the moment it is needed.
+        """
+        self.strand_a_transaction()
+        w3, fn = make(receipt_script=[receipt()])
+        w3.eth.lookup_error = ConnectionError("All 2 RPC endpoint(s) failed")
+
+        with self.assertRaises(NonceBlocked):
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, poll_latency=0.001, label="setValue"
+            )
+
+        self.assertEqual(w3.eth.sent, [])
 
     def test_a_confirmed_send_clears_the_record(self):
         self.strand_a_transaction()

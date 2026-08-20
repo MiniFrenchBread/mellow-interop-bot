@@ -54,7 +54,9 @@ def is_due(last_run: float, now: float, interval: int) -> bool:
     time of day no matter how often the process is restarted.
     """
     if interval <= 0:
-        return True
+        # Config rejects this; if one ever reaches here, not running is the
+        # direction that cannot cause harm.
+        return False
     return int(last_run) // interval < int(now) // interval
 
 

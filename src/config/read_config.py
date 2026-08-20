@@ -453,7 +453,12 @@ def _create_scheduler_config(
         if isinstance(interval, dict):
             interval = interval.get("interval_seconds")
         if interval is not None and str(interval) != "":
-            intervals[task] = int(interval)
+            # Rejected rather than accepted as "off": a non-positive interval
+            # makes the task due on every cycle, so the value an operator would
+            # reach for to stop it does the opposite, at maximum frequency, to
+            # real on-chain operations. Removing a task's config section is how
+            # you actually stop it.
+            intervals[task] = _at_least("interval-seconds for " + task, interval, 1)
     return SchedulerConfig(
         loop_sleep_seconds=int(
             scheduler_dict.get("loop_sleep_seconds", DEFAULT_LOOP_SLEEP_SECONDS)

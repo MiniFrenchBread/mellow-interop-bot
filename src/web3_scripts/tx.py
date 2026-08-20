@@ -148,14 +148,28 @@ def _log(text: str, color: str = "yellow") -> None:
 
 
 def _still_in_flight(w3: Web3, tx_hash: str) -> bool:
-    """Whether the node still knows this transaction. Dropped ones are gone."""
+    """Whether the node still knows this transaction.
+
+    Only a node that answers "I do not have it" frees the nonce. Any other
+    error is no answer at all, and is treated as still in flight -- the safe
+    direction, because the alternative evicts a transaction that may well be
+    about to mine.
+
+    That distinction matters more than it looks: the send that left this hash
+    behind most likely timed out *because* the RPC was struggling, so asking the
+    same endpoint moments later is exactly when a non-answer is likeliest. A
+    blanket "no answer means dropped" would surrender the protection precisely
+    when it is needed. Nothing wedges as a result -- the nonce also frees once
+    the account moves past it, and while the RPC is down nothing can be sent
+    anyway.
+    """
     try:
         return w3.eth.get_transaction(tx_hash) is not None
-    except Exception:
-        # TransactionNotFound, or a node that cannot answer. Absent means
-        # dropped, which frees the nonce; an unanswerable node is treated the
-        # same way rather than blocking forever on a question we cannot ask.
+    except TransactionNotFound:
         return False
+    except Exception as e:
+        _log("Could not tell whether {} is still pending: {}".format(tx_hash, e))
+        return True
 
 
 def record_unreconciled(w3: Web3, sender: str, nonce: int, label: str, tx_hashes):
