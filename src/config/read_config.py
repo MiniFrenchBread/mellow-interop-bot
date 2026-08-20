@@ -19,6 +19,10 @@ DEFAULT_POST_ASCEND_GAP_SECONDS = 60
 DEFAULT_LOCK_FILE = ".scheduler.lock"
 DEFAULT_STATE_FILE = ".scheduler-state.json"
 DEFAULT_ALERT_AFTER_FAILURES = 3
+# Every task runs on one of these unless the config names a different
+# interval. Omitting a task does not stop it; ascend and handle-epoch are
+# stopped by removing the source section each needs (`ascend`,
+# `withdrawal-queue`), and rebalance and oracle-report have no off switch.
 DEFAULT_TASK_INTERVALS = {
     "ascend": 1209600,
     "rebalance": 7200,
@@ -456,8 +460,8 @@ def _create_scheduler_config(
             # Rejected rather than accepted as "off": a non-positive interval
             # makes the task due on every cycle, so the value an operator would
             # reach for to stop it does the opposite, at maximum frequency, to
-            # real on-chain operations. Removing a task's config section is how
-            # you actually stop it.
+            # real on-chain operations. There is no interval that means off --
+            # omitting a task here leaves it on its default below, not stopped.
             intervals[task] = _at_least("interval-seconds for " + task, interval, 1)
     return SchedulerConfig(
         loop_sleep_seconds=int(

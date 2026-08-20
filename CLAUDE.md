@@ -47,6 +47,11 @@ This bot is the operational automation layer for the Mellow interop protocol -- 
   Unix epoch, so a restart neither shifts the schedule nor skips a beat. Each task is isolated so
   one failure cannot stop the others, and repeated failures or repeated guard-skips raise a
   Telegram alert.
+  Task intervals come from `scheduler.tasks` in `config.json`, falling back to built-in
+  defaults. Omitting a task does **not** stop it — it runs on its default — and no interval
+  value means "off" (a non-positive one is rejected, because it would otherwise make the task
+  due every cycle). `ascend` and `handle-epoch` are stopped by removing the source section each
+  needs (`ascend`, `withdrawal-queue`); `rebalance` and `oracle-report` have no off switch.
 - **`src/cli.py`** -- One-shot entry points for the same code paths: `ascend` (with `--dry-run`),
   `handle-epoch`, `oracle`, `rebalance`, `validate-config`.
 - **`src/process_lock.py`** -- Single-holder lock shared by the scheduler and the CLI. One account

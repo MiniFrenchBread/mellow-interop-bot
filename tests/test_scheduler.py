@@ -93,6 +93,19 @@ class TestIntervalBuckets(unittest.TestCase):
         self.assertFalse(is_due(1000, 10**9, 0))
         self.assertFalse(is_due(1000, 10**9, -1))
 
+    def test_omitting_a_task_leaves_it_on_its_default(self):
+        """Not a way to stop it -- the comment beside this once claimed it was."""
+        from config.read_config import DEFAULT_TASK_INTERVALS, _create_scheduler_config
+
+        config = _create_scheduler_config(
+            {"tasks": {"ascend": {"interval_seconds": 60}}}
+        )
+
+        self.assertEqual(config.interval("ascend"), 60)
+        self.assertEqual(
+            config.interval("handle_epoch"), DEFAULT_TASK_INTERVALS["handle_epoch"]
+        )
+
     def test_the_config_refuses_a_non_positive_interval(self):
         from config.read_config import _create_scheduler_config
 
