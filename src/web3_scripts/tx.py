@@ -325,17 +325,25 @@ def send_and_confirm(
         return max(0.0, deadline - time.monotonic())
 
     for attempt in range(1, max_attempts + 1):
-        transaction = contract_function.build_transaction(
-            {
-                "gas": gas,
-                "maxFeePerGas": max_fee,
-                "maxPriorityFeePerGas": max_priority_fee,
-                "value": value,
-                "from": sender,
-                "nonce": nonce,
-            }
-        )
-        signed = w3.eth.account.sign_transaction(transaction, private_key=private_key)
+        try:
+            transaction = contract_function.build_transaction(
+                {
+                    "gas": gas,
+                    "maxFeePerGas": max_fee,
+                    "maxPriorityFeePerGas": max_priority_fee,
+                    "value": value,
+                    "from": sender,
+                    "nonce": nonce,
+                }
+            )
+            signed = w3.eth.account.sign_transaction(
+                transaction, private_key=private_key
+            )
+        except Exception as e:
+            # Building a replacement still talks to the node. On the first
+            # attempt nothing is out yet and this is an ordinary error; on later
+            # ones a transaction is already live and must not be forgotten.
+            raise _with_hashes(e, sent_hashes, nonce)
         tx_hash = _to_hex(signed.hash)
 
         # Recorded before the broadcast: if the call raises after the node
@@ -411,7 +419,12 @@ def send_and_confirm(
             return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
 
         if attempt < max_attempts:
-            fresh_max_fee, fresh_priority = compute_fees(w3, fee_cap_gwei)
+            try:
+                fresh_max_fee, fresh_priority = compute_fees(w3, fee_cap_gwei)
+            except Exception as e:
+                # Reads the latest block over the connection that just failed to
+                # serve a receipt, so it is a likely place to lose the hashes.
+                raise _with_hashes(e, sent_hashes, nonce)
             bumped_priority = max(
                 _bump(max_priority_fee, fee_bump_percent), fresh_priority
             )

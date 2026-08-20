@@ -100,19 +100,23 @@ async def run_oracle_report(config: Config):
             )
         )
 
-    # Compose message with oracle statuses
-    message = compose_oracle_data_message(config, oracle_validation_results)
-    if not message:
+    if not needs_attention(oracle_validation_results):
         print("No invalid oracle statuses to report")
         return
 
-    # Send message with oracle statuses
-    status_message = await send_message(
-        config.telegram_bot_api_key, config.telegram_group_chat_id, message
-    )
-
-    # Propose tx to update oracle
+    # Proposed before anything is sent. The proposal is the action that keeps
+    # the oracle alive; the messages only tell people about it, and an outage in
+    # the telling must not cancel the doing.
     safe_proposals = propose_tx_to_update_oracle(oracle_validation_results)
+
+    message = compose_oracle_data_message(config, oracle_validation_results)
+    status_message = (
+        await send_message(
+            config.telegram_bot_api_key, config.telegram_group_chat_id, message
+        )
+        if message
+        else None
+    )
 
     # Compose message with safe data
     for source, safe_global, safe_proposal in safe_proposals:
@@ -147,19 +151,20 @@ async def run_oracle_report(config: Config):
     print(f"Sent {len(safe_proposals)} message(s) with safe proposal")
 
 
-def compose_oracle_data_message(
-    config: Config,
+def needs_attention(
     oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
-) -> str:
-    # Skip if telegram variables are not set
-    if not config.telegram_bot_api_key or not config.telegram_group_chat_id:
-        return ""
+) -> bool:
+    """Whether this run has anything to act on or report.
 
-    # Skip if there are no oracle validation results
+    Deliberately independent of the Telegram settings. Whether an oracle needs
+    updating is a fact about the chain; whether anyone can be told about it is a
+    separate question, and letting the second decide the first is what made the
+    Safe proposal -- the part that actually keeps the oracle alive -- conditional
+    on a notification succeeding.
+    """
     if len(oracle_validation_results) == 0:
-        return ""
+        return False
 
-    # Skip if there are no required (or recent) updates
     has_any_problem = any(
         oracle_data.validation is None  # Error during validation on-chain data
         or oracle_data.validation.almost_expired
@@ -171,8 +176,18 @@ def compose_oracle_data_message(
         oracle_data.validation is not None and oracle_data.validation.recently_updated
         for _, oracle_data in oracle_validation_results
     )
-    should_report = has_any_problem or has_recent_update
-    if not should_report:
+    return has_any_problem or has_recent_update
+
+
+def compose_oracle_data_message(
+    config: Config,
+    oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
+) -> str:
+    # Skip if telegram variables are not set
+    if not config.telegram_bot_api_key or not config.telegram_group_chat_id:
+        return ""
+
+    if not needs_attention(oracle_validation_results):
         return ""
 
     # Group validation results by source.name

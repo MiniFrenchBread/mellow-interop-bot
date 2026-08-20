@@ -21,13 +21,22 @@ class TestProcessLock(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def test_acquire_writes_our_pid_and_release_removes_it(self):
+    def test_acquire_writes_our_pid_and_release_frees_the_lock(self):
+        """Release frees the lock, and deliberately leaves the file behind.
+
+        Removing it would let a process that opened the path just before the
+        unlink lock an unreachable inode while the next starter locks a fresh
+        one -- two holders at once.
+        """
         lock = ProcessLock(self.path)
         lock.acquire()
         with open(self.path) as handle:
             self.assertEqual(int(handle.read()), os.getpid())
+
         lock.release()
-        self.assertFalse(os.path.exists(self.path))
+
+        self.assertTrue(os.path.exists(self.path))
+        ProcessLock(self.path).acquire()
 
     def test_second_holder_is_refused(self):
         first = ProcessLock(self.path)
@@ -58,15 +67,19 @@ class TestProcessLock(unittest.TestCase):
 
     def test_context_manager_releases(self):
         with ProcessLock(self.path):
-            self.assertTrue(os.path.exists(self.path))
-        self.assertFalse(os.path.exists(self.path))
+            with self.assertRaises(LockHeld):
+                ProcessLock(self.path).acquire()
 
-    def test_release_does_not_remove_a_lock_we_do_not_hold(self):
+        ProcessLock(self.path).acquire()
+
+    def test_releasing_an_object_that_never_acquired_is_a_no_op(self):
         lock = ProcessLock(self.path)
         lock.acquire()
-        other = ProcessLock(self.path)
-        other.release()
-        self.assertTrue(os.path.exists(self.path))
+
+        ProcessLock(self.path).release()
+
+        with self.assertRaises(LockHeld):
+            ProcessLock(self.path).acquire()
         lock.release()
 
 
@@ -130,8 +143,8 @@ class TestStaleLocks(unittest.TestCase):
 
         holder.release()
 
-    def test_the_second_attempt_does_not_destroy_the_first_holders_file(self):
-        """Takeover used to unlink first, so a loser could delete a live lock."""
+    def test_a_refused_attempt_leaves_the_holders_file_intact(self):
+        """A loser must not be able to disturb the winner's lock."""
         holder = ProcessLock(self.path)
         holder.acquire()
 

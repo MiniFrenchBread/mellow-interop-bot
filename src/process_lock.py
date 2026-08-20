@@ -79,12 +79,14 @@ class ProcessLock:
         return self
 
     def release(self) -> None:
+        # The file is deliberately left in place. Unlinking it would let a
+        # process that opened the path just before the unlink take a lock on an
+        # inode nothing else can reach, while the next starter creates a fresh
+        # file and locks that -- two holders of a lock whose whole purpose is
+        # that only one of them signs. The lock lives on the open file, not on
+        # the name, so leaving the name costs nothing.
         if self._fd is None:
             return
-        try:
-            os.unlink(self.path)
-        except FileNotFoundError:
-            pass
         try:
             fcntl.flock(self._fd, fcntl.LOCK_UN)
         finally:
