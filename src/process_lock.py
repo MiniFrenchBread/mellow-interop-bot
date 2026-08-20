@@ -8,6 +8,26 @@ running, and this makes that check automatic rather than a thing to remember.
 """
 
 import os
+import time
+from pathlib import Path
+
+# The lock has to name the same file for every process regardless of where each
+# was started from. Resolving a relative path against the working directory would
+# put a scheduler started from the repo root and a command started from a home
+# directory on two different locks -- each acquiring successfully, neither aware
+# of the other, which is worse than having no lock at all.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# A holder writes its pid immediately after creating the file, so a lock file
+# that reads as empty is far more likely to be a few milliseconds old than
+# abandoned. Re-read before concluding anything from it.
+PID_WRITE_GRACE_SECONDS = 0.5
+
+
+def resolve_lock_path(configured: str) -> str:
+    """Anchor a configured lock path to the repo, unless it is already absolute."""
+    path = Path(configured)
+    return str(path if path.is_absolute() else REPO_ROOT / path)
 
 
 class LockHeld(Exception):
@@ -35,7 +55,7 @@ def _process_alive(pid: int) -> bool:
 
 class ProcessLock:
     def __init__(self, path: str):
-        self.path = path
+        self.path = resolve_lock_path(path)
         self._acquired = False
 
     def _read_pid(self):
@@ -51,6 +71,11 @@ class ProcessLock:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
                 pid = self._read_pid()
+                if pid is None:
+                    # Either the holder is still writing its pid, or it died
+                    # before it could. Give it a moment to tell us apart.
+                    time.sleep(PID_WRITE_GRACE_SECONDS)
+                    pid = self._read_pid()
                 if pid is not None and _process_alive(pid):
                     raise LockHeld(self.path, pid)
                 # The holder died without cleaning up. Drop the stale file and

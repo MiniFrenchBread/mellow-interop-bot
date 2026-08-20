@@ -21,6 +21,12 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_FEE_BUMP_PERCENT = 115
 DEFAULT_FEE_CAP_GWEI = 4
 DEFAULT_POLL_LATENCY = 0.5
+# How long to keep looking for our own receipt after the node rejects a
+# replacement as "nonce too low". That answer usually means an earlier attempt
+# was mined, but the receipt for it is not queryable for a few seconds after
+# inclusion, so a single immediate lookup would report a successful transaction
+# as a lost one.
+NONCE_CONFLICT_LOOKUP_TIMEOUT = 10
 GAS_BUFFER_PERCENT = 105
 BASE_FEE_BUFFER_PERCENT = 105
 PRIORITY_FEE_MULTIPLIER = 3
@@ -313,7 +319,12 @@ def send_and_confirm(
                     )
                 )
             elif is_nonce_too_low(e):
-                receipt = wait_any_receipt(w3, sent_hashes, 0, poll_latency)
+                receipt = wait_any_receipt(
+                    w3,
+                    sent_hashes,
+                    min(NONCE_CONFLICT_LOOKUP_TIMEOUT, receipt_timeout),
+                    poll_latency,
+                )
                 if receipt is not None:
                     return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
                 raise NonceAlreadyUsed(
@@ -328,7 +339,7 @@ def send_and_confirm(
                 )
                 max_fee = _bump(max_fee, fee_bump_percent)
                 max_priority_fee = _bump(max_priority_fee, fee_bump_percent)
-                continue
+                continue  # nothing new was broadcast; the final sweep still polls
             else:
                 raise
 
@@ -347,6 +358,13 @@ def send_and_confirm(
                     prefix, receipt_timeout, nonce, max_fee / 1e9
                 )
             )
+
+    # A rejected replacement returns instantly, so the attempts can run out with
+    # most of the time budget unspent while an earlier broadcast is still live in
+    # the mempool. Spend what is left before declaring the transaction lost.
+    receipt = wait_any_receipt(w3, sent_hashes, receipt_timeout, poll_latency)
+    if receipt is not None:
+        return _confirmed(w3, receipt, nonce, max_attempts, sent_hashes, prefix)
 
     raise TxNotConfirmed(
         "No receipt for nonce {} after {} attempt(s). Broadcast hashes: {}".format(

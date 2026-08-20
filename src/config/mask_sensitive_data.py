@@ -71,6 +71,12 @@ def mask_source_sensitive_data(message: str, source: "SourceConfig") -> str:
     if source.rpc:
         message = mask_url_credentials(message, source.rpc)
 
+    # Mask the key this source signs transactions with. The scheduler pipes
+    # failure text through here on its way to Telegram, which is the one path
+    # where a configured secret leaves the machine.
+    if getattr(source, "executor_private_key", None):
+        message = mask_sensitive_data(message, source.executor_private_key)
+
     # Mask safe global sensitive data
     if source.safe_global:
         # Mask proposer private key

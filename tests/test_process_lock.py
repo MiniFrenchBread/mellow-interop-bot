@@ -6,7 +6,7 @@ import unittest
 # Add the src directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from process_lock import LockHeld, ProcessLock
+from process_lock import REPO_ROOT, LockHeld, ProcessLock, resolve_lock_path
 
 # High enough to be unassigned on both Linux and macOS.
 DEAD_PID = 4194304
@@ -68,6 +68,56 @@ class TestProcessLock(unittest.TestCase):
         other.release()
         self.assertTrue(os.path.exists(self.path))
         lock.release()
+
+
+class TestLockPathResolution(unittest.TestCase):
+    """The lock must name one file no matter where a process was started."""
+
+    def test_relative_paths_anchor_to_the_repo(self):
+        self.assertEqual(
+            resolve_lock_path(".scheduler.lock"),
+            str(REPO_ROOT / ".scheduler.lock"),
+        )
+
+    def test_absolute_paths_are_left_alone(self):
+        self.assertEqual(resolve_lock_path("/tmp/x.lock"), "/tmp/x.lock")
+
+    def test_the_resolved_path_does_not_follow_the_working_directory(self):
+        original = os.getcwd()
+        try:
+            os.chdir(tempfile.gettempdir())
+            self.assertEqual(
+                ProcessLock(".scheduler.lock").path,
+                str(REPO_ROOT / ".scheduler.lock"),
+            )
+        finally:
+            os.chdir(original)
+
+
+class TestPidWriteWindow(unittest.TestCase):
+
+    def test_an_empty_file_is_re_read_before_being_called_stale(self):
+        """A holder writes its pid just after creating the file.
+
+        Reading that gap once and concluding the lock is abandoned would hand a
+        second process the same lock, and both would sign from one account.
+        """
+        with open(self.path, "w"):
+            pass
+
+        lock = ProcessLock(self.path)
+        reads = [None, os.getpid()]
+        lock._read_pid = lambda: reads.pop(0) if reads else os.getpid()
+
+        with self.assertRaises(LockHeld):
+            lock.acquire()
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "scheduler.lock")
+
+    def tearDown(self):
+        self.directory.cleanup()
 
 
 if __name__ == "__main__":

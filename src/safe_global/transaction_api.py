@@ -150,7 +150,7 @@ def get_superseded_transactions(
         for transaction in queued
         if same_nonce(transaction)
         and same_target(transaction)
-        and transaction.get("data") != calldata
+        and (transaction.get("data") or "").lower() != (calldata or "").lower()
     ]
 
 

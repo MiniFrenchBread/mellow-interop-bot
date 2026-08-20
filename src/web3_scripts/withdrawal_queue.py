@@ -27,14 +27,21 @@ DEFAULT_MAX_ITERATIONS = 8
 class QueueParams:
     init_timestamp: int
     epoch_duration: int
-    withdrawal_delay: int
 
 
 _params_cache = {}
 
 
 def read_params(w3, address: str) -> QueueParams:
-    """Read the queue's immutable timing parameters, once per chain and address."""
+    """Read the queue's genuinely immutable timing parameters, once per chain.
+
+    Only initTimestamp and epochDuration qualify. withdrawalDelay looks like a
+    sibling but is ordinary storage behind a role-gated setter, and the deployed
+    value has already been moved off the contract's default, so it is read fresh
+    on every use instead. Caching it would leave a long-lived scheduler computing
+    maturity from a delay governance had since shortened, quietly holding
+    withdrawals back until someone restarted the process.
+    """
     address = Web3.to_checksum_address(address)
     key = (w3.eth.chain_id, address)
     if key not in _params_cache:
@@ -42,7 +49,6 @@ def read_params(w3, address: str) -> QueueParams:
         _params_cache[key] = QueueParams(
             init_timestamp=queue.functions.initTimestamp().call(),
             epoch_duration=queue.functions.epochDuration().call(),
-            withdrawal_delay=queue.functions.withdrawalDelay().call(),
         )
     return _params_cache[key]
 
@@ -83,10 +89,11 @@ def handle_epochs(
             break
 
         block_timestamp = w3.eth.get_block("latest").timestamp
+        withdrawal_delay = queue.functions.withdrawalDelay().call()
         maturity = (
             params.init_timestamp
             + (epoch_iterator + 1) * params.epoch_duration
-            + params.withdrawal_delay
+            + withdrawal_delay
         )
         if maturity > block_timestamp:
             print(

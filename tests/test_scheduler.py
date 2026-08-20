@@ -167,6 +167,57 @@ class TestCycleIsolation(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("oracle value is incorrect", sent[0])
 
+    def test_a_failure_does_not_consume_the_task_interval(self):
+        """Marking a failed run as done costs a fortnightly task a fortnight."""
+        self._stub("ascend", RuntimeError("RPC exploded"))
+        before = self.scheduler.last_run["ascend"]
+        self.clock.advance(10)
+
+        self.scheduler.run_cycle()
+
+        self.assertEqual(self.scheduler.last_run["ascend"], before)
+        self.assertGreater(self.scheduler.retry_after["ascend"], self.clock.now)
+
+    def test_a_successful_run_clears_the_retry(self):
+        self._stub("ascend", RuntimeError("RPC exploded"))
+        self.clock.advance(10)
+        self.scheduler.run_cycle()
+        self._stub("ascend")
+        self.clock.advance(10_000)
+
+        self.scheduler.run_cycle()
+
+        self.assertEqual(self.scheduler.retry_after["ascend"], 0.0)
+        self.assertEqual(self.scheduler.failures["ascend"], 0)
+
+    def test_the_retry_waits_before_running_again(self):
+        self._stub("ascend", RuntimeError("RPC exploded"))
+        self.clock.advance(10)
+        self.scheduler.run_cycle()
+        self.ran.clear()
+
+        self.scheduler.run_cycle()
+
+        self.assertNotIn("ascend", self.ran)
+
+    def test_backoff_never_exceeds_the_task_interval(self):
+        self.scheduler.failures["ascend"] = 20
+        interval = self.config.scheduler.interval("ascend")
+
+        self.assertLessEqual(self.scheduler.retry_delay("ascend"), interval)
+
+    def test_a_stop_request_abandons_the_rest_of_the_cycle(self):
+        def stop_then_run():
+            self.ran.append("ascend")
+            self.scheduler.request_stop()
+
+        self.scheduler.task_ascend = stop_then_run
+        self.clock.advance(10)
+
+        self.scheduler.run_cycle()
+
+        self.assertEqual(self.ran, ["ascend"])
+
     def test_ascend_is_followed_by_a_settling_gap(self):
         self.config.scheduler = SchedulerConfig(
             task_intervals=self.config.scheduler.task_intervals,

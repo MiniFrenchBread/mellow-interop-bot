@@ -484,5 +484,47 @@ class TestMaskAllSensitiveConfigData(unittest.TestCase):
         self.assertEqual(message, result)
 
 
+class TestExecutorKeyMasking(unittest.TestCase):
+    """The scheduler pipes failure text through the masker on its way to Telegram.
+
+    That is the one path where a key held in config leaves the machine.
+    """
+
+    EXECUTOR_KEY = "0x" + "ab" * 32
+
+    def make_source(self):
+        return SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid/token",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(),
+            executor_private_key=self.EXECUTOR_KEY,
+        )
+
+    def test_the_executor_key_is_masked(self):
+        message = f"boom while signing with {self.EXECUTOR_KEY}"
+
+        masked = mask_source_sensitive_data(message, self.make_source())
+
+        self.assertNotIn(self.EXECUTOR_KEY, masked)
+
+    def test_it_is_masked_through_the_whole_config_helper(self):
+        config = Config(
+            telegram_bot_api_key="",
+            telegram_group_chat_id="",
+            telegram_owner_nicknames={},
+            telegram_proposal_message_prefix="",
+            oracle_expiry_threshold_seconds=3600,
+            oracle_recent_update_threshold_seconds=0,
+            target_rpc="",
+            target_core_helper="",
+            sources=[self.make_source()],
+        )
+
+        masked = mask_all_sensitive_config_data(f"boom {self.EXECUTOR_KEY}", config)
+
+        self.assertNotIn(self.EXECUTOR_KEY, masked)
+
+
 if __name__ == "__main__":
     unittest.main()

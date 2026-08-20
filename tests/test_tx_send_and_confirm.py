@@ -37,6 +37,10 @@ NONCE_TOO_LOW = (
     "nonce too low: next nonce 2129, tx nonce 2128"
 )
 REVERTED = "execution reverted: SourceCore: zero shares"
+UNDERPRICED = (
+    "server returned an error response: error code -32000: "
+    "replacement transaction underpriced"
+)
 
 
 def receipt(status=1, block_number=100, tx_hash=None):
@@ -311,6 +315,56 @@ class TestSendAndConfirm(unittest.TestCase):
             send_and_confirm(
                 fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.01, poll_latency=0.001
             )
+
+    def test_nonce_too_low_waits_out_the_indexing_lag(self):
+        """The rejection usually means our own attempt was mined moments ago.
+
+        Its receipt is not queryable for a few seconds after inclusion, so a
+        single immediate lookup would report a mined transaction as lost.
+        """
+        w3, fn = make(
+            receipt_script=[
+                Exception(RECEIPTS_NOT_INDEXED),
+                None,
+                receipt(),
+            ],
+            send_script=[Exception(NONCE_TOO_LOW)],
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
+
+    def test_underpriced_attempts_do_not_consume_the_time_budget(self):
+        """A rejected replacement returns instantly and sends nothing new.
+
+        Without a final sweep the attempts run out in milliseconds while the
+        first broadcast is still live in the mempool.
+        """
+        state = {"polls": 0}
+
+        def receipt_after_a_few_polls(eth, tx_hash):
+            state["polls"] += 1
+            return receipt(tx_hash=tx_hash) if state["polls"] > 3 else None
+
+        w3, fn = make(
+            resolver=receipt_after_a_few_polls,
+            send_script=[None, Exception(UNDERPRICED), Exception(UNDERPRICED)],
+        )
+
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=5,
+            max_attempts=3,
+            poll_latency=0.001,
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
 
     def test_nonce_too_low_after_our_tx_landed_is_success(self):
         w3, fn = make(

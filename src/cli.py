@@ -119,36 +119,75 @@ LOCK_FREE = {"validate-config"}
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cli", description=__doc__)
-    parser.add_argument("--source", help="Source chain name (default: the only one)")
-    parser.add_argument(
+    # Shared options live on a parent parser so they are accepted both before and
+    # after the subcommand. Registered only on the top-level parser they would be
+    # rejected in the position an operator naturally types them, which is the
+    # position `pick_source` suggests when it asks for --source.
+    # SUPPRESS matters: a subparser parses into its own namespace and copies every
+    # key back over the outer one, so an ordinary default here would overwrite a
+    # value already given before the subcommand. Suppressed options land in that
+    # namespace only when actually passed; parse_args() fills in the rest.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--source",
+        default=argparse.SUPPRESS,
+        help="Source chain name (default: the only one)",
+    )
+    common.add_argument(
         "--no-lock",
         action="store_true",
+        default=argparse.SUPPRESS,
         help="Skip the single-holder lock. Only safe when the scheduler is stopped.",
     )
+
+    parser = argparse.ArgumentParser(prog="cli", description=__doc__, parents=[common])
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    ascend = subparsers.add_parser("ascend", help="Claim rewards and distribute them")
+    ascend = subparsers.add_parser(
+        "ascend", help="Claim rewards and distribute them", parents=[common]
+    )
     ascend.add_argument(
         "--dry-run",
         action="store_true",
         help="Simulate the calls without broadcasting",
     )
 
-    subparsers.add_parser("handle-epoch", help="Advance matured withdrawal epochs")
-    subparsers.add_parser("oracle", help="Report oracle status and propose updates")
+    subparsers.add_parser(
+        "handle-epoch", help="Advance matured withdrawal epochs", parents=[common]
+    )
+    subparsers.add_parser(
+        "oracle", help="Report oracle status and propose updates", parents=[common]
+    )
 
-    rebalance = subparsers.add_parser("rebalance", help="Rebalance across chains")
+    rebalance = subparsers.add_parser(
+        "rebalance", help="Rebalance across chains", parents=[common]
+    )
     rebalance.add_argument(
         "-y", "--yes", action="store_true", help="Skip the confirmation prompt"
     )
 
-    subparsers.add_parser("validate-config", help="Validate config against chains")
+    subparsers.add_parser(
+        "validate-config", help="Validate config against chains", parents=[common]
+    )
     return parser
 
 
+# Deliberately not parser.set_defaults(): parents share the action objects, and
+# set_defaults rewrites the shared action's default, which would undo the
+# SUPPRESS above and reintroduce the clobbering it exists to prevent.
+SHARED_DEFAULTS = {"source": None, "no_lock": False}
+
+
+def parse_args(argv=None):
+    args = build_parser().parse_args(argv)
+    for name, default in SHARED_DEFAULTS.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    return args
+
+
 def main() -> int:
-    args = build_parser().parse_args()
+    args = parse_args()
     config = load()
     handler = COMMANDS[args.command]
 

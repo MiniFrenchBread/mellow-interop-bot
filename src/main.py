@@ -1,6 +1,7 @@
 import dotenv
 import os
 import asyncio
+from pathlib import Path
 from collections import defaultdict
 from typing import List, Optional, Tuple, Dict
 
@@ -24,6 +25,11 @@ from safe_global import PendingTransactionInfo, propose_tx_if_needed
 from dataclasses import dataclass, field
 
 from web3_scripts.base import print_colored
+
+# Resolved from this file rather than the working directory: the scheduler calls
+# main() in-process, so a scheduler started from anywhere but the repo root would
+# otherwise fail this task alone while every other task kept working.
+CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 
 
 @dataclass
@@ -54,7 +60,7 @@ async def main():
         dotenv.load_dotenv()
 
         # Read config
-        config = read_config(os.getcwd() + "/config.json")
+        config = read_config(str(CONFIG_PATH))
 
         # Print Telegram info (Bot and group)
         await print_telegram_info(

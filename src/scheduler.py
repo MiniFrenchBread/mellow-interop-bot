@@ -88,6 +88,12 @@ class Scheduler:
         self.last_run = {task: started for task in TASK_ORDER}
         self.failures = {task: 0 for task in TASK_ORDER}
         self.skips = {task: 0 for task in TASK_ORDER}
+        # A task that failed is retried on a backoff rather than at its next
+        # scheduled slot. Treating a failure as a completed run would mean one
+        # transient RPC error costs a fortnightly task a fortnight, and would put
+        # three consecutive failures six weeks apart -- long enough that the
+        # failure alert would never fire.
+        self.retry_after = {task: 0.0 for task in TASK_ORDER}
 
     # -- notifications -----------------------------------------------------
 
@@ -117,7 +123,15 @@ class Scheduler:
                 )
             )
 
+    def retry_delay(self, task: str) -> float:
+        """Backoff after a failure, doubling up to the task's own interval."""
+        interval = self.config.scheduler.interval(task)
+        base = self.config.scheduler.loop_sleep_seconds
+        delay = base * (2 ** max(0, self.failures[task] - 1))
+        return min(delay, interval) if interval > 0 else delay
+
     def record_success(self, task: str) -> None:
+        self.retry_after[task] = 0.0
         if self.failures[task]:
             print_colored(
                 "[{}] recovered after {} failure(s)".format(task, self.failures[task]),
@@ -193,8 +207,18 @@ class Scheduler:
         print("-" * 42)
 
         for task in TASK_ORDER:
+            if self.stopping:
+                print("Stopping; skipping the rest of this cycle")
+                return
+
             interval = self.config.scheduler.interval(task)
-            if not is_due(self.last_run[task], now, interval):
+            retry_at = self.retry_after[task]
+            if retry_at and now < retry_at:
+                print(
+                    "[{}] retrying in {}".format(task, format_duration(retry_at - now))
+                )
+                continue
+            if not retry_at and not is_due(self.last_run[task], now, interval):
                 remaining = next_due(self.last_run[task], interval) - now
                 print(
                     "[{}] skipped. Next run in {}".format(
@@ -207,13 +231,13 @@ class Scheduler:
             try:
                 self.handler(task)()
                 self.record_success(task)
+                self.last_run[task] = now
             except Exception as e:
                 # Isolated per task: the shell scheduler got this from running
                 # each task in its own process, and losing it would let one
                 # failure stop every other task.
                 self.record_failure(task, e)
-            finally:
-                self.last_run[task] = now
+                self.retry_after[task] = now + self.retry_delay(task)
 
             if task == "ascend":
                 gap = self.config.scheduler.post_ascend_gap_seconds
@@ -256,9 +280,10 @@ def main() -> int:
         return 1
 
     def stop(signum, _frame):
-        # First signal finishes the task in flight rather than dying mid-broadcast,
-        # which would leave a transaction sent but unrecorded. A second signal is
-        # taken as "I meant now" and gets the default behaviour.
+        # First signal finishes the task in flight and then abandons the rest of
+        # the cycle, rather than dying mid-broadcast and leaving a transaction
+        # sent but unrecorded. A second signal is taken as "I meant now" and gets
+        # the default behaviour.
         if scheduler.stopping:
             signal.signal(signum, signal.SIG_DFL)
             lock.release()
