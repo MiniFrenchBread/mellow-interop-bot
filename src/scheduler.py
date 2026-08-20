@@ -302,12 +302,17 @@ class Scheduler:
 
             interval = self.config.scheduler.interval(task)
             retry_at = self.retry_after[task]
-            if retry_at and now < retry_at:
-                print(
-                    "[{}] retrying in {}".format(task, format_duration(retry_at - now))
-                )
-                continue
-            if not retry_at and not is_due(self.last_run[task], now, interval):
+            if retry_at:
+                # A pending retry replaces the schedule outright: the task owes a
+                # run and the only question is whether the backoff has elapsed.
+                if now < retry_at:
+                    print(
+                        "[{}] retrying in {}".format(
+                            task, format_duration(retry_at - now)
+                        )
+                    )
+                    continue
+            elif not is_due(self.last_run[task], now, interval):
                 remaining = next_due(self.last_run[task], interval) - now
                 print(
                     "[{}] skipped. Next run in {}".format(

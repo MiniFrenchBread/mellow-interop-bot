@@ -77,17 +77,20 @@ def mask_source_sensitive_data(message: str, source: "SourceConfig") -> str:
     if getattr(source, "executor_private_key", None):
         message = mask_sensitive_data(message, source.executor_private_key)
 
-    # Mask safe global sensitive data
-    if source.safe_global:
-        # Mask proposer private key
-        if source.safe_global.proposer_private_key:
-            message = mask_sensitive_data(
-                message, source.safe_global.proposer_private_key
-            )
+    # Mask safe global sensitive data, including any a deployment overrode. The
+    # proposal path uses the merged per-deployment config, so an override's own
+    # proposer key or API key is what would appear in an error from it.
+    safes = [source.safe_global]
+    for deployment in getattr(source, "deployments", ()) or ():
+        safes.append(getattr(deployment, "safe_global", None))
 
-        # Mask safe API key
-        if source.safe_global.api_key:
-            message = mask_sensitive_data(message, source.safe_global.api_key)
+    for safe in safes:
+        if not safe:
+            continue
+        if safe.proposer_private_key:
+            message = mask_sensitive_data(message, safe.proposer_private_key)
+        if safe.api_key:
+            message = mask_sensitive_data(message, safe.api_key)
 
     return message
 

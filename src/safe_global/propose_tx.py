@@ -178,35 +178,44 @@ def _resolve_call(
     return to, calldata, operation
 
 
-def _classify_propose_failure(
-    error: Exception,
+def _expected_transaction_id(safe_tx, safe_global: SafeGlobal) -> str:
+    return "multisig_{}_0x{}".format(
+        safe_global.safe_address, safe_tx.safe_tx_hash.hex()
+    )
+
+
+def _find_after_failed_post(
     to: str,
     calldata: str,
     source: SourceConfig,
     safe_global: SafeGlobal,
-) -> Exception:
-    """Decide whether a failed POST left a proposal behind.
+    attempts: int = 3,
+):
+    """Look for a proposal a failed POST may have left behind.
 
-    Returns ProposalPosted when the queue already holds this exact calldata, so
-    the caller knows not to propose it again; otherwise the original error, so a
-    retry is free to try once more. A lookup that itself fails is treated as
-    "posted", because proposing a duplicate is the worse of the two mistakes.
+    Returns (found, lookup_failed). Retried, because the success path below
+    assumes the row is not readable the instant a POST returns -- a single
+    immediate read would answer "not queued" for exactly the case this exists to
+    detect.
     """
-    try:
-        queued = _get_queued_transaction_for_safe(to, calldata, source.rpc, safe_global)
-    except Exception as lookup_error:
-        return ProposalPosted(
-            "unknown",
-            "the proposal failed with '{}' and the queue could not be read "
-            "back either ({}), so it is unclear whether it landed".format(
-                error, lookup_error
-            ),
-        )
-    if queued:
-        return ProposalPosted(
-            queued.id, "the proposal failed with '{}' but it is queued".format(error)
-        )
-    return error
+    lookup_failed = False
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(attempt)
+        try:
+            found = _get_queued_transaction_for_safe(
+                to, calldata, source.rpc, safe_global
+            )
+        except Exception as lookup_error:
+            lookup_failed = True
+            print_colored(
+                "Could not check whether the proposal landed: {}".format(lookup_error),
+                "yellow",
+            )
+            continue
+        if found:
+            return found, False
+    return None, lookup_failed
 
 
 def _superseded_hashes(
@@ -272,12 +281,43 @@ def propose_tx_if_needed(
     try:
         tx_hash = _propose_tx_for_safe(safe_tx, safe_global)
     except Exception as e:
-        # The POST itself can fail after the service accepted the proposal: the
-        # gateway validates its own 200 response and can reject it, and a read
-        # timeout on a committed row is retried as a duplicate POST. Ask the
-        # queue which happened rather than assuming, because assuming "not
-        # queued" makes the caller propose again and compete for the nonce.
-        raise _classify_propose_failure(e, to, calldata, source, safe_global)
+        # The POST can fail after the service accepted the proposal: the gateway
+        # validates its own 200 response and can reject it, and a read timeout on
+        # a committed row is retried as a duplicate. Ask the queue which happened
+        # rather than assuming.
+        found, lookup_failed = _find_after_failed_post(
+            to, calldata, source, safe_global
+        )
+        if found and found.id == _expected_transaction_id(safe_tx, safe_global):
+            # Proof it landed, and the queue entry describes it fully -- so this
+            # is an ordinary success, with the link, the confirmation count and
+            # the signer mentions the degraded path would have thrown away.
+            print_colored(
+                "Proposal failed with '{}' but it is queued; continuing".format(e),
+                "yellow",
+            )
+            return (
+                found,
+                True,
+                _superseded_hashes(to, calldata, safe_tx.safe_nonce, safe_global),
+            )
+        if found:
+            raise ProposalPosted(
+                found.id,
+                "the proposal failed with '{}' and something else is queued "
+                "for this calldata".format(e),
+            )
+        if lookup_failed:
+            # No evidence either way. Reported as a plain failure on purpose:
+            # treating it as queued would clear the failure counter and wait a
+            # whole interval, and a Safe API outage takes down the POST and the
+            # read-back together, so two quiet runs would consume the entire
+            # expiry margin. A retry that turns out to be a duplicate lands on
+            # the same nonce and the supersedes notice names the one to sign,
+            # which is a visible, recoverable outcome; a silent non-update is
+            # not.
+            raise e
+        raise e
     print_colored(f"Transaction proposed: {tx_hash}", "green")
 
     # Past this point the proposal exists and is signable. Everything below only

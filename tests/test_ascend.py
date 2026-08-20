@@ -130,7 +130,16 @@ class AscendTestCase(unittest.TestCase):
             # left the balance alone would let the balance be read before the
             # claims and still pass.
             if function.name == "claim":
-                reward = function.contract.call_returns.get("claim", 0)
+                # Credited with what the event reports, not with the simulated
+                # return: on chain Rewarder.claim transfers exactly the amount it
+                # emits. Using the simulation would make the modelled balance
+                # disagree with the events whenever a test drives the two apart,
+                # which is precisely what one of these tests does.
+                reward = sum(
+                    event["args"]["reward"]
+                    for event in function.contract.events_for.get("Claimed", [])
+                    if event["args"]["account"] == ROUTER
+                )
                 self.world.balances[ROUTER] = (
                     self.world.balances.get(ROUTER, 0) + reward
                 )

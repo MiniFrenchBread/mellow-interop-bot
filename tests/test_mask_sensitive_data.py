@@ -526,5 +526,50 @@ class TestExecutorKeyMasking(unittest.TestCase):
         self.assertNotIn(self.EXECUTOR_KEY, masked)
 
 
+class TestDeploymentOverrideMasking(unittest.TestCase):
+    """A deployment can override the Safe config, keys included.
+
+    The proposal path uses the merged per-deployment config, so an override's
+    own key is what appears in an error from it -- and errors reach Telegram.
+    """
+
+    OVERRIDE_KEY = "0x" + "cd" * 32
+    OVERRIDE_API_KEY = "override-api-key-value"
+
+    def source(self):
+        return SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(
+                Deployment(
+                    name="OG",
+                    source_core="0x" + "22" * 20,
+                    target_core="0x" + "33" * 20,
+                    safe_global=SafeGlobal(
+                        safe_address="0x" + "fc" * 20,
+                        proposer_private_key=self.OVERRIDE_KEY,
+                        api_url="https://api.safe.global",
+                        api_key=self.OVERRIDE_API_KEY,
+                    ),
+                ),
+            ),
+        )
+
+    def test_an_override_proposer_key_is_masked(self):
+        masked = mask_source_sensitive_data(
+            "signing failed with " + self.OVERRIDE_KEY, self.source()
+        )
+
+        self.assertNotIn(self.OVERRIDE_KEY, masked)
+
+    def test_an_override_api_key_is_masked(self):
+        masked = mask_source_sensitive_data(
+            "rejected: " + self.OVERRIDE_API_KEY, self.source()
+        )
+
+        self.assertNotIn(self.OVERRIDE_API_KEY, masked)
+
+
 if __name__ == "__main__":
     unittest.main()

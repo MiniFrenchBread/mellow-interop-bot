@@ -173,5 +173,51 @@ class TestNoResendWhenNothingMoved(unittest.TestCase):
         self.assertEqual(len(self.sends), 1, "sent once, then left for next time")
 
 
+class TestTxSettingsReachTheSend(unittest.TestCase):
+    """Per-chain settings are the invariant of record; ascend pins them, this did not."""
+
+    def setUp(self):
+        self.calls = []
+        self.captured = []
+        self.epoch_iterator = 1
+        self.values = {
+            "initTimestamp": 0,
+            "epochDuration": DAY,
+            "epochIterator": lambda: self.epoch_iterator,
+            "currentEpoch": 5,
+            "withdrawalDelay": 0,
+            "handleEpoch": None,
+        }
+        withdrawal_queue._params_cache.clear()
+        self._contract = withdrawal_queue.get_contract
+        self._send = withdrawal_queue.send_and_confirm
+        withdrawal_queue.get_contract = lambda w3, address, name: FakeContract(
+            self.values, self.calls
+        )
+
+        def capture(function, value, private_key, **kwargs):
+            self.captured.append(kwargs)
+            self.epoch_iterator += 1
+
+        withdrawal_queue.send_and_confirm = capture
+
+    def tearDown(self):
+        withdrawal_queue.get_contract = self._contract
+        withdrawal_queue.send_and_confirm = self._send
+        withdrawal_queue._params_cache.clear()
+
+    def test_settings_reach_the_handle_epoch_send(self):
+        handle_epochs(
+            FakeW3(8 * DAY),
+            QUEUE,
+            KEY,
+            max_iterations=1,
+            tx={"receipt_timeout": 60, "max_attempts": 3},
+        )
+
+        self.assertEqual(self.captured[0]["receipt_timeout"], 60)
+        self.assertEqual(self.captured[0]["max_attempts"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

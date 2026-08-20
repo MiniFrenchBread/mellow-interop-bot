@@ -56,9 +56,15 @@ class ProposeTestCase(unittest.TestCase):
 
         propose_tx._resolve_call = lambda *_a, **_k: (ORACLE, "0xCALLDATA", 0)
         propose_tx._create_signed_safe_tx_for_safe = lambda *_a: SimpleNamespace(
-            safe_nonce=11
+            safe_nonce=11, safe_tx_hash=bytes.fromhex(POSTED_HASH[2:])
         )
-        propose_tx._superseded_hashes = lambda *_a: []
+        self.superseded_nonces = []
+
+        def superseded(_to, _calldata, safe_nonce, _safe_global):
+            self.superseded_nonces.append(safe_nonce)
+            return []
+
+        propose_tx._superseded_hashes = superseded
         self.set_post(lambda: POSTED_HASH)
         self.set_queue([None])
 
@@ -102,9 +108,26 @@ class TestPostFailure(ProposeTestCase):
     so the new calldata matches nothing and competes for the same Safe nonce.
     """
 
-    def test_a_failed_post_whose_proposal_is_queued_reports_posted(self):
+    def test_a_failed_post_whose_proposal_is_queued_is_an_ordinary_success(self):
+        """The queue entry proves it landed and describes it fully.
+
+        Reporting it as merely "posted" would throw away the link, the
+        confirmation count and the mentions of the signers still to sign -- in
+        the one case where the bot has proof the proposal is waiting for them.
+        """
         self.set_post(lambda: Exception("hash mismatch in gateway response"))
         self.set_queue([None, queued()])
+
+        transaction, is_new, _superseded = self.propose()
+
+        self.assertTrue(is_new)
+        self.assertEqual(transaction.id, queued().id)
+        self.assertEqual(self.superseded_nonces, [11], "and under the signed nonce")
+
+    def test_a_failed_post_with_a_different_entry_queued_reports_posted(self):
+        """Something is at this calldata but it is not what we signed."""
+        self.set_post(lambda: Exception("gateway rejected its own response"))
+        self.set_queue([None, queued(tx_hash="0x" + "ee" * 32)])
 
         with self.assertRaises(ProposalPosted):
             self.propose()
@@ -119,13 +142,36 @@ class TestPostFailure(ProposeTestCase):
         self.assertNotIsInstance(caught.exception, ProposalPosted)
         self.assertIn("connection refused", str(caught.exception))
 
-    def test_an_unreadable_queue_after_a_failed_post_assumes_posted(self):
-        """Proposing a duplicate is the worse of the two mistakes."""
+    def test_an_unreadable_queue_after_a_failed_post_is_a_plain_failure(self):
+        """No evidence either way, so do not claim a proposal is waiting.
+
+        Calling it "posted" would clear the scheduler's failure counter and wait
+        a whole interval. A Safe API outage takes down the POST and the read-back
+        together, and two quiet runs consume the entire expiry margin. A retry
+        that turns out to be a duplicate lands on the same nonce and the
+        supersedes notice names the one to sign -- visible and recoverable.
+        """
         self.set_post(lambda: Exception("connection reset"))
         self.set_queue([None, Exception("service unavailable")])
 
-        with self.assertRaises(ProposalPosted):
+        with self.assertRaises(Exception) as caught:
             self.propose()
+
+        self.assertNotIsInstance(caught.exception, ProposalPosted)
+        self.assertIn("connection reset", str(caught.exception))
+
+    def test_the_lookup_is_retried_before_concluding_nothing_landed(self):
+        """The success path assumes a row is not readable the instant it lands.
+
+        A single immediate read would answer "not queued" for exactly the case
+        this exists to detect.
+        """
+        self.set_post(lambda: Exception("read timeout"))
+        self.set_queue([None, None, queued()])
+
+        transaction, is_new, _superseded = self.propose()
+
+        self.assertTrue(is_new)
 
 
 class TestReadBack(ProposeTestCase):
@@ -164,6 +210,21 @@ class TestDeduplication(ProposeTestCase):
         self.assertFalse(is_new)
         self.assertEqual(self.posts, 0, "must not propose a duplicate")
         self.assertEqual(superseded, [])
+
+
+class TestSupersededLookupNonce(ProposeTestCase):
+    """The competing entries are the ones bound to this proposal's nonce.
+
+    Looking under any other nonce reports the wrong set, or none, and the notice
+    then tells signers nothing about the entry it displaced.
+    """
+
+    def test_the_signed_nonce_is_what_is_looked_up(self):
+        self.set_queue([None, queued()])
+
+        self.propose()
+
+        self.assertEqual(self.superseded_nonces, [11])
 
 
 if __name__ == "__main__":

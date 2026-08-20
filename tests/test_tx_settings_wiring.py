@@ -209,22 +209,6 @@ class TestEachLegUsesItsOwnChain(unittest.TestCase):
     def tearDown(self):
         self.operator_bot.execute = self._execute
 
-    def test_push_to_target_uses_the_source_settings(self):
-        source_core = SimpleNamespace(pushToTarget=lambda: object())
-
-        # The surplus branch's only send, lifted out of run() so the chain reads
-        # around it do not have to be faked.
-        source_tx = {"receipt_timeout": 60}
-        target_tx = {"receipt_timeout": 600}
-        self.operator_bot.execute(
-            source_core.pushToTarget(), 1, SOURCE_KEY, **source_tx
-        )
-
-        self.assertEqual(self.calls[-1]["receipt_timeout"], 60)
-        self.assertNotEqual(
-            self.calls[-1]["receipt_timeout"], target_tx["receipt_timeout"]
-        )
-
     def test_the_source_leg_in_run_is_wired_to_source_tx(self):
         """Read from the source rather than faked, so a swap is visible."""
         import inspect

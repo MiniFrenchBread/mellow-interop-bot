@@ -288,6 +288,24 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
 
         asyncio.run(main.run_oracle_report(with_telegram()))
 
+    def test_a_partial_delivery_is_not_reported_as_complete(self):
+        """The status message got through and the proposal message did not.
+
+        Counting attempts rather than successes would call that a clean run.
+        """
+        calls = {"n": 0}
+
+        async def first_ok_then_fail(*_args, **_kwargs):
+            calls["n"] += 1
+            self.sends.append(1)
+            if calls["n"] == 1:
+                return SimpleNamespace(message_id=1)
+            raise Exception("httpx.ConnectError")
+
+        main.send_message = first_ok_then_fail
+
+        self.assertFalse(asyncio.run(main.run_oracle_report(with_telegram())))
+
     def test_a_working_telegram_reports_delivery(self):
         async def ok_send(*_args, **_kwargs):
             self.sends.append(1)

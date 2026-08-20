@@ -51,10 +51,20 @@ class TestSupersededLookup(unittest.TestCase):
 
     def setUp(self):
         self.calls = []
+        self.filters = []
 
         def fake_fetch(api_url, api_key, safe_address, safe_nonce, to=None):
             self.calls.append(safe_nonce)
-            return self.queue
+            self.filters.append(to)
+            if to is None:
+                return self.queue
+            # The service filters server-side, so a `to` narrows the result set
+            # before any local filtering sees it.
+            return [
+                entry
+                for entry in self.queue
+                if (entry.get("to") or "").lower() == to.lower()
+            ]
 
         import safe_global.transaction_api as module
 
@@ -98,8 +108,26 @@ class TestSupersededLookup(unittest.TestCase):
         self.assertEqual([t["safeTxHash"] for t in self.find()], [OLD_HASH])
 
     def test_target_casing_does_not_matter(self):
-        self.queue = [queued(11, "0xOLD", OLD_HASH, to=ORACLE.lower())]
-        self.assertEqual([t["safeTxHash"] for t in self.find()], [OLD_HASH])
+        """Reuse is decided by target and calldata together.
+
+        With casing ignored, a proposal would fail to recognise the one it just
+        made and tell signers to leave their own current entry unsigned.
+        """
+        self.queue = [queued(11, "0xNEW", OLD_HASH, to=ORACLE.lower())]
+
+        self.assertEqual(self.find(), [], "same target, same calldata: reuse")
+
+    def test_the_fetch_is_not_narrowed_to_one_target(self):
+        """One stale oracle goes direct, several via MultiSend.
+
+        Both bind the same nonce, so a server-side target filter would hide the
+        competitor in the case where the shape changed between proposals.
+        """
+        self.queue = [queued(11, "0xOLD", OLD_HASH)]
+
+        self.find()
+
+        self.assertEqual(self.filters, [None])
 
     def test_an_unparseable_nonce_is_ignored(self):
         self.queue = [queued("", "0xOLD", OLD_HASH)]

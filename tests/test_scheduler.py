@@ -464,5 +464,66 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
         asyncio.run(oracle_main_module.main())
 
 
+class TestRetryBackoff(unittest.TestCase):
+    """A pending retry replaces the schedule; the backoff is what paces it.
+
+    Without the backoff a failing task runs every cycle -- for ascend that is
+    real claim transactions every five minutes.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock(100 * DAY)
+        self.directory = tempfile.TemporaryDirectory()
+        self.config = make_config(
+            task_intervals={"ascend": 14 * DAY}, post_ascend_gap_seconds=0
+        )
+        self.scheduler = make_scheduler(
+            self.config,
+            now=self.clock.time,
+            sleep=self.clock.sleep,
+            state_path=os.path.join(self.directory.name, "state.json"),
+        )
+        self.ran = []
+
+        def failing():
+            self.ran.append(1)
+            raise RuntimeError("RPC exploded")
+
+        self.scheduler.task_ascend = failing
+        for task in ("rebalance", "oracle_report", "handle_epoch"):
+            setattr(self.scheduler, "task_" + task, lambda: None)
+        self.scheduler.last_run["ascend"] = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_a_failure_does_not_run_again_on_the_next_cycle(self):
+        self.scheduler.run_cycle()
+        self.assertEqual(len(self.ran), 1)
+
+        self.clock.advance(1)
+        self.scheduler.run_cycle()
+
+        self.assertEqual(len(self.ran), 1, "the backoff has not elapsed")
+
+    def test_it_runs_once_the_backoff_elapses(self):
+        self.scheduler.run_cycle()
+
+        self.clock.advance(self.scheduler.retry_after["ascend"] - self.clock.now + 1)
+        self.scheduler.run_cycle()
+
+        self.assertEqual(len(self.ran), 2)
+
+    def test_the_backoff_grows_with_consecutive_failures(self):
+        delays = []
+        for _ in range(3):
+            self.scheduler.run_cycle()
+            delays.append(self.scheduler.retry_after["ascend"] - self.clock.now)
+            self.clock.advance(delays[-1] + 1)
+
+        self.assertEqual(delays, sorted(delays))
+        self.assertLess(delays[0], delays[-1])
+
+
 if __name__ == "__main__":
     unittest.main()
