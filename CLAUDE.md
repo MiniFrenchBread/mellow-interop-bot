@@ -156,6 +156,13 @@ Chain-specific overrides (e.g., `BSC_RPC`, `BSC_SAFE_API_KEY`, `FRAX_SAFE_PROPOS
 - Safe nonces do not advance for queued-but-unexecuted proposals, so a proposal carrying a newer
   oracle value lands on the same nonce as the pending one and voids it when executed. That is the
   intended outcome, and the Telegram message names the displaced proposal so signers pick the current one.
+- Each source's `executor-private-key` signs both legs of that source's rebalance, including the
+  target-chain calls. Today every task shares one account (`OPERATOR_PK`), so this is the same key
+  either way; the per-source indirection exists so the roles can be split later without a code
+  change, and there is deliberately no separate target-chain executor key until one is needed.
+- Transaction settings are per chain and reach every send through `TxConfig.as_kwargs()`. The single
+  accessor is the point: a setting added to the dataclass but forgotten at one call site is exactly
+  how the long target-chain receipt budget ended up configured and ignored.
 - Transactions are confirmed by polling for a receipt, never by whether the broadcast call returned.
   A receipt lookup can legitimately fail for a mined transaction while the node is still indexing the
   block; a broadcast can raise after the node accepted the payload. A timeout replaces the transaction

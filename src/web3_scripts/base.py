@@ -8,6 +8,7 @@ from web3.middleware import ExtraDataToPOAMiddleware
 
 try:
     from .tx import (
+        DEFAULT_FEE_BUMP_PERCENT,
         DEFAULT_FEE_CAP_GWEI,
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RECEIPT_TIMEOUT,
@@ -27,6 +28,7 @@ except ImportError:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
     from tx import (
+        DEFAULT_FEE_BUMP_PERCENT,
         DEFAULT_FEE_CAP_GWEI,
         DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RECEIPT_TIMEOUT,
@@ -155,6 +157,7 @@ def execute(
     nonce: int = None,
     receipt_timeout: float = DEFAULT_RECEIPT_TIMEOUT,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    fee_bump_percent: int = DEFAULT_FEE_BUMP_PERCENT,
     fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
     label: str = "",
 ) -> TxOutcome:
@@ -165,6 +168,7 @@ def execute(
         nonce=nonce,
         receipt_timeout=receipt_timeout,
         max_attempts=max_attempts,
+        fee_bump_percent=fee_bump_percent,
         fee_cap_gwei=fee_cap_gwei,
         label=label,
     )

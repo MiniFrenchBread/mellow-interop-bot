@@ -34,6 +34,16 @@ class TxConfig:
     fee_bump_percent: int = DEFAULT_TX_FEE_BUMP_PERCENT
     fee_cap_gwei: int = DEFAULT_TX_FEE_CAP_GWEI
 
+    def as_kwargs(self) -> Dict[str, Any]:
+        """Every field, keyed for execute(). A single accessor so that adding a
+        setting here cannot leave a call site silently using the default."""
+        return {
+            "receipt_timeout": self.receipt_timeout_seconds,
+            "max_attempts": self.max_attempts,
+            "fee_bump_percent": self.fee_bump_percent,
+            "fee_cap_gwei": self.fee_cap_gwei,
+        }
+
 
 @dataclass(frozen=True)
 class AscendConfig:

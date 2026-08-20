@@ -29,6 +29,7 @@ jobs:
     - name: Validate configuration
       env:
         TARGET_RPC: ${{ secrets.TARGET_RPC }}
+        ZG_RPC: ${{ secrets.ZG_RPC }}
         BSC_RPC: ${{ secrets.BSC_RPC }}
         FRAX_RPC: ${{ secrets.FRAX_RPC }}
         LISK_RPC: ${{ secrets.LISK_RPC }}

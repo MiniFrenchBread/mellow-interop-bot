@@ -153,9 +153,7 @@ class Scheduler:
                 rewarders=list(source.ascend.rewarders),
                 private_key=source.executor_private_key,
                 claim_account=source.ascend.resolved_claim_account(),
-                receipt_timeout=source.tx.receipt_timeout_seconds,
-                max_attempts=source.tx.max_attempts,
-                fee_cap_gwei=source.tx.fee_cap_gwei,
+                tx=source.tx.as_kwargs(),
             )
 
     def task_rebalance(self) -> None:
@@ -180,9 +178,7 @@ class Scheduler:
                 address=source.withdrawal_queue.address,
                 private_key=source.executor_private_key,
                 max_iterations=source.withdrawal_queue.max_iterations,
-                receipt_timeout=source.tx.receipt_timeout_seconds,
-                max_attempts=source.tx.max_attempts,
-                fee_cap_gwei=source.tx.fee_cap_gwei,
+                tx=source.tx.as_kwargs(),
             )
 
     def handler(self, task: str):

@@ -57,21 +57,13 @@ def run_ascend(
     private_key: str,
     claim_account: Optional[str] = None,
     dry_run: bool = False,
-    receipt_timeout: float = None,
-    max_attempts: int = None,
-    fee_cap_gwei: int = None,
+    tx: dict = None,
 ) -> AscendResult:
     router = Web3.to_checksum_address(router)
     claim_account = Web3.to_checksum_address(claim_account or router)
     sender = Web3.to_checksum_address(Account.from_key(private_key).address)
 
-    tx_options = {}
-    if receipt_timeout is not None:
-        tx_options["receipt_timeout"] = receipt_timeout
-    if max_attempts is not None:
-        tx_options["max_attempts"] = max_attempts
-    if fee_cap_gwei is not None:
-        tx_options["fee_cap_gwei"] = fee_cap_gwei
+    tx_options = tx or {}
 
     result = AscendResult(dry_run=dry_run)
     router_contract = get_contract(w3, router, "AscendRouter")

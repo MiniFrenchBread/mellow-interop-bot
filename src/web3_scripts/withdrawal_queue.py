@@ -52,9 +52,7 @@ def handle_epochs(
     address: str,
     private_key: str,
     max_iterations: int = DEFAULT_MAX_ITERATIONS,
-    receipt_timeout: float = None,
-    max_attempts: int = None,
-    fee_cap_gwei: int = None,
+    tx: dict = None,
 ) -> int:
     """Process every matured epoch, returning how many were advanced.
 
@@ -69,13 +67,7 @@ def handle_epochs(
     params = read_params(w3, address)
     queue = get_contract(w3, address, "WithdrawalQueue")
 
-    tx_options = {}
-    if receipt_timeout is not None:
-        tx_options["receipt_timeout"] = receipt_timeout
-    if max_attempts is not None:
-        tx_options["max_attempts"] = max_attempts
-    if fee_cap_gwei is not None:
-        tx_options["fee_cap_gwei"] = fee_cap_gwei
+    tx_options = tx or {}
 
     processed = 0
     for _ in range(max_iterations):

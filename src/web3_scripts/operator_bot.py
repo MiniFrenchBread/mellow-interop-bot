@@ -65,6 +65,8 @@ def run(
     source_ratio_d3: int,
     max_source_ratio_d3: int,
     force_withdrawal: bool = False,
+    source_tx: dict = None,
+    target_tx: dict = None,
 ) -> Optional[str]:
     """Rebalance one deployment.
 
@@ -95,6 +97,13 @@ def run(
     if oracle_validation_result.incorrect_value:
         print_colored("Oracle value is incorrect", "red")
         return "oracle value is incorrect"
+
+    # Settings are per chain because the chains behave nothing alike: 0G confirms
+    # in about a second, while inclusion on the target chain depends on fee
+    # competition and regularly takes minutes. Sending a target-chain transaction
+    # under 0G's budget is what abandoned five transactions that were merely slow.
+    source_tx = source_tx or {}
+    target_tx = target_tx or {}
 
     source_w3 = get_w3(source_rpc)
     target_w3 = get_w3(target_rpc)
@@ -168,10 +177,10 @@ def run(
         data = target_helper.getAmounts(target_core_address, assets_deficit).call()
         if data[2] > 0:
             print_colored("TargetCore.redeem({})".format(data[2]))
-            execute(target_core.redeem(data[2]), 0, operator_pk)
+            execute(target_core.redeem(data[2]), 0, operator_pk, **target_tx)
         if data[1]:
             print_colored("TargetCore.claim({})".format(data[1].hex()))
-            execute(target_core.claim(data[1]), 0, operator_pk)
+            execute(target_core.claim(data[1]), 0, operator_pk, **target_tx)
         if data[0] > 0:
             value = target_helper.quotePushToSource(target_core_address).call()
             print_colored(
@@ -181,6 +190,7 @@ def run(
                 target_core.pushToSource(data[0]),
                 value,
                 operator_pk,
+                **target_tx,
             )
             print("Waiting for LayerZero finalization...")
             wait_for_layer_zero_finalization(
@@ -202,10 +212,10 @@ def run(
         data = target_helper.getAmounts(target_core_address, assets_deficit).call()
         if data[2] > 0:
             print_colored("TargetCore.redeem({})".format(data[2]))
-            execute(target_core.redeem(data[2]), 0, operator_pk)
+            execute(target_core.redeem(data[2]), 0, operator_pk, **target_tx)
         if data[1]:
             print_colored("TargetCore.claim({})".format(data[1].hex()))
-            execute(target_core.claim(data[1]), 0, operator_pk)
+            execute(target_core.claim(data[1]), 0, operator_pk, **target_tx)
         if data[0] > 0:
             value = target_helper.quotePushToSource(target_core_address).call()
             print_colored(
@@ -215,6 +225,7 @@ def run(
                 target_core.pushToSource(data[0]),
                 value,
                 operator_pk,
+                **target_tx,
             )
             print("Waiting for LayerZero finalization...")
             wait_for_layer_zero_finalization(
@@ -229,6 +240,7 @@ def run(
             source_core.pushToTarget(),
             value,
             operator_pk,
+            **source_tx,
         )
         print("Waiting for LayerZero finalization...")
         wait_for_layer_zero_finalization(
@@ -249,10 +261,10 @@ def run(
 
     if data[1]:
         print_colored("TargetCore.claim({})".format(data[1].hex()))
-        execute(target_core.claim(data[1]), 0, operator_pk)
+        execute(target_core.claim(data[1]), 0, operator_pk, **target_tx)
     if data[3] >= LAYER_ZERO_DUST:
         print_colored("TargetCore.deposit({})".format(data[3]))
-        execute(target_core.deposit(data[3]), 0, operator_pk)
+        execute(target_core.deposit(data[3]), 0, operator_pk, **target_tx)
 
 
 def parse_deployments(config, deployments_raw):
@@ -321,6 +333,9 @@ def run_all(
     """
     import os
 
+    # Fallback only. Each source signs with its own configured executor key,
+    # resolved per deployment below, so a deployment that later splits its keys
+    # does not silently keep using this one.
     operator_pk = operator_pk or os.getenv("OPERATOR_PK")
     raw_deployments = raw_deployments or os.getenv("DEPLOYMENTS")
     if source_ratio_d3 is None:
@@ -334,10 +349,16 @@ def run_all(
     if not deployments:
         raise Exception("No valid deployments found")
 
-    operator_address = Account.from_key(operator_pk).address
+    def signer_for(source) -> str:
+        key = getattr(source, "executor_private_key", None) or operator_pk
+        if not key:
+            raise Exception(f"No executor key configured for source {source.name}")
+        return key
 
     print("Configuration:\n")
-    print(f"Operator Address: {add_color(operator_address, 'yellow')}")
+    for source, _deployment in deployments:
+        address = Account.from_key(signer_for(source)).address
+        print(f"Operator Address ({source.name}): {add_color(address, 'yellow')}")
     print(f"Source Ratio D3: {add_color(str(source_ratio_d3), 'yellow')}")
     print(f"Max Source Ratio D3: {add_color(str(max_source_ratio_d3), 'yellow')}")
     print(
@@ -378,10 +399,16 @@ def run_all(
             target_rpc=config.target_rpc,
             source_core_helper=source.source_core_helper,
             target_core_helper=config.target_core_helper,
-            operator_pk=operator_pk,
+            operator_pk=signer_for(source),
             source_ratio_d3=source_ratio_d3,
             max_source_ratio_d3=max_source_ratio_d3,
             force_withdrawal=force_withdrawal,
+            source_tx=source.tx.as_kwargs() if getattr(source, "tx", None) else None,
+            target_tx=(
+                config.target_tx.as_kwargs()
+                if getattr(config, "target_tx", None)
+                else None
+            ),
         )
         skipped.append(("{}:{}".format(source.name, deployment.name), reason))
     return skipped

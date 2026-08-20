@@ -66,9 +66,7 @@ def cmd_ascend(config: Config, args) -> None:
         private_key=_require(source.executor_private_key, "executor private key"),
         claim_account=ascend.resolved_claim_account(),
         dry_run=args.dry_run,
-        receipt_timeout=source.tx.receipt_timeout_seconds,
-        max_attempts=source.tx.max_attempts,
-        fee_cap_gwei=source.tx.fee_cap_gwei,
+        tx=source.tx.as_kwargs(),
     )
     print_colored(
         "Claimed {} in total across {} rewarder(s); distributed {}".format(
@@ -86,9 +84,7 @@ def cmd_handle_epoch(config: Config, args) -> None:
         address=queue.address,
         private_key=_require(source.executor_private_key, "executor private key"),
         max_iterations=queue.max_iterations,
-        receipt_timeout=source.tx.receipt_timeout_seconds,
-        max_attempts=source.tx.max_attempts,
-        fee_cap_gwei=source.tx.fee_cap_gwei,
+        tx=source.tx.as_kwargs(),
     )
     print("Epochs processed: {}".format(processed))
 
