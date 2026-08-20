@@ -21,7 +21,7 @@ from web3_scripts import (
     format_remaining_time,
 )
 from safe_global import PendingTransactionInfo, propose_tx_if_needed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from web3_scripts.base import print_colored
 
@@ -42,6 +42,9 @@ class SafeProposal:
     ]  # List of tuples(<oracle_address>, <args>), e.g. [("0x123", [1e18]), ...]
     transaction: Optional[PendingTransactionInfo]
     is_newly_created: bool  # True if TX was newly created, False if already existed
+    # safeTxHashes of queued proposals sharing this one's Safe nonce. Only one of
+    # them can ever execute, so signers need to be told which is the current one.
+    superseded: list[str] = field(default_factory=list)
 
 
 async def main():
@@ -203,6 +206,14 @@ def compose_safe_proposal_message(
     link = compose_safe_tx_link(safe_global, proposal)
     message += f"\nLink: [{link}]({link})\n"
 
+    if proposal.superseded:
+        short = ", ".join(f"`{h[:10]}…{h[-6:]}`" for h in proposal.superseded)
+        message += (
+            f"\n⚠️ Supersedes {short}, which share this Safe nonce. "
+            "Only one of them can execute and it voids the others, "
+            "so sign this one and leave the earlier proposal(s) unsigned.\n"
+        )
+
     confirmations_message, is_confirmed = compose_safe_tx_confirmations(proposal)
     message += f"\n{confirmations_message}"
 
@@ -317,8 +328,9 @@ def propose_tx_to_update_oracle(
 
         transaction = None
         is_newly_created = False
+        superseded = []
         try:
-            transaction, is_newly_created = propose_tx_if_needed(
+            transaction, is_newly_created, superseded = propose_tx_if_needed(
                 contract_abi, method, calls, source, safe_global
             )
         except Exception as e:
@@ -336,6 +348,7 @@ def propose_tx_to_update_oracle(
             calls=calls,
             transaction=transaction,
             is_newly_created=is_newly_created,
+            superseded=superseded,
         )
         result.append((source, safe_global, proposal))
 

@@ -220,7 +220,7 @@ class TestProposeTxToUpdateOracle(unittest.TestCase):
     @patch("main.propose_tx_if_needed")
     def test_single_source_single_oracle_expired(self, mock_propose_tx):
         """Test with single source and single expired oracle"""
-        mock_propose_tx.return_value = (self.mock_pending_transaction, True)
+        mock_propose_tx.return_value = (self.mock_pending_transaction, True, [])
 
         oracle_validation_results = [(self.source_config_1, self.oracle_data_expired)]
 
@@ -260,7 +260,7 @@ class TestProposeTxToUpdateOracle(unittest.TestCase):
     @patch("main.propose_tx_if_needed")
     def test_single_source_multiple_oracles_batched(self, mock_propose_tx):
         """Test with single source and multiple oracles that should be batched"""
-        mock_propose_tx.return_value = (self.mock_pending_transaction, True)
+        mock_propose_tx.return_value = (self.mock_pending_transaction, True, [])
 
         oracle_validation_results = [
             (self.source_config_1, self.oracle_data_expired),
@@ -307,7 +307,7 @@ class TestProposeTxToUpdateOracle(unittest.TestCase):
     @patch("main.propose_tx_if_needed")
     def test_multiple_sources_separate_proposals(self, mock_propose_tx):
         """Test with multiple sources - should create separate proposals"""
-        mock_propose_tx.return_value = (self.mock_pending_transaction, True)
+        mock_propose_tx.return_value = (self.mock_pending_transaction, True, [])
 
         oracle_validation_results = [
             (self.source_config_1, self.oracle_data_expired),
@@ -363,7 +363,7 @@ class TestProposeTxToUpdateOracle(unittest.TestCase):
     @patch("main.propose_tx_if_needed")
     def test_filtering_logic(self, mock_propose_tx):
         """Test that oracles are properly filtered based on validation criteria"""
-        mock_propose_tx.return_value = (self.mock_pending_transaction, True)
+        mock_propose_tx.return_value = (self.mock_pending_transaction, True, [])
 
         oracle_validation_results = [
             (self.source_config_1, self.oracle_data_expired),  # Should be included
@@ -528,7 +528,7 @@ class TestProposeTxToUpdateOracle(unittest.TestCase):
     @patch("main.propose_tx_if_needed")
     def test_grouping_by_safe_address_correctness(self, mock_propose_tx):
         """Test that grouping by safe address works correctly with same source appearing multiple times"""
-        mock_propose_tx.return_value = (self.mock_pending_transaction, True)
+        mock_propose_tx.return_value = (self.mock_pending_transaction, True, [])
 
         # Same source appears multiple times in different positions
         oracle_validation_results = [

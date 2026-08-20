@@ -116,35 +116,78 @@ def _get_queued_transaction_for_safe(
         )
 
 
-def propose_tx_if_needed(
+def _resolve_call(
     contract_name: str,
     method: str,
-    calls: list[tuple[str, list]],
+    calls: list,
     source: SourceConfig,
     safe_global: SafeGlobal,
-) -> tuple[PendingTransactionInfo, bool]:
-    print(
-        f"Starting proposing transaction... source: '{source.name}', safe: '{safe_global.safe_address}', contract: '{contract_name}', method: '{method}', calls: {calls}..."
-    )
-
-    multi_send = len(calls) > 1
-    if multi_send:
+    verbose: bool = False,
+):
+    """Resolve one or more calls into the (to, calldata, operation) a Safe tx carries."""
+    if len(calls) > 1:
         to = resolve_multi_send_contract(source.rpc, safe_global.safe_address)
         calls_with_calldata = [
             (to, _create_calldata(contract_name, method, args)) for to, args in calls
         ]
         calldata = encode_multi(calls_with_calldata)
         operation = 1  # delegatecall
-        print(
-            f"Going to propose multi-send transaction to multi-send contract {to} with calldata: {calldata}..."
-        )
+        if verbose:
+            print(
+                f"Going to propose multi-send transaction to multi-send contract {to} with calldata: {calldata}..."
+            )
     else:
         to, args = calls[0]
         calldata = _create_calldata(contract_name, method, args)
         operation = 0  # call
-        print(
-            f"Going to propose single transaction to {to} with args: {args} (calldata: {calldata})..."
+        if verbose:
+            print(
+                f"Going to propose single transaction to {to} with args: {args} (calldata: {calldata})..."
+            )
+    return to, calldata, operation
+
+
+def _superseded_hashes(
+    to: str, calldata: str, source: SourceConfig, safe_global: SafeGlobal
+) -> list:
+    """safeTxHashes of queued proposals now competing for this proposal's nonce.
+
+    Only meaningful for the Transaction API; the Client Gateway path returns
+    nothing rather than guessing. Never fatal: failing to describe the queue is
+    not a reason to fail a proposal that already succeeded.
+    """
+    try:
+        w3 = get_w3(source.rpc)
+        safe_contract = get_contract(w3, address=safe_global.safe_address, name="Safe")
+        nonce = safe_contract.functions.nonce().call()
+        superseded = transaction_api.get_superseded_transactions(
+            safe_global.api_url,
+            safe_global.api_key,
+            safe_global.safe_address,
+            nonce,
+            to,
+            calldata,
         )
+        return [tx.get("safeTxHash") for tx in superseded if tx.get("safeTxHash")]
+    except Exception as e:
+        print_colored(f"Could not check for superseded proposals: {e}", "yellow")
+        return []
+
+
+def propose_tx_if_needed(
+    contract_name: str,
+    method: str,
+    calls: list[tuple[str, list]],
+    source: SourceConfig,
+    safe_global: SafeGlobal,
+) -> tuple[PendingTransactionInfo, bool, list]:
+    print(
+        f"Starting proposing transaction... source: '{source.name}', safe: '{safe_global.safe_address}', contract: '{contract_name}', method: '{method}', calls: {calls}..."
+    )
+
+    to, calldata, operation = _resolve_call(
+        contract_name, method, calls, source, safe_global, verbose=True
+    )
 
     safe_tx = _create_signed_safe_tx_for_safe(
         source.rpc, safe_global, to, calldata, operation
@@ -158,7 +201,7 @@ def propose_tx_if_needed(
         print_colored(
             f"Transaction '{queued_transaction.id}' is already queued", "yellow"
         )
-        return queued_transaction, False
+        return queued_transaction, False, []
 
     print(f"Proposing transaction: {safe_tx}...")
     tx_hash = _propose_tx_for_safe(safe_tx, safe_global)
@@ -181,7 +224,13 @@ def propose_tx_if_needed(
                 raise Exception(
                     f"Transaction ID mismatch: expected {tx_id}, got {transaction.id}"
                 )
-            return transaction, True
+            # The queue now holds the new entry, so what comes back here is
+            # whatever it displaced at the same nonce.
+            return (
+                transaction,
+                True,
+                _superseded_hashes(to, calldata, source, safe_global),
+            )
 
     raise Exception(
         f"Transaction not found after {attempts} attempts. Expected transaction hash: {tx_hash}"

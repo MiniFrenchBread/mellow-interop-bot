@@ -108,6 +108,34 @@ def _get_queued_transaction_by_calldata(
     return None
 
 
+def get_superseded_transactions(
+    api_url: str,
+    api_key: str,
+    safe_address: str,
+    safe_nonce: int,
+    to: str,
+    calldata: str,
+):
+    """Queued transactions this proposal would compete with.
+
+    A Safe transaction is bound to a nonce, and the nonce read from the contract
+    does not advance for proposals that are queued but not executed. So a second
+    proposal carrying a newer oracle value lands on the same nonce as the first:
+    both stay signable, only one can ever execute, and executing either voids the
+    other. That is the right outcome for an oracle -- the freshest value should
+    win rather than both being applied in turn -- but signers cannot tell which
+    of two entries is the current one unless they are told.
+    """
+    queued = _get_queued_transactions(api_url, api_key, safe_address, safe_nonce, to)
+    return [
+        transaction
+        for transaction in queued
+        if transaction.get("nonce") == safe_nonce
+        and transaction.get("to") == to
+        and transaction.get("data") != calldata
+    ]
+
+
 def _get_owners_and_threshold(
     api_url: str, api_key: str, safe_address: str
 ) -> ThresholdWithOwners:
