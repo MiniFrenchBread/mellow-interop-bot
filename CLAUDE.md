@@ -117,7 +117,7 @@ so a default there would enter public history.
 | `TELEGRAM_BOT_API_KEY` | Telegram bot token | (required unless DRY_RUN) |
 | `TELEGRAM_GROUP_CHAT_ID` | Target chat ID | (required unless DRY_RUN) |
 | `TELEGRAM_OWNER_NICKNAMES` | Safe signer nicknames, optionally with addresses | (optional) |
-| `ORACLE_EXPIRY_THRESHOLD_SECONDS` | When to alert about near-expiry | 3600 |
+| `ORACLE_EXPIRY_THRESHOLD_SECONDS` | How far ahead of expiry to start asking the signers to refresh. Must exceed the oracle-report interval or the window can be stepped over entirely | 172800 |
 | `ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS` | Window for "recently updated" notifications | 0 |
 | `TARGET_RPC` | Target chain (Ethereum) RPC | (required, no default in config) |
 | `ZG_RPC` | 0G chain RPC | (required, no default in config) |
