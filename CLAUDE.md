@@ -138,8 +138,13 @@ Chain-specific overrides (e.g., `BSC_RPC`, `BSC_SAFE_API_KEY`, `FRAX_SAFE_PROPOS
 ## CI/CD (GitHub Actions)
 
 - **check-code.yml** -- On push to `*.py`: run Black formatter check + unit tests
-- **validate-config.yml** -- On push to `config.json` or `abi/`: validate config against live chains
-- **scheduled-bot-execution.yml** -- Cron every 4 hours (or manual): run `main.py` with production secrets
+
+This deployment fork deliberately keeps no Actions secrets, so the two upstream workflows that
+need them were removed. `validate-config.yml` checked the config against live chains and could
+only ever fail here; run `python ./src/cli.py validate-config` locally instead, where the RPC
+credentials already live in `.env`. `scheduled-bot-execution.yml` ran `main.py` on a cron, which
+would have proposed Safe transactions in parallel with the scheduler on the box -- two oracle
+proposers for one Safe.
 
 ## Relationship to Other 0G Ecosystem Repos
 
