@@ -174,6 +174,46 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         self.assertGreater(len(self.sends), 1, "the announcement path must run")
         self.assertFalse(delivered, "and it must report that nobody was told")
 
+    def test_a_status_message_with_no_proposal_is_still_counted(self):
+        """When nothing is proposed the status message is the only announcement.
+
+        A transfer in flight, a recent update, or a missing proposer key all
+        produce this shape; leaving it out of the tally reported a clean run for
+        exactly the outage the tally exists to expose.
+        """
+        main.propose_tx_to_update_oracle = lambda _results: []
+
+        delivered = asyncio.run(main.run_oracle_report(with_telegram()))
+
+        self.assertGreater(len(self.sends), 0)
+        self.assertFalse(delivered)
+
+    def test_a_dry_run_send_is_not_a_delivery_failure(self):
+        """Dry-run send_message returns None on success.
+
+        Inferring failure from a missing result turned every dry run into a
+        false alarm telling the operator to go and check a healthy token.
+        """
+
+        async def dry_run_send(*_args, **_kwargs):
+            self.sends.append(1)
+            return None
+
+        main.send_message = dry_run_send
+
+        self.assertTrue(asyncio.run(main.run_oracle_report(with_telegram())))
+
+    def test_every_proposal_failing_fails_the_run(self):
+        """Nothing is queued, so the scheduler must see it and retry."""
+        proposals = one_proposal()
+        proposals[0][2].transaction = None
+        main.propose_tx_to_update_oracle = lambda _results: proposals
+
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(main.run_oracle_report(with_telegram()))
+
+        self.assertIn("no update is queued", str(caught.exception))
+
     def test_a_working_telegram_reports_delivery(self):
         async def ok_send(*_args, **_kwargs):
             self.sends.append(1)

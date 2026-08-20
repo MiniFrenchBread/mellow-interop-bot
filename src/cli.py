@@ -15,7 +15,7 @@ import dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import read_config
+from config import mask_all_sensitive_config_data, read_config
 from config.read_config import Config, SourceConfig
 from process_lock import LockHeld, ProcessLock
 from web3_scripts import get_w3, print_colored
@@ -29,6 +29,17 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 def load() -> Config:
     dotenv.load_dotenv()
     return read_config(str(CONFIG_PATH))
+
+
+# Held so the top-level handler can mask an error it did not catch in context.
+# RPC URLs carry API keys and reach exception text verbatim, and this is the
+# other path -- alongside the scheduler's Telegram alerts -- where that text
+# leaves the machine.
+_loaded_config = None
+
+
+def _sanitise(error: Exception) -> str:
+    return mask_all_sensitive_config_data(str(error), _loaded_config)
 
 
 def pick_source(config: Config, name: str = None) -> SourceConfig:
@@ -194,8 +205,10 @@ def parse_args(argv=None):
 
 
 def main() -> int:
+    global _loaded_config
     args = parse_args()
     config = load()
+    _loaded_config = config
     handler = COMMANDS[args.command]
 
     # A dry run signs nothing, so it is safe alongside a running scheduler.
@@ -209,7 +222,7 @@ def main() -> int:
         with lock:
             handler(config, args)
     except LockHeld as e:
-        print_colored(str(e), "red")
+        print_colored(_sanitise(e), "red")
         return 1
     return 0
 
@@ -221,5 +234,5 @@ if __name__ == "__main__":
         print("\nCancelled.")
         sys.exit(130)
     except Exception as error:
-        print_colored(str(error), "red")
+        print_colored(_sanitise(error), "red")
         sys.exit(1)

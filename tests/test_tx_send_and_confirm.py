@@ -543,34 +543,82 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(outcome.receipt["status"], 1)
 
-    def test_underpriced_attempts_do_not_consume_the_time_budget(self):
+    def test_the_final_sweep_finds_a_receipt_the_attempts_missed(self):
         """A rejected replacement returns instantly and sends nothing new.
 
-        Without a final sweep the attempts run out in milliseconds while the
-        first broadcast is still live in the mempool.
+        The attempts can therefore run out in milliseconds while the first
+        broadcast is still live, so the sweep after the loop is what actually
+        finds it. The receipt is withheld until every attempt has been made, so
+        this cannot pass on a receipt found inside the loop.
         """
-        state = {"polls": 0}
 
-        def receipt_after_a_few_polls(eth, tx_hash):
-            state["polls"] += 1
-            return receipt(tx_hash=tx_hash) if state["polls"] > 3 else None
+        # The first send is accepted and stays live; the second is refused at
+        # the cap, which ends the loop instantly with most of the budget unspent.
+        # The receipt appears only after both sends, so nothing inside the loop
+        # can find it -- only the sweep afterwards.
+        def only_after_the_loop_has_ended(eth, tx_hash):
+            if len(eth.sent) < 2:
+                return None
+            return receipt(tx_hash=tx_hash)
 
         w3, fn = make(
-            resolver=receipt_after_a_few_polls,
-            send_script=[None, Exception(UNDERPRICED), Exception(UNDERPRICED)],
+            resolver=only_after_the_loop_has_ended,
+            send_script=[None, Exception(UNDERPRICED)],
         )
+        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
 
         outcome = send_and_confirm(
             fn,
             0,
             TEST_KEY,
             w3=w3,
-            receipt_timeout=5,
-            max_attempts=3,
+            receipt_timeout=0.05,
+            max_attempts=2,
+            fee_cap_gwei=4,
             poll_latency=0.001,
         )
 
         self.assertEqual(outcome.receipt["status"], 1)
+        self.assertEqual(len(w3.eth.sent), 2, "both sends must have been attempted")
+        self.assertEqual(
+            outcome.tx_hashes,
+            [outcome.tx_hash],
+            "the refused hash is dropped; the live one is what the sweep found",
+        )
+
+    def test_the_underpriced_path_never_repeats_a_payload(self):
+        """Every refusal must be answered with a strictly better offer.
+
+        This is what lets a refusal be read as proof the payload is not live,
+        which is what justifies dropping its hash from the poll set. The count
+        of attempts is deliberately not asserted: `priority_ceiling` derives the
+        opening bid from `max_attempts`, so the ladder has exactly that many
+        rungs and the loop ends on the last one either way. The property that
+        carries weight is that no two of them are the same.
+        """
+        attempts = 8
+        w3, fn = make(
+            receipt_script=[], send_script=[Exception(UNDERPRICED)] * attempts
+        )
+        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
+
+        with self.assertRaises(TxNotConfirmed) as caught:
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=attempts,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+            )
+
+        fees = [t["maxPriorityFeePerGas"] for t in fn.built]
+        self.assertEqual(len(fees), len(set(fees)), "a payload was signed twice")
+        self.assertEqual(fees, sorted(fees))
+        self.assertLessEqual(fees[-1], Web3.to_wei(4, "gwei"))
+        self.assertEqual(caught.exception.tx_hashes, [], "all refused, none live")
 
     def test_nonce_too_low_after_our_tx_landed_is_success(self):
         w3, fn = make(

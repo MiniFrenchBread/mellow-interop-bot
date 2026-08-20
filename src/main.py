@@ -120,21 +120,24 @@ async def run_oracle_report(config: Config) -> bool:
     # the telling must not cancel the doing.
     safe_proposals = propose_tx_to_update_oracle(oracle_validation_results)
 
+    attempted = 0
+    delivered = 0
+    status_message = None
+
     message = compose_oracle_data_message(config, oracle_validation_results)
-    status_message = (
-        await _best_effort(
+    if message:
+        # Counted like any other announcement. When nothing is proposed -- a
+        # transfer in flight, a recent update, no proposer key -- this is the
+        # only thing that gets sent, and leaving it out of the tally reported a
+        # clean run for precisely the outage the tally exists to expose.
+        attempted += 1
+        ok, status_message = await _best_effort(
             "send the oracle status message",
             send_message(
                 config.telegram_bot_api_key, config.telegram_group_chat_id, message
             ),
         )
-        if message
-        else None
-    )
-
-    # Compose message with safe data
-    attempted = 0
-    delivered = 0
+        delivered += ok
     for source, safe_global, safe_proposal in safe_proposals:
         message = compose_safe_proposal_message(
             config.telegram_owner_nicknames,
@@ -161,7 +164,7 @@ async def run_oracle_report(config: Config) -> bool:
             # failing must not take the others' announcements with it -- and it
             # must not fail the run, or the retry proposes again against a moved
             # share price and competes for the same Safe nonce.
-            sent = await _best_effort(
+            ok, _sent = await _best_effort(
                 "send the proposal message for {}".format(source.name),
                 send_message(
                     config.telegram_bot_api_key,
@@ -172,8 +175,19 @@ async def run_oracle_report(config: Config) -> bool:
                     ),
                 ),
             )
-            delivered += sent is not None
+            delivered += ok
             attempted += 1
+
+    if safe_proposals and all(
+        proposal.transaction is None for _, _, proposal in safe_proposals
+    ):
+        # Raised after the messages so the per-Safe error still reaches Telegram.
+        # Nothing was queued, so a retry proposes rather than competing.
+        raise Exception(
+            "Every one of {} Safe proposal(s) failed; no update is queued".format(
+                len(safe_proposals)
+            )
+        )
 
     if attempted and not delivered:
         # Everything else succeeded, so nothing else will report this. Say it
@@ -190,12 +204,18 @@ async def run_oracle_report(config: Config) -> bool:
 
 
 async def _best_effort(what: str, awaitable):
-    """Await something whose failure must not stop the run. Returns None if it did."""
+    """Await something whose failure must not stop the run.
+
+    Returns (succeeded, result). Success is reported separately from the result
+    because a successful send can legitimately return nothing -- dry-run mode
+    does exactly that -- and inferring failure from a missing result turns every
+    dry run into a false alarm about the notification channel.
+    """
     try:
-        return await awaitable
+        return True, await awaitable
     except Exception as e:
         print_colored("Could not {}: {}".format(what, e), "yellow")
-        return None
+        return False, None
 
 
 def needs_attention(
