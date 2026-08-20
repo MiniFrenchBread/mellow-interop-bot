@@ -87,6 +87,19 @@ async def run_oracle_report(config: Config):
     # Validate and get oracles data
     oracle_validation_results = validate_oracles(config)
 
+    if oracle_validation_results and all(
+        oracle_data.validation is None for _, oracle_data in oracle_validation_results
+    ):
+        # validate_oracles catches per deployment so one broken chain cannot
+        # suppress the others, but every one failing is an outage rather than a
+        # report. Returning normally here would reset the scheduler's failure
+        # counter and keep the alert from ever arming.
+        raise Exception(
+            "Could not validate any of {} oracle deployment(s)".format(
+                len(oracle_validation_results)
+            )
+        )
+
     # Compose message with oracle statuses
     message = compose_oracle_data_message(config, oracle_validation_results)
     if not message:

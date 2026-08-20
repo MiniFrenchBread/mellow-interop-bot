@@ -17,7 +17,6 @@ except ImportError:
 from dataclasses import dataclass
 from typing import Optional
 
-from eth_account import Account
 from web3 import Web3
 
 DEFAULT_MAX_ITERATIONS = 8
@@ -69,7 +68,6 @@ def handle_epochs(
     the same transaction indefinitely.
     """
     address = Web3.to_checksum_address(address)
-    sender = Web3.to_checksum_address(Account.from_key(private_key).address)
     params = read_params(w3, address)
     queue = get_contract(w3, address, "WithdrawalQueue")
 

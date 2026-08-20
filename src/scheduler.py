@@ -284,6 +284,10 @@ class Scheduler:
         print("-" * 42)
 
         for task in TASK_ORDER:
+            # Re-sampled per task: a long task leaves the cycle-start value far
+            # behind, which would put a freshly computed backoff in the past and
+            # defer a task that became due while the previous one ran.
+            now = self._now()
             if self.stopping:
                 print("Stopping; skipping the rest of this cycle")
                 return

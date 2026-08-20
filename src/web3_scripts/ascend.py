@@ -20,6 +20,12 @@ from eth_account import Account
 from web3 import Web3
 from web3.logs import DISCARD
 
+# distribute() floor-divides each recipient's share, losing under a wei apiece,
+# so a successful run is routinely a few wei short of the wrapped balance. The
+# shortfall worth reporting is a whole share left behind, which is orders of
+# magnitude larger.
+DISTRIBUTION_DUST_WEI = 100
+
 
 @dataclass
 class AscendResult:
@@ -143,7 +149,7 @@ def run_ascend(
     # exceed the balance read a moment earlier if a reward landed in between, so
     # only a genuine shortfall is worth reporting.
     undistributed = result.router_balance - result.distributed
-    if undistributed > 0:
+    if undistributed > DISTRIBUTION_DUST_WEI:
         print_colored(
             "{} was wrapped but not transferred; it remains in the router "
             "as WETH".format(undistributed),

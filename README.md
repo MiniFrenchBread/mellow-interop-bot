@@ -59,16 +59,35 @@ There are some chain-specific variables, like: `BSC_SAFE_API_KEY`, `FRAX_SAFE_PR
 
 3. Set up environment variables if needed (you can use `.env` file). It is recommended to explicitly set `*_RPC` variables to use custom RPC endpoints to avoid 400/429 network errors.
 
-4. Run the main script:
+4. Run one of the entry points.
+
+    `src/main.py` is a single oracle-monitoring pass, and it never broadcasts a
+    transaction of its own — it only proposes Safe transactions for the signers
+    to approve. It is the safe thing to run first:
 
     ```bash
     python ./src/main.py
+    DRY_RUN=true python ./src/main.py   # same, without sending Telegram messages
     ```
 
-    You may want to run it without sending messages first:
+    `src/scheduler.py` is the production loop. It **signs and broadcasts real
+    transactions on both chains** — advancing the withdrawal queue within
+    minutes and rebalancing within hours — so run it only where that is
+    intended. `DRY_RUN` does not gate this; it only suppresses Telegram.
 
     ```bash
-    DRY_RUN=true python ./src/main.py
+    python -u ./src/scheduler.py
+    ```
+
+    `src/cli.py` runs any one of those operations once. Pass `--dry-run` to
+    ascend to simulate the calls without broadcasting:
+
+    ```bash
+    python ./src/cli.py ascend --dry-run
+    python ./src/cli.py handle-epoch
+    python ./src/cli.py oracle
+    python ./src/cli.py rebalance -y
+    python ./src/cli.py validate-config
     ```
 
 5. Optionally, run tests:
@@ -85,10 +104,19 @@ There are some chain-specific variables, like: `BSC_SAFE_API_KEY`, `FRAX_SAFE_PR
     docker build -t mellow-interop-bot .
     ```
 
-2. Run with environment variables:
+2. Run with environment variables. The image's default command is the
+   **scheduler**, which broadcasts real transactions, so mount a volume for the
+   file that records when each task last ran — without it a redeploy just after
+   an interval boundary silently forfeits that run:
 
     ```bash
-    docker run --env-file .env mellow-interop-bot
+    docker run --env-file .env -v mellow-bot-state:/app/state mellow-interop-bot
+    ```
+
+   To run a single monitoring pass instead, override the command:
+
+    ```bash
+    docker run --env-file .env mellow-interop-bot python ./src/main.py
     ```
 
 ### Running scripts

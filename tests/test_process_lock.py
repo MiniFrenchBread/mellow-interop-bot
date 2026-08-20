@@ -94,23 +94,8 @@ class TestLockPathResolution(unittest.TestCase):
             os.chdir(original)
 
 
-class TestPidWriteWindow(unittest.TestCase):
-
-    def test_an_empty_file_is_re_read_before_being_called_stale(self):
-        """A holder writes its pid just after creating the file.
-
-        Reading that gap once and concluding the lock is abandoned would hand a
-        second process the same lock, and both would sign from one account.
-        """
-        with open(self.path, "w"):
-            pass
-
-        lock = ProcessLock(self.path)
-        reads = [None, os.getpid()]
-        lock._read_pid = lambda: reads.pop(0) if reads else os.getpid()
-
-        with self.assertRaises(LockHeld):
-            lock.acquire()
+class TestStaleLocks(unittest.TestCase):
+    """Exclusion comes from the kernel, so a dead holder never blocks a start."""
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -118,6 +103,45 @@ class TestPidWriteWindow(unittest.TestCase):
 
     def tearDown(self):
         self.directory.cleanup()
+
+    def test_a_file_naming_our_own_pid_does_not_block_us(self):
+        """The scheduler is pid 1 inside a container.
+
+        A leftover file naming pid 1 would otherwise read as proof that someone
+        else holds the lock, and the container could never start again.
+        """
+        with open(self.path, "w") as handle:
+            handle.write(str(os.getpid()))
+
+        ProcessLock(self.path).acquire()
+
+    def test_an_empty_file_does_not_block_us(self):
+        with open(self.path, "w"):
+            pass
+
+        ProcessLock(self.path).acquire()
+
+    def test_a_holder_that_never_released_still_blocks(self):
+        holder = ProcessLock(self.path)
+        holder.acquire()
+
+        with self.assertRaises(LockHeld):
+            ProcessLock(self.path).acquire()
+
+        holder.release()
+
+    def test_the_second_attempt_does_not_destroy_the_first_holders_file(self):
+        """Takeover used to unlink first, so a loser could delete a live lock."""
+        holder = ProcessLock(self.path)
+        holder.acquire()
+
+        with self.assertRaises(LockHeld):
+            ProcessLock(self.path).acquire()
+
+        self.assertTrue(os.path.exists(self.path))
+        with open(self.path) as handle:
+            self.assertEqual(int(handle.read()), os.getpid())
+        holder.release()
 
 
 if __name__ == "__main__":

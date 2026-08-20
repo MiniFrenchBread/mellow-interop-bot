@@ -7,8 +7,8 @@ was dropped. Manual runs therefore have to establish that the scheduler is not
 running, and this makes that check automatic rather than a thing to remember.
 """
 
+import fcntl
 import os
-import time
 from pathlib import Path
 
 # The lock has to name the same file for every process regardless of where each
@@ -18,11 +18,6 @@ from pathlib import Path
 # of the other, which is worse than having no lock at all.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# A holder writes its pid immediately after creating the file, so a lock file
-# that reads as empty is far more likely to be a few milliseconds old than
-# abandoned. Re-read before concluding anything from it.
-PID_WRITE_GRACE_SECONDS = 0.5
-
 
 def resolve_lock_path(configured: str) -> str:
     """Anchor a configured lock path to the repo, unless it is already absolute."""
@@ -31,75 +26,70 @@ def resolve_lock_path(configured: str) -> str:
 
 
 class LockHeld(Exception):
-    def __init__(self, path: str, pid: int):
+    def __init__(self, path: str, pid):
         super().__init__(
             "Another run holds {} (pid {}). Stop it before running this, so the "
             "two do not send transactions from the same account at once.".format(
-                path, pid
+                path, pid if pid is not None else "unknown"
             )
         )
         self.path = path
         self.pid = pid
 
 
-def _process_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Owned by another user, but running.
-        return True
-    return True
-
-
 class ProcessLock:
+    """Exclusive across processes, via an advisory lock on an open file.
+
+    The lock lives in the kernel rather than in the file's contents. Comparing
+    pids instead cannot be made correct: two processes can both read a dead pid
+    and both decide to take over, each deleting the other's file, and a process
+    that is itself pid 1 -- which the scheduler is inside a container -- reads a
+    leftover file naming pid 1 as proof that someone else holds it, and can never
+    start again. An advisory lock has neither problem: the kernel releases it
+    when the holder dies, however it dies.
+
+    The pid is still written into the file, purely so an operator can see who is
+    holding it.
+    """
+
     def __init__(self, path: str):
         self.path = resolve_lock_path(path)
-        self._acquired = False
+        self._fd = None
 
-    def _read_pid(self):
+    def _holder_pid(self):
         try:
             with open(self.path, "r") as handle:
                 return int(handle.read().strip())
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, ValueError, OSError):
             return None
 
     def acquire(self) -> "ProcessLock":
-        while True:
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            except FileExistsError:
-                pid = self._read_pid()
-                if pid is None:
-                    # Either the holder is still writing its pid, or it died
-                    # before it could. Give it a moment to tell us apart.
-                    time.sleep(PID_WRITE_GRACE_SECONDS)
-                    pid = self._read_pid()
-                if pid is not None and _process_alive(pid):
-                    raise LockHeld(self.path, pid)
-                # The holder died without cleaning up. Drop the stale file and
-                # retry rather than refusing to start after a crash.
-                try:
-                    os.unlink(self.path)
-                except FileNotFoundError:
-                    pass
-                continue
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            pid = self._holder_pid()
+            os.close(fd)
+            raise LockHeld(self.path, pid)
 
-            with os.fdopen(fd, "w") as handle:
-                handle.write(str(os.getpid()))
-            self._acquired = True
-            return self
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        os.fsync(fd)
+        self._fd = fd
+        return self
 
     def release(self) -> None:
-        if not self._acquired:
+        if self._fd is None:
             return
-        if self._read_pid() == os.getpid():
-            try:
-                os.unlink(self.path)
-            except FileNotFoundError:
-                pass
-        self._acquired = False
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
 
     def __enter__(self) -> "ProcessLock":
         return self.acquire()

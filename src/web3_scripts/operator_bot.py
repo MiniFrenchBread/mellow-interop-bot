@@ -104,6 +104,9 @@ def run(
     # under 0G's budget is what abandoned five transactions that were merely slow.
     source_tx = source_tx or {}
     target_tx = target_tx or {}
+    # operator_pk signs on both chains: the source's executor key is used for the
+    # target-chain calls too. There is no separate target executor key, so
+    # pointing OG_EXECUTOR_PK at a 0G-only account would break every send below.
 
     source_w3 = get_w3(source_rpc)
     target_w3 = get_w3(target_rpc)
