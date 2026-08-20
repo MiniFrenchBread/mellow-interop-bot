@@ -118,6 +118,58 @@ class TestNeedsAttention(unittest.TestCase):
         self.assertFalse(needs_attention([]))
 
 
+class TestTotalValidationOutage(unittest.TestCase):
+    """Every oracle failing validation is an outage, not a report.
+
+    Returning normally would reset the scheduler's failure counter and keep the
+    alert from ever arming -- for the task whose silence started this.
+    """
+
+    def setUp(self):
+        self._validate = main.validate_oracles
+        self._info = main.print_telegram_info
+
+        async def no_info(*_args):
+            return None
+
+        main.print_telegram_info = no_info
+
+    def tearDown(self):
+        main.validate_oracles = self._validate
+        main.print_telegram_info = self._info
+
+    def test_all_validations_failing_raises(self):
+        main.validate_oracles = lambda _config: [
+            (SOURCE, OracleData(name="OG", deployment=None, validation=None)),
+            (SOURCE, OracleData(name="OG2", deployment=None, validation=None)),
+        ]
+
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(main.run_oracle_report(base_config()))
+
+        self.assertIn("Could not validate any", str(caught.exception))
+
+    def test_one_validation_failing_does_not_raise(self):
+        """One broken chain must not suppress the others."""
+        main.validate_oracles = lambda _config: [
+            (SOURCE, OracleData(name="OG", deployment=None, validation=None)),
+            (
+                SOURCE,
+                OracleData(
+                    name="OG2",
+                    deployment=None,
+                    validation=validation(incorrect_value=True),
+                ),
+            ),
+        ]
+        propose = main.propose_tx_to_update_oracle
+        main.propose_tx_to_update_oracle = lambda _results: []
+        try:
+            asyncio.run(main.run_oracle_report(base_config()))
+        finally:
+            main.propose_tx_to_update_oracle = propose
+
+
 class TestTelegramCannotCancelTheProposal(unittest.TestCase):
 
     def setUp(self):
@@ -204,7 +256,7 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         self.assertTrue(asyncio.run(main.run_oracle_report(with_telegram())))
 
     def test_every_proposal_failing_fails_the_run(self):
-        """Nothing is queued, so the scheduler must see it and retry."""
+        """Nothing reached the service, so the scheduler must see it and retry."""
         proposals = one_proposal()
         proposals[0][2].transaction = None
         main.propose_tx_to_update_oracle = lambda _results: proposals
@@ -212,7 +264,29 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         with self.assertRaises(Exception) as caught:
             asyncio.run(main.run_oracle_report(with_telegram()))
 
-        self.assertIn("no update is queued", str(caught.exception))
+        self.assertIn("queued no update", str(caught.exception))
+
+    def test_one_failure_among_several_does_not_fail_the_run(self):
+        """Retrying would re-propose against the Safe whose proposal succeeded.
+
+        This is what separates `all` from `any`, and a single-proposal fixture
+        cannot tell them apart.
+        """
+        proposals = one_proposal() + one_proposal()
+        proposals[0][2].transaction = None
+
+        main.propose_tx_to_update_oracle = lambda _results: proposals
+
+        asyncio.run(main.run_oracle_report(with_telegram()))
+
+    def test_a_posted_but_unconfirmed_proposal_does_not_fail_the_run(self):
+        """It is queued and signable; a retry would compete for its nonce."""
+        proposals = one_proposal()
+        proposals[0][2].transaction = None
+        proposals[0][2].posted = True
+        main.propose_tx_to_update_oracle = lambda _results: proposals
+
+        asyncio.run(main.run_oracle_report(with_telegram()))
 
     def test_a_working_telegram_reports_delivery(self):
         async def ok_send(*_args, **_kwargs):

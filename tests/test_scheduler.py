@@ -258,6 +258,40 @@ class TestCycleIsolation(unittest.TestCase):
 
         self.assertLessEqual(self.scheduler.retry_delay("ascend"), interval)
 
+    def test_the_cycle_persists_the_schedule(self):
+        """Serialising is covered elsewhere; this pins that the cycle calls it.
+
+        Without the call a restart cannot know a slot was already served, which
+        is the property the persisted schedule exists for.
+        """
+        saves = []
+        self.scheduler._save_state = lambda: saves.append(1)
+        self.clock.advance(10)
+
+        self.scheduler.run_cycle()
+
+        self.assertGreater(len(saves), 0)
+
+    def test_rebalance_pins_force_withdrawal_off(self):
+        """A stray FORCE_WITHDRAWAL must not pull the whole position back."""
+        captured = {}
+
+        def fake_rebalance(config, **kwargs):
+            captured.update(kwargs)
+            return []
+
+        import scheduler as scheduler_module
+
+        original = scheduler_module.run_rebalance
+        scheduler_module.run_rebalance = fake_rebalance
+        try:
+            # The real method, not setUp's stub of the same name.
+            Scheduler.task_rebalance(self.scheduler)
+        finally:
+            scheduler_module.run_rebalance = original
+
+        self.assertIs(captured.get("force_withdrawal"), False)
+
     def test_a_stop_request_abandons_the_rest_of_the_cycle(self):
         def stop_then_run():
             self.ran.append("ascend")

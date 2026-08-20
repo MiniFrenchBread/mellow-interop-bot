@@ -20,7 +20,7 @@ from web3_scripts import (
     run_oracle_validation,
     format_remaining_time,
 )
-from safe_global import PendingTransactionInfo, propose_tx_if_needed
+from safe_global import PendingTransactionInfo, ProposalPosted, propose_tx_if_needed
 from dataclasses import dataclass, field
 
 from web3_scripts.base import print_colored
@@ -50,6 +50,10 @@ class SafeProposal:
     # safeTxHashes of queued proposals sharing this one's Safe nonce. Only one of
     # them can ever execute, so signers need to be told which is the current one.
     superseded: list[str] = field(default_factory=list)
+    # True when the proposal reached the Safe service but could not be read back.
+    # It is queued and signable, so this run did put an update in front of the
+    # signers even though it has no transaction to describe.
+    posted: bool = False
 
 
 async def main():
@@ -179,14 +183,16 @@ async def run_oracle_report(config: Config) -> bool:
             attempted += 1
 
     if safe_proposals and all(
-        proposal.transaction is None for _, _, proposal in safe_proposals
+        proposal.transaction is None and not proposal.posted
+        for _, _, proposal in safe_proposals
     ):
         # Raised after the messages so the per-Safe error still reaches Telegram.
-        # Nothing was queued, so a retry proposes rather than competing.
+        # Only when nothing reached the service at all: a proposal that was
+        # posted but not confirmed is already queued, and a retry would compete
+        # with it rather than replace it.
         raise Exception(
-            "Every one of {} Safe proposal(s) failed; no update is queued".format(
-                len(safe_proposals)
-            )
+            "Every one of {} Safe proposal(s) failed before reaching the service; "
+            "this run queued no update".format(len(safe_proposals))
         )
 
     if attempted and not delivered:
@@ -194,8 +200,12 @@ async def run_oracle_report(config: Config) -> bool:
         # loudly here, because the channel that would normally carry the alarm
         # is the one that is down.
         print_colored(
-            "Proposed {} Safe transaction(s) but could not announce any of them; "
-            "signers have not been told".format(len(safe_proposals)),
+            "Nothing could be announced; signers have not been told"
+            + (
+                " about {} Safe transaction(s)".format(len(safe_proposals))
+                if safe_proposals
+                else ""
+            ),
             "red",
         )
     else:
@@ -440,9 +450,18 @@ def propose_tx_to_update_oracle(
         transaction = None
         is_newly_created = False
         superseded = []
+        posted = False
         try:
             transaction, is_newly_created, superseded = propose_tx_if_needed(
                 contract_abi, method, calls, source, safe_global
+            )
+        except ProposalPosted as e:
+            # Queued and signable; only the read-back failed. Retrying would add
+            # a second entry competing for the same nonce.
+            posted = True
+            print_colored(
+                f"Proposal for source {source.name} (safe: {safe_address}): {e}",
+                "yellow",
             )
         except Exception as e:
             error_message = str(e)
@@ -460,6 +479,7 @@ def propose_tx_to_update_oracle(
             transaction=transaction,
             is_newly_created=is_newly_created,
             superseded=superseded,
+            posted=posted,
         )
         result.append((source, safe_global, proposal))
 

@@ -98,6 +98,40 @@ class TestErrorMasking(unittest.TestCase):
 
         self.assertIn("boom", cli._sanitise(Exception("boom")))
 
+    def test_the_lock_held_path_masks_what_it_prints(self):
+        """Testing the helper alone leaves the call site free to bypass it."""
+        import process_lock
+        from web3_scripts import base
+
+        printed = []
+        original_print = base.print_colored
+        original_load = cli.load
+        original_parse = cli.parse_args
+        original_acquire = process_lock.ProcessLock.acquire
+        base.print_colored = lambda text, color="yellow": printed.append(text)
+        cli.print_colored = base.print_colored
+        cli.load = lambda: config()
+        cli.parse_args = lambda argv=None: SimpleNamespace(
+            command="handle-epoch", source=None, no_lock=False
+        )
+
+        def refuse(self):
+            # The path carries the credential so the assertion has teeth.
+            raise cli.LockHeld("https://rpc.invalid/apikey-SECRET", 1)
+
+        process_lock.ProcessLock.acquire = refuse
+        try:
+            self.assertEqual(cli.main(), 1)
+        finally:
+            base.print_colored = original_print
+            cli.print_colored = original_print
+            cli.load = original_load
+            cli.parse_args = original_parse
+            process_lock.ProcessLock.acquire = original_acquire
+
+        self.assertTrue(printed)
+        self.assertNotIn("apikey-SECRET", " ".join(printed))
+
 
 if __name__ == "__main__":
     unittest.main()

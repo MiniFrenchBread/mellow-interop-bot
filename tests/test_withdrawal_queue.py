@@ -136,5 +136,42 @@ class TestWithdrawalDelayIsReadFresh(unittest.TestCase):
         )
 
 
+class TestNoResendWhenNothingMoved(unittest.TestCase):
+    """handleEpoch returns without advancing when liquidity is short.
+
+    Resending on that is how the shell loop answered "already known" 472 times.
+    """
+
+    def setUp(self):
+        self.calls = []
+        self.values = {
+            "initTimestamp": 0,
+            "epochDuration": DAY,
+            "epochIterator": 1,
+            "currentEpoch": 5,
+            "withdrawalDelay": 0,
+            "handleEpoch": None,
+        }
+        withdrawal_queue._params_cache.clear()
+        self._contract = withdrawal_queue.get_contract
+        self._send = withdrawal_queue.send_and_confirm
+        withdrawal_queue.get_contract = lambda w3, address, name: FakeContract(
+            self.values, self.calls
+        )
+        self.sends = []
+        withdrawal_queue.send_and_confirm = lambda *a, **k: self.sends.append(1)
+
+    def tearDown(self):
+        withdrawal_queue.get_contract = self._contract
+        withdrawal_queue.send_and_confirm = self._send
+        withdrawal_queue._params_cache.clear()
+
+    def test_a_stalled_epoch_is_sent_once_and_left_alone(self):
+        processed = handle_epochs(FakeW3(8 * DAY), QUEUE, KEY, max_iterations=5)
+
+        self.assertEqual(processed, 0)
+        self.assertEqual(len(self.sends), 1, "sent once, then left for next time")
+
+
 if __name__ == "__main__":
     unittest.main()

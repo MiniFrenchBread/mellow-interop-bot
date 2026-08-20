@@ -11,6 +11,22 @@ from web3_scripts import get_contract, print_colored, get_w3
 from config import SourceConfig, SafeGlobal
 
 
+class ProposalPosted(Exception):
+    """The proposal reached the Safe service but could not be confirmed.
+
+    Distinct from a plain failure because the transaction is queued and
+    signable. Treating this as "nothing happened" and proposing again produces a
+    second entry competing for the same Safe nonce, since the share price will
+    have moved and the calldata no longer matches.
+    """
+
+    def __init__(self, safe_tx_hash: str, reason: str):
+        super().__init__(
+            "Proposal {} was posted but not confirmed: {}".format(safe_tx_hash, reason)
+        )
+        self.safe_tx_hash = safe_tx_hash
+
+
 def _create_calldata(contract_name: str, method: str, args: list) -> str:
     contract = get_contract(Web3(), address=constants.ADDRESS_ZERO, name=contract_name)
     calldata = contract.encode_abi(method, args)
@@ -225,7 +241,11 @@ def propose_tx_if_needed(
     tx_hash = _propose_tx_for_safe(safe_tx, safe_global)
     print_colored(f"Transaction proposed: {tx_hash}", "green")
 
-    # Transaction might not be immediately created, try getting it again with several attempts
+    # Past this point the proposal exists and is signable. Everything below only
+    # confirms that, so its failures are reported as ProposalPosted: a caller
+    # that retries after a plain failure would propose again, and against a share
+    # price that has moved by then the calldata differs, so the new proposal is
+    # not deduplicated and competes with the one already queued.
     attempts = 8
     for attempt in range(attempts):
         time.sleep(attempt + 1)
@@ -233,14 +253,20 @@ def propose_tx_if_needed(
         print(
             f"Trying to get transaction: {tx_hash}... (attempt {attempt + 1} of {attempts})"
         )
-        transaction = _get_queued_transaction_for_safe(
-            to, calldata, source.rpc, safe_global
-        )
+        try:
+            transaction = _get_queued_transaction_for_safe(
+                to, calldata, source.rpc, safe_global
+            )
+        except Exception as e:
+            raise ProposalPosted(tx_hash, "could not read it back: {}".format(e))
         if transaction:
             tx_id = f"multisig_{safe_global.safe_address}_{tx_hash}"
             if transaction.id != tx_id:
-                raise Exception(
-                    f"Transaction ID mismatch: expected {tx_id}, got {transaction.id}"
+                raise ProposalPosted(
+                    tx_hash,
+                    "read back a different id: expected {}, got {}".format(
+                        tx_id, transaction.id
+                    ),
                 )
             # The queue now holds the new entry, so what comes back here is
             # whatever it displaced at the same nonce.
@@ -250,6 +276,6 @@ def propose_tx_if_needed(
                 _superseded_hashes(to, calldata, safe_tx.safe_nonce, safe_global),
             )
 
-    raise Exception(
-        f"Transaction not found after {attempts} attempts. Expected transaction hash: {tx_hash}"
+    raise ProposalPosted(
+        tx_hash, "not visible in the queue after {} attempts".format(attempts)
     )
