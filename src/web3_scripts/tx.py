@@ -387,24 +387,26 @@ def send_and_confirm(
                         prefix, attempt
                     )
                 )
-                # The node refused this exact payload, so unlike every other
-                # error here it is certain the transaction is not live. Polling
-                # for it would spend the remaining budget on a hash that cannot
-                # appear, and would name it in the failure as though it might.
-                if tx_hash in sent_hashes:
-                    sent_hashes.remove(tx_hash)
+                # The node refused this exact payload. Every attempt signs a
+                # strictly higher fee than the last -- the loop stops rather than
+                # repeating one -- so this hash was broadcast for the first time
+                # just now, and a refusal of a first broadcast is the one error
+                # here that proves the transaction is not live. Polling for it
+                # would spend the remaining budget on a hash that cannot appear,
+                # and name it in the failure as though it might.
+                sent_hashes.remove(tx_hash)
                 cap = w3.to_wei(fee_cap_gwei, "gwei")
                 bumped = _bump(max_priority_fee, fee_bump_percent)
                 if bumped > cap:
                     _log(
                         "{}Replacement underpriced but the {} gwei cap is "
-                        "reached; waiting on what is broadcast".format(
+                        "reached; nothing further can outbid the incumbent".format(
                             prefix, fee_cap_gwei
                         )
                     )
-                else:
-                    max_priority_fee = bumped
-                    max_fee = _bump(max_fee, fee_bump_percent)
+                    break
+                max_priority_fee = bumped
+                max_fee = _bump(max_fee, fee_bump_percent)
                 continue  # nothing new was broadcast; the final sweep still polls
             else:
                 raise _with_hashes(e, sent_hashes, nonce)
@@ -437,14 +439,16 @@ def send_and_confirm(
             cap = w3.to_wei(fee_cap_gwei, "gwei")
             if bumped_priority > cap:
                 # A configured cap is a limit on what we are willing to pay, so
-                # it also limits replacements. Below the client's minimum premium
-                # a replacement would only be rejected, so keep waiting on what
-                # is already broadcast instead of re-signing.
+                # it also limits replacements. Stop attempting rather than
+                # continuing: with the fees pinned the next attempt would sign a
+                # byte-identical payload under the same hash, which is pure
+                # noise -- and would make it ambiguous whether a later refusal
+                # referred to a payload that had already been accepted.
                 _log(
                     "{}Fee cap of {} gwei reached; waiting on the broadcast "
                     "transaction rather than replacing it".format(prefix, fee_cap_gwei)
                 )
-                continue
+                break
             max_priority_fee = bumped_priority
             max_fee = max(_bump(max_fee, fee_bump_percent), fresh_max_fee)
             _log(

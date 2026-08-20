@@ -257,7 +257,15 @@ class Scheduler:
 
         # The raising variant, not main(): main() swallows everything so the
         # scheduler could never see this task fail.
-        asyncio.run(run_oracle_report(self.config))
+        notified = asyncio.run(run_oracle_report(self.config))
+        if not notified:
+            # Not raised: failing would retry, and a retry after the share price
+            # moved proposes different calldata competing for the same Safe
+            # nonce. The alert would go over the channel that is down anyway.
+            print_colored(
+                "[oracle_report] proposals are queued but no one was notified",
+                "red",
+            )
 
     def task_handle_epoch(self) -> None:
         for source in self.config.sources:

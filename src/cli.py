@@ -92,8 +92,14 @@ def cmd_handle_epoch(config: Config, args) -> None:
 def cmd_oracle(config: Config, args) -> None:
     from main import run_oracle_report
 
-    # The raising variant, so a failure leaves a non-zero exit status.
-    asyncio.run(run_oracle_report(config))
+    # The raising variant, so a failure leaves a non-zero exit status. Delivery
+    # failures do not raise -- they would make the scheduler retry and propose
+    # again -- so they are surfaced here instead, where a person is watching.
+    if not asyncio.run(run_oracle_report(config)):
+        raise Exception(
+            "Oracle report ran but could not notify anyone; check the Telegram "
+            "token, the group id, and that the bot is still in the group"
+        )
 
 
 def cmd_rebalance(config: Config, args) -> None:

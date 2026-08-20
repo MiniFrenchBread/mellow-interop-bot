@@ -66,8 +66,12 @@ async def main():
         print(f"Unexpected error: {error_message}")
 
 
-async def run_oracle_report(config: Config):
+async def run_oracle_report(config: Config) -> bool:
     """Validate every oracle, alert, and propose updates.
+
+    Returns whether every announcement it tried to send got through, so a caller
+    that a human is watching can say otherwise. Never raises for a delivery
+    failure -- see below.
 
     Kept separate from main() because the scheduler needs to see failures: with
     the catch-all wrapped around this work, a broken oracle report always looked
@@ -109,7 +113,7 @@ async def run_oracle_report(config: Config):
 
     if not needs_attention(oracle_validation_results):
         print("No invalid oracle statuses to report")
-        return
+        return True
 
     # Proposed before anything is sent. The proposal is the action that keeps
     # the oracle alive; the messages only tell people about it, and an outage in
@@ -129,6 +133,8 @@ async def run_oracle_report(config: Config):
     )
 
     # Compose message with safe data
+    attempted = 0
+    delivered = 0
     for source, safe_global, safe_proposal in safe_proposals:
         message = compose_safe_proposal_message(
             config.telegram_owner_nicknames,
@@ -150,15 +156,37 @@ async def run_oracle_report(config: Config):
                     + message
                 )
 
-            await send_message(
-                config.telegram_bot_api_key,
-                config.telegram_group_chat_id,
-                message,
-                reply_to_message_id=(
-                    status_message.message_id if status_message else None
+            # Wrapped per proposal: this is the message carrying the Safe link,
+            # the missing confirmations and the supersedes notice, so one source
+            # failing must not take the others' announcements with it -- and it
+            # must not fail the run, or the retry proposes again against a moved
+            # share price and competes for the same Safe nonce.
+            sent = await _best_effort(
+                "send the proposal message for {}".format(source.name),
+                send_message(
+                    config.telegram_bot_api_key,
+                    config.telegram_group_chat_id,
+                    message,
+                    reply_to_message_id=(
+                        status_message.message_id if status_message else None
+                    ),
                 ),
             )
-    print(f"Sent {len(safe_proposals)} message(s) with safe proposal")
+            delivered += sent is not None
+            attempted += 1
+
+    if attempted and not delivered:
+        # Everything else succeeded, so nothing else will report this. Say it
+        # loudly here, because the channel that would normally carry the alarm
+        # is the one that is down.
+        print_colored(
+            "Proposed {} Safe transaction(s) but could not announce any of them; "
+            "signers have not been told".format(len(safe_proposals)),
+            "red",
+        )
+    else:
+        print(f"Sent {delivered} message(s) with safe proposal")
+    return delivered == attempted
 
 
 async def _best_effort(what: str, awaitable):

@@ -281,8 +281,9 @@ class TestSendAndConfirm(unittest.TestCase):
         )
 
     def test_every_planned_bump_fits_under_the_cap(self):
+        """The headroom exists so the planned replacements can all be signed."""
         w3, fn = make(receipt_script=[])
-        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
+        w3.eth.max_priority_fee = Web3.to_wei(1, "gwei") // 2
 
         with self.assertRaises(TxNotConfirmed):
             send_and_confirm(
@@ -300,6 +301,54 @@ class TestSendAndConfirm(unittest.TestCase):
         cap = Web3.to_wei(4, "gwei")
         for transaction in fn.built:
             self.assertLessEqual(transaction["maxPriorityFeePerGas"], cap)
+
+    def test_bumping_stops_once_the_cap_is_reached(self):
+        """With the tip already above the cap there is nowhere left to climb."""
+        w3, fn = make(receipt_script=[])
+        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=4,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+            )
+
+        self.assertLess(len(fn.built), 4, "stops instead of repeating a payload")
+        self.assertLessEqual(
+            fn.built[-1]["maxPriorityFeePerGas"], Web3.to_wei(4, "gwei")
+        )
+
+    def test_no_attempt_repeats_a_payload(self):
+        """Every attempt must offer strictly more than the last.
+
+        Re-signing identical fields produces the same hash, which is noise, and
+        makes it ambiguous whether a later refusal refers to a payload the node
+        had already accepted -- the premise the refusal handling relies on.
+        """
+        w3, fn = make(receipt_script=[])
+        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=4,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+            )
+
+        fees = [t["maxPriorityFeePerGas"] for t in fn.built]
+        self.assertEqual(len(fees), len(set(fees)), "a payload was signed twice")
+        self.assertEqual(fees, sorted(fees))
 
     def test_the_fee_cap_still_caps_after_a_bump(self):
         """A cap is a limit on what we will pay, replacements included."""
