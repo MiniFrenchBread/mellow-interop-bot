@@ -37,17 +37,23 @@ This bot is the operational automation layer for the Mellow interop protocol -- 
   - `multi_send_call.py` -- Encodes multiple calls into a single `multiSend(bytes)` call for Safe contracts (supports versions 1.3.0, 1.4.1, 1.5.0).
   - `common.py` -- Shared data structures (`PendingTransactionInfo`, `ThresholdWithOwners`), validation helpers, retry utility.
 - **`src/telegram_bot/`** -- Telegram message sending with Markdown formatting and dry-run support.
-- **`abi/`** -- JSON ABI files for smart contracts: `Oracle`, `SourceCore`, `TargetCore`, `SourceHelper`, `TargetHelper`, `Safe`, `SafeMultiSend`.
+- **`abi/`** -- JSON ABI files for smart contracts: `Oracle`, `SourceCore`, `TargetCore`, `SourceHelper`, `TargetHelper`, `Safe`, `SafeMultiSend`, `Rewarder`, `AscendRouter`, `WithdrawalQueue`.
 
-### Shell Scripts
+### Scheduler and CLI
 
-- **`run_bot.sh`** -- Production scheduler loop running 4 tasks on different intervals:
-  - Task 1: Run `ascend.sh` from `0g-restaking-contracts` every 2 weeks
-  - Task 2: Run `operator_bot.py` every 2 hours (rebalancing)
-  - Task 3: Run `main.py` every 1 day (oracle monitoring + Telegram alerts)
-  - Task 4: Process mature withdrawal epochs on WithdrawalQueue contract using `cast send`
-- **`run_bot_testnet.sh`** -- Testnet scheduler: runs ascend every 4h, operator_bot every 5m, and triggers Forge scripts from `mellow-interop` repo to update oracles.
-- **`handle_epoch.sh`** -- Standalone script to process mature withdrawal epochs on the WithdrawalQueue contract.
+- **`src/scheduler.py`** -- Production task loop, replacing the former `run_bot.sh`. Runs four tasks
+  on independent intervals in one process: ascend (2 weeks), rebalance (2 hours), oracle report
+  (1 day), handle-epoch (5 minutes). Tasks fire on multiples of their interval measured from the
+  Unix epoch, so a restart neither shifts the schedule nor skips a beat. Each task is isolated so
+  one failure cannot stop the others, and repeated failures or repeated guard-skips raise a
+  Telegram alert.
+- **`src/cli.py`** -- One-shot entry points for the same code paths: `ascend` (with `--dry-run`),
+  `handle-epoch`, `oracle`, `rebalance`, `validate-config`.
+- **`src/process_lock.py`** -- Single-holder lock shared by the scheduler and the CLI. One account
+  signs every transaction, so two processes running at once would collide over its nonce.
+
+The bot no longer shells out to `forge` or `cast`, and no longer needs a checkout of
+`0g-restaking-contracts`.
 
 ## Build and Test Commands
 
@@ -56,6 +62,16 @@ This bot is the operational automation layer for the Mellow interop protocol -- 
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Run the scheduler (production)
+python -u ./src/scheduler.py
+
+# One-shot commands
+python ./src/cli.py ascend --dry-run   # simulate claims, broadcast nothing
+python ./src/cli.py ascend
+python ./src/cli.py handle-epoch
+python ./src/cli.py oracle
+python ./src/cli.py rebalance -y
 
 # Run main bot (oracle monitoring + alerts)
 python ./src/main.py
@@ -93,6 +109,9 @@ Central configuration file with `${VAR:default}` env var substitution. Structure
 
 ### Key Environment Variables
 
+Credentialed RPC URLs belong in `.env`, never as defaults in `config.json`: that file is tracked,
+so a default there would enter public history.
+
 | Variable | Purpose | Default |
 |---|---|---|
 | `TELEGRAM_BOT_API_KEY` | Telegram bot token | (required unless DRY_RUN) |
@@ -100,12 +119,16 @@ Central configuration file with `${VAR:default}` env var substitution. Structure
 | `TELEGRAM_OWNER_NICKNAMES` | Safe signer nicknames, optionally with addresses | (optional) |
 | `ORACLE_EXPIRY_THRESHOLD_SECONDS` | When to alert about near-expiry | 3600 |
 | `ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS` | Window for "recently updated" notifications | 0 |
-| `TARGET_RPC` | Target chain (Ethereum) RPC | QuikNode default |
-| `ZG_RPC` | 0G chain RPC | default in config |
+| `TARGET_RPC` | Target chain (Ethereum) RPC | (required, no default in config) |
+| `ZG_RPC` | 0G chain RPC | (required, no default in config) |
 | `SAFE_PROPOSER_PK` | Global Safe proposer private key | (optional) |
 | `SAFE_API_KEY` | Global Safe API key | (optional) |
 | `DRY_RUN` | Skip Telegram messages | false |
-| `OPERATOR_PK` | Operator private key for rebalancing | (required for operator_bot) |
+| `OPERATOR_PK` | Signs every transaction: rebalancing, ascend claims, epoch advances | (required) |
+| `OG_EXECUTOR_PK` | Overrides `OPERATOR_PK` for the 0G chain only | `OPERATOR_PK` |
+| `OG_RECEIPT_TIMEOUT` / `TARGET_RECEIPT_TIMEOUT` | Seconds to wait for a receipt before replacing the transaction at a higher fee | 60 / 600 |
+| `ASCEND_INTERVAL_SECONDS` / `REBALANCE_INTERVAL_SECONDS` / `ORACLE_REPORT_INTERVAL_SECONDS` / `HANDLE_EPOCH_INTERVAL_SECONDS` | Task intervals | 1209600 / 7200 / 86400 / 300 |
+| `ALERT_AFTER_FAILURES` | Consecutive failures or skips before a Telegram alert | 3 |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
 | `SOURCE_RATIO_D3` | Target source asset ratio (per mille) | 50 |
 | `MAX_SOURCE_RATIO_D3` | Max source ratio before surplus rebalance | 100 |
@@ -120,8 +143,8 @@ Chain-specific overrides (e.g., `BSC_RPC`, `BSC_SAFE_API_KEY`, `FRAX_SAFE_PROPOS
 
 ## Relationship to Other 0G Ecosystem Repos
 
-- **mellow-interop** -- The smart contracts (Solidity) that this bot monitors and manages. Contains SourceCore, TargetCore, Oracle contracts deployed across chains. The testnet script (`run_bot_testnet.sh`) calls Forge scripts from this repo to update oracles.
-- **0g-restaking-contracts** -- Contains `ascend.sh` which is called periodically by `run_bot.sh` for restaking protocol epoch advancement. The bot also interacts with the WithdrawalQueue contract from this repo.
+- **mellow-interop** -- The smart contracts (Solidity) that this bot monitors and manages. Contains SourceCore, TargetCore, Oracle, and WithdrawalQueue contracts deployed across chains.
+- **0g-restaking-contracts** -- Source of the Rewarder and AscendRouter contracts. The ascend task used to run a Forge script from this repo; it is now implemented in `src/web3_scripts/ascend.py` and this repo is no longer a runtime dependency.
 - **0g-chain-v2 / 0g-geth / 0g-reth** -- The 0G blockchain nodes (consensus + execution layers) that serve as one of the source chains monitored by this bot.
 - **0g-restaking-service** -- Complementary service; while that handles restaking event bridging, this bot handles oracle freshness and vault rebalancing.
 
@@ -130,5 +153,12 @@ Chain-specific overrides (e.g., `BSC_RPC`, `BSC_SAFE_API_KEY`, `FRAX_SAFE_PROPOS
 - Oracle "secure value" is computed as `(sourceValue + targetValue) * 1e18 / totalSupply`, queried at a block 15 seconds before latest (SECURE_INTERVAL) to avoid using very recent state.
 - OFT transfer detection: compares source chain inbound/outbound nonces with target chain outbound/inbound nonces; mismatch means a LayerZero cross-chain transfer is in flight.
 - Safe transaction proposals: the bot first checks for an existing queued transaction with matching calldata before proposing a new one, to avoid duplicates.
+- Safe nonces do not advance for queued-but-unexecuted proposals, so a proposal carrying a newer
+  oracle value lands on the same nonce as the pending one and voids it when executed. That is the
+  intended outcome, and the Telegram message names the displaced proposal so signers pick the current one.
+- Transactions are confirmed by polling for a receipt, never by whether the broadcast call returned.
+  A receipt lookup can legitimately fail for a mined transaction while the node is still indexing the
+  block; a broadcast can raise after the node accepted the payload. A timeout replaces the transaction
+  at a higher fee under the same nonce, and every hash sent for that nonce stays in the poll set.
 - Multi-send is used automatically when multiple oracle updates are needed for the same Safe address.
 - Error messages are sanitized to mask RPC URLs, private keys, and API keys before logging or sending to Telegram.
