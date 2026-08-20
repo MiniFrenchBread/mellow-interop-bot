@@ -382,6 +382,14 @@ def _merge_safe_global_overrides(
     return merged
 
 
+def _at_least(name: str, value: Any, minimum: int) -> int:
+    """Reject a setting that would silently disable what it configures."""
+    parsed = int(value)
+    if parsed < minimum:
+        raise ValueError("{} must be at least {}, got {}".format(name, minimum, parsed))
+    return parsed
+
+
 def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
     if not tx_dict:
         return TxConfig()
@@ -389,9 +397,15 @@ def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
         receipt_timeout_seconds=float(
             tx_dict.get("receipt_timeout_seconds", DEFAULT_RECEIPT_TIMEOUT_SECONDS)
         ),
-        max_attempts=int(tx_dict.get("max_attempts", DEFAULT_TX_MAX_ATTEMPTS)),
-        fee_bump_percent=int(
-            tx_dict.get("fee_bump_percent", DEFAULT_TX_FEE_BUMP_PERCENT)
+        max_attempts=_at_least(
+            "max-attempts", tx_dict.get("max_attempts", DEFAULT_TX_MAX_ATTEMPTS), 1
+        ),
+        # Above 100 or a replacement cannot clear the node's minimum premium
+        # and every attempt after the first is refused.
+        fee_bump_percent=_at_least(
+            "fee-bump-percent",
+            tx_dict.get("fee_bump_percent", DEFAULT_TX_FEE_BUMP_PERCENT),
+            101,
         ),
         fee_cap_gwei=int(tx_dict.get("fee_cap_gwei", DEFAULT_TX_FEE_CAP_GWEI)),
     )

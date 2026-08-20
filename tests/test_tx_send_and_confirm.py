@@ -78,7 +78,11 @@ class FakeEth:
     def get_balance(self, _address):
         return self._balance
 
+    def set_balance(self, value):
+        self._balance = value
+
     def get_block(self, _identifier):
+        self.block_reads = getattr(self, "block_reads", 0) + 1
         return SimpleNamespace(baseFeePerGas=7)
 
     def get_transaction_count(self, _address, block="latest"):
@@ -174,6 +178,67 @@ class TestErrorClassification(unittest.TestCase):
 
     def test_missing_receipts_is_not_a_revert(self):
         self.assertFalse(is_revert(Exception(RECEIPTS_NOT_INDEXED)))
+
+
+class TestFeeArithmetic(unittest.TestCase):
+    """The bump is what makes every attempt a distinct payload.
+
+    That distinctness is the whole premise for dropping a refused hash from the
+    poll set, so the floor that guarantees it is load-bearing on its own.
+    """
+
+    def test_a_bump_always_moves_the_number(self):
+        from web3_scripts.tx import _bump
+
+        # A percentage alone rounds back to the input for small values, and the
+        # config would allow a percentage that never moves it at all.
+        for value in (0, 1, 2, 7, 100):
+            self.assertGreater(_bump(value, 101), value)
+
+    def test_the_config_refuses_a_percentage_that_cannot_replace(self):
+        from config.read_config import _create_tx_config
+
+        with self.assertRaises(ValueError):
+            _create_tx_config({"fee_bump_percent": 100})
+
+    def test_the_config_refuses_zero_attempts(self):
+        from config.read_config import _create_tx_config
+
+        with self.assertRaises(ValueError):
+            _create_tx_config({"max_attempts": 0})
+
+
+class TestPreflightGuards(unittest.TestCase):
+    """Refuse before signing rather than after broadcasting."""
+
+    def test_a_balance_below_the_call_value_is_refused(self):
+        w3, fn = make(receipt_script=[receipt()])
+        w3.eth.set_balance(5)
+
+        with self.assertRaises(Exception) as caught:
+            send_and_confirm(fn, 10, TEST_KEY, w3=w3, poll_latency=0.001)
+
+        # Named specifically: the affordability guard below rejects this case
+        # too, and asserting the shared prefix would let this one be deleted.
+        self.assertIn("LayerZero payment", str(caught.exception))
+        self.assertEqual(w3.eth.sent, [])
+
+    def test_a_balance_that_cannot_cover_gas_is_refused(self):
+        w3, fn = make(receipt_script=[receipt()])
+        w3.eth.set_balance(1)
+
+        with self.assertRaises(Exception) as caught:
+            send_and_confirm(fn, 0, TEST_KEY, w3=w3, poll_latency=0.001)
+
+        self.assertIn("transaction execution", str(caught.exception))
+        self.assertEqual(w3.eth.sent, [])
+
+    def test_the_gas_estimate_carries_a_buffer(self):
+        w3, fn = make(receipt_script=[receipt()])
+
+        send_and_confirm(fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001)
+
+        self.assertGreater(fn.built[0]["gas"], fn._gas)
 
 
 class TestSendAndConfirm(unittest.TestCase):
@@ -478,7 +543,8 @@ class TestSendAndConfirm(unittest.TestCase):
         elapsed = _time.monotonic() - started
 
         self.assertEqual(caught.exception.tx_hashes, [])
-        self.assertIn("underpriced", str(caught.exception))
+        self.assertIn("refused", str(caught.exception))
+        self.assertIn("nothing is live", str(caught.exception).lower())
         self.assertLess(elapsed, 1, "must not wait out a budget for nothing")
 
     def test_gives_up_carrying_every_hash(self):
@@ -585,6 +651,29 @@ class TestSendAndConfirm(unittest.TestCase):
             [outcome.tx_hash],
             "the refused hash is dropped; the live one is what the sweep found",
         )
+
+    def test_the_underpriced_path_makes_no_network_call(self):
+        """The node just refused a payload; do not go back to it for a fee.
+
+        The slow path consults the network deliberately and is guarded for it.
+        This one relies on a keyword default to stay offline.
+        """
+        w3, fn = make(receipt_script=[], send_script=[Exception(UNDERPRICED)] * 4)
+        w3.eth.block_reads = 0
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=4,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+            )
+
+        self.assertEqual(w3.eth.block_reads, 1, "only the opening fee reads a block")
 
     def test_the_underpriced_path_never_repeats_a_payload(self):
         """Every refusal must be answered with a strictly better offer.

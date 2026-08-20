@@ -21,12 +21,6 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_FEE_BUMP_PERCENT = 115
 DEFAULT_FEE_CAP_GWEI = 4
 DEFAULT_POLL_LATENCY = 0.5
-# How long to keep looking for our own receipt after the node rejects a
-# replacement as "nonce too low". That answer usually means an earlier attempt
-# was mined, but the receipt for it is not queryable for a few seconds after
-# inclusion, so a single immediate lookup would report a successful transaction
-# as a lost one.
-NONCE_CONFLICT_LOOKUP_TIMEOUT = 10
 GAS_BUFFER_PERCENT = 105
 BASE_FEE_BUFFER_PERCENT = 105
 PRIORITY_FEE_MULTIPLIER = 3
@@ -85,10 +79,16 @@ class TxNotConfirmed(Exception):
 
 
 class NonceAlreadyUsed(Exception):
-    """The nonce was consumed by a transaction that is not one of ours."""
+    """The nonce is taken and no receipt for our own attempts turned up.
 
-    def __init__(self, message: str, nonce: int):
+    Carries the hashes anyway. On a replacement the likeliest occupant is an
+    earlier attempt of ours that mined while we were waiting, so reporting this
+    without them would describe a mined transaction as a lost one.
+    """
+
+    def __init__(self, message: str, tx_hashes: List[str], nonce: int):
         super().__init__(message)
+        self.tx_hashes = list(tx_hashes)
         self.nonce = nonce
 
 
@@ -366,6 +366,10 @@ def send_and_confirm(
         nonce = w3.eth.get_transaction_count(sender, "latest")
 
     sent_hashes: List[str] = []
+    # Carried out of the loop so the sweep below reports the attempt actually
+    # reached rather than the budget. Diagnostic only -- nothing branches on it,
+    # and pinning it in a test would take a timing assumption not worth having.
+    attempt = 0
     # The whole call gets one budget. Attempts that fail without waiting -- a
     # rejected replacement returns instantly -- must not each buy another full
     # timeout, or one send could hold the scheduler for the better part of an
@@ -415,11 +419,17 @@ def send_and_confirm(
                     )
                 )
             elif is_nonce_too_low(e):
+                # Every hash stays in the poll set, unlike the underpriced branch
+                # below. There the node rejected this exact payload, so it cannot
+                # be live; here it only says the nonce is spent -- and the likely
+                # spender is one of ours, possibly this very payload, since an
+                # unchanged operation re-signs to the same hash and an earlier
+                # run may already have mined it.
                 try:
                     receipt = wait_any_receipt(
                         w3,
                         sent_hashes,
-                        min(NONCE_CONFLICT_LOOKUP_TIMEOUT, receipt_timeout),
+                        min(receipt_timeout, remaining_budget()),
                         poll_latency,
                     )
                 except Exception as lookup_error:
@@ -427,7 +437,11 @@ def send_and_confirm(
                 if receipt is not None:
                     return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
                 raise NonceAlreadyUsed(
-                    "Nonce {} was consumed by another transaction: {}".format(nonce, e),
+                    "Nonce {} is already taken and none of this run's {} "
+                    "transaction(s) has a receipt: {}".format(
+                        nonce, len(sent_hashes), e
+                    ),
+                    sent_hashes,
                     nonce,
                 )
             elif is_underpriced(e):
@@ -444,9 +458,15 @@ def send_and_confirm(
                 # would spend the remaining budget on a hash that cannot appear,
                 # and name it in the failure as though it might.
                 sent_hashes.remove(tx_hash)
-                raised = next_fees(
-                    w3, max_fee, max_priority_fee, fee_bump_percent, fee_cap_gwei
-                )
+                try:
+                    raised = next_fees(
+                        w3, max_fee, max_priority_fee, fee_bump_percent, fee_cap_gwei
+                    )
+                except Exception as fee_error:
+                    # Reachable only if this ever starts consulting the network,
+                    # which is one keyword away. Guarded like the other call site
+                    # so the hashes cannot be lost if it does.
+                    raise _with_hashes(fee_error, sent_hashes, nonce)
                 if raised is None:
                     _log(
                         "{}Replacement underpriced but the {} gwei cap is "
@@ -510,20 +530,20 @@ def send_and_confirm(
     except Exception as e:
         raise _with_hashes(e, sent_hashes, nonce)
     if receipt is not None:
-        return _confirmed(w3, receipt, nonce, max_attempts, sent_hashes, prefix)
+        return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
 
     if not sent_hashes:
         raise TxNotConfirmed(
-            "Nonce {} is occupied by a transaction this run could not replace "
-            "within the {} gwei cap; every attempt was refused as underpriced "
-            "and none is live".format(nonce, fee_cap_gwei),
+            "Nothing is live for nonce {} after {} attempt(s): every payload was "
+            "refused, so the nonce is held by something this run could not "
+            "outbid within the {} gwei cap".format(nonce, attempt, fee_cap_gwei),
             sent_hashes,
             nonce,
         )
 
     raise TxNotConfirmed(
         "No receipt for nonce {} after {} attempt(s). Broadcast hashes: {}".format(
-            nonce, max_attempts, ", ".join(sent_hashes)
+            nonce, attempt, ", ".join(sent_hashes)
         ),
         sent_hashes,
         nonce,

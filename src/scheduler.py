@@ -166,6 +166,9 @@ class Scheduler:
 
     def record_failure(self, task: str, error: Exception) -> None:
         self.failures[task] += 1
+        # A failure breaks a run of skips: "skipped 3 times in a row" should mean
+        # three in a row.
+        self.skips[task] = 0
         message = mask_all_sensitive_config_data(str(error), self.config)
         # Backticks would close the code fence below and Telegram would reject
         # the message, dropping the alert precisely when the error is unusual.
@@ -332,7 +335,13 @@ class Scheduler:
                 # each task in its own process, and losing it would let one
                 # failure stop every other task.
                 self.record_failure(task, e)
-                self.retry_after[task] = now + self.retry_delay(task)
+                # Measured from when the task finished, not from when the cycle
+                # began. A task that fails because its sends timed out can run
+                # for longer than its own backoff, which would put the retry in
+                # the past and make it run again every cycle -- the pacing the
+                # backoff exists to provide, absent for exactly the failure it
+                # was written for.
+                self.retry_after[task] = self._now() + self.retry_delay(task)
 
             if task == "ascend":
                 gap = self.config.scheduler.post_ascend_gap_seconds

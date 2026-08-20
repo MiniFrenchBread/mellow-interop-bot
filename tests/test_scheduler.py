@@ -189,6 +189,13 @@ class TestCycleIsolation(unittest.TestCase):
 
         self.assertEqual(self.scheduler.failures["rebalance"], 0)
 
+    def test_a_failure_breaks_a_run_of_skips(self):
+        """ "Skipped three times in a row" has to mean in a row."""
+        self.scheduler.record_skip("rebalance", "oracle value is incorrect")
+        self.scheduler.record_failure("rebalance", RuntimeError("boom"))
+
+        self.assertEqual(self.scheduler.skips["rebalance"], 0)
+
     def test_repeated_skips_alert(self):
         sent = []
         self.scheduler.notify = sent.append
@@ -513,6 +520,27 @@ class TestRetryBackoff(unittest.TestCase):
         self.scheduler.run_cycle()
 
         self.assertEqual(len(self.ran), 2)
+
+    def test_a_slow_failure_still_gets_its_backoff(self):
+        """Measured from when the task finished, not when the cycle began.
+
+        A task that fails because its sends timed out runs for longer than its
+        own backoff, so a start-of-cycle timestamp puts the retry in the past
+        and it runs again every cycle -- no pacing, for the one failure the
+        backoff exists to pace.
+        """
+        clock = self.clock
+
+        def slow_failure():
+            self.ran.append(1)
+            clock.advance(2400)
+            raise RuntimeError("every send timed out")
+
+        self.scheduler.task_ascend = slow_failure
+
+        self.scheduler.run_cycle()
+
+        self.assertGreater(self.scheduler.retry_after["ascend"], clock.now)
 
     def test_the_backoff_grows_with_consecutive_failures(self):
         delays = []
