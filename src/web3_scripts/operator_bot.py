@@ -5,6 +5,7 @@ except ImportError:
     from base import *
     from oracle_script import run_oracle_validation
 import time
+from typing import List, Optional, Tuple
 
 LAYER_ZERO_DUST = 1000_000_000_000
 
@@ -64,7 +65,14 @@ def run(
     source_ratio_d3: int,
     max_source_ratio_d3: int,
     force_withdrawal: bool = False,
-) -> None:
+) -> Optional[str]:
+    """Rebalance one deployment.
+
+    Returns None when the pass completed, or a short reason when a guard stopped
+    it before any transaction was sent. The reason is what lets the scheduler
+    notice that this task has been skipping silently: nothing is wrong with a
+    single skip, but repeated ones mean the bot has quietly stopped rebalancing.
+    """
     oracle_validation_result = run_oracle_validation(
         source_core_address,
         target_core_address,
@@ -78,15 +86,15 @@ def run(
 
     if oracle_validation_result.transfer_in_progress:
         print_colored("OFT transfers in progress", "yellow")
-        return []
+        return "OFT transfers in progress"
 
     if oracle_validation_result.almost_expired:
         print_colored("Oracle is almost expired", "red")
-        return []
+        return "oracle almost expired"
 
     if oracle_validation_result.incorrect_value:
         print_colored("Oracle value is incorrect", "red")
-        return []
+        return "oracle value is incorrect"
 
     source_w3 = get_w3(source_rpc)
     target_w3 = get_w3(target_rpc)
@@ -118,7 +126,7 @@ def run(
             ),
             "yellow",
         )
-        return
+        return "OFT transfers in progress"
 
     source_value = source_helper.getSourceValue(source_core_address).call(
         block_identifier=source_block
@@ -139,7 +147,7 @@ def run(
         print_colored(
             "Withdrawal demand is greater or equal to total assets. Invalid state."
         )
-        return
+        return "withdrawal demand exceeds total assets"
 
     current_ratio_d3 = int(
         1000
@@ -297,40 +305,37 @@ def parse_deployments(config, deployments_raw):
     return valid_deployments
 
 
-if __name__ == "__main__":
+def run_all(
+    config,
+    operator_pk: str = None,
+    raw_deployments: str = None,
+    source_ratio_d3: int = None,
+    max_source_ratio_d3: int = None,
+    force_withdrawal: bool = None,
+    interactive: bool = True,
+) -> List[Tuple[str, Optional[str]]]:
+    """Rebalance every configured deployment.
+
+    Lifted out of the __main__ block so the scheduler and the CLI can call it
+    in-process rather than spawning a subprocess.
+    """
     import os
-    import dotenv
-    import sys
-    from pathlib import Path
 
-    # Add src directory to path to import config module
-    src_path = Path(__file__).parent.parent
-    sys.path.insert(0, str(src_path))
+    operator_pk = operator_pk or os.getenv("OPERATOR_PK")
+    raw_deployments = raw_deployments or os.getenv("DEPLOYMENTS")
+    if source_ratio_d3 is None:
+        source_ratio_d3 = int(os.getenv("SOURCE_RATIO_D3", 50))
+    if max_source_ratio_d3 is None:
+        max_source_ratio_d3 = int(os.getenv("MAX_SOURCE_RATIO_D3", 100))
+    if force_withdrawal is None:
+        force_withdrawal = int(os.getenv("FORCE_WITHDRAWAL", 0)) != 0
 
-    from config.read_config import read_config
-
-    dotenv.load_dotenv()
-
-    # Read configuration from config.json
-    config_path = src_path.parent / "config.json"
-    config = read_config(str(config_path))
-
-    # Get environment variables
-    operator_pk = os.getenv("OPERATOR_PK")
-    raw_deployments = os.getenv("DEPLOYMENTS")
-    source_ratio_d3 = int(os.getenv("SOURCE_RATIO_D3", 50))
-    max_source_ratio_d3 = int(os.getenv("MAX_SOURCE_RATIO_D3", 100))
-    force_withdrawal = int(os.getenv("FORCE_WITHDRAWAL", 0)) != 0
-
-    # Parse deployments
     deployments = parse_deployments(config, raw_deployments)
-    if not deployments or len(deployments) == 0:
-        print_colored("No valid deployments found", "red")
-        sys.exit(1)
+    if not deployments:
+        raise Exception("No valid deployments found")
 
     operator_address = Account.from_key(operator_pk).address
 
-    # Print configuration summary
     print("Configuration:\n")
     print(f"Operator Address: {add_color(operator_address, 'yellow')}")
     print(f"Source Ratio D3: {add_color(str(source_ratio_d3), 'yellow')}")
@@ -350,30 +355,23 @@ if __name__ == "__main__":
         print(f"\tTarget Core Helper: {add_color(config.target_core_helper, 'yellow')}")
         print(f"\tTarget Core: {add_color(deployment.target_core, 'yellow')}")
 
-    if os.getenv("NON_INTERACTIVE", "").strip().lower() == "true":
+    if interactive and os.getenv("NON_INTERACTIVE", "").strip().lower() != "true":
+        user_input = (
+            input("\nEnter 'y' to continue, any other key to quit: ").strip().lower()
+        )
+        if user_input != "y":
+            print("Operation cancelled by user.")
+            return []
+        print("Continuing with operations...")
+    elif interactive:
         print_colored(
             "NON_INTERACTIVE enabled; skipping confirmation prompt.", "yellow"
         )
-    else:
-        # Wait for user confirmation
-        try:
-            user_input = (
-                input("\nEnter 'y' to continue, any other key to quit: ")
-                .strip()
-                .lower()
-            )
-            if user_input == "y":
-                print("Continuing with operations...")
-            else:
-                print("Operation cancelled by user.")
-                sys.exit(0)
-        except KeyboardInterrupt:
-            print("\nOperation cancelled by user (Ctrl+C).")
-            sys.exit(0)
 
+    skipped = []
     for source, deployment in deployments:
         print(f"\nProcessing deployment {deployment.name} of {source.name}...")
-        run(
+        reason = run(
             source_core_address=deployment.source_core,
             target_core_address=deployment.target_core,
             source_rpc=source.rpc,
@@ -385,3 +383,30 @@ if __name__ == "__main__":
             max_source_ratio_d3=max_source_ratio_d3,
             force_withdrawal=force_withdrawal,
         )
+        skipped.append(("{}:{}".format(source.name, deployment.name), reason))
+    return skipped
+
+
+if __name__ == "__main__":
+    import dotenv
+    import sys
+    from pathlib import Path
+
+    # Add src directory to path to import config module
+    src_path = Path(__file__).parent.parent
+    sys.path.insert(0, str(src_path))
+
+    from config.read_config import read_config
+
+    dotenv.load_dotenv()
+
+    config_path = src_path.parent / "config.json"
+
+    try:
+        run_all(read_config(str(config_path)))
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user (Ctrl+C).")
+        sys.exit(0)
+    except Exception as e:
+        print_colored(str(e), "red")
+        sys.exit(1)
