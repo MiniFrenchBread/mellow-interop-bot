@@ -1,5 +1,4 @@
 import dotenv
-import os
 import asyncio
 from pathlib import Path
 from collections import defaultdict
@@ -68,12 +67,17 @@ async def main():
 
 
 async def run_oracle_report(config: Config):
-    """Validate every oracle, alert, and propose updates. Raises on failure.
+    """Validate every oracle, alert, and propose updates.
 
     Kept separate from main() because the scheduler needs to see failures: with
     the catch-all wrapped around this work, a broken oracle report always looked
     like a successful one, and the whole retry-and-alert path was dead for the
     one task whose silence started this.
+
+    Raises on anything that stops the report being produced, and on every oracle
+    failing validation, which is what a total RPC outage looks like. A single
+    deployment or Safe failing is still caught and reported inline, so one broken
+    chain does not suppress the others.
     """
     # Print Telegram info (Bot and group)
     await print_telegram_info(

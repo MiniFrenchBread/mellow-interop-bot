@@ -199,6 +199,26 @@ class TestCycleIsolation(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("oracle value is incorrect", sent[0])
 
+    def test_a_task_stuck_skipping_keeps_alerting(self):
+        """Like failures: one alert then silence is what this exists to prevent."""
+        sent = []
+        self.scheduler.notify = sent.append
+
+        for _ in range(6):
+            self.scheduler.record_skip("rebalance", "oracle value is incorrect")
+
+        self.assertEqual(len(sent), 2)
+
+    def test_backticks_in_an_error_cannot_break_the_alert(self):
+        sent = []
+        self.scheduler.notify = sent.append
+        self.scheduler.failures["ascend"] = 2
+
+        self.scheduler.record_failure("ascend", RuntimeError("bad `code` here"))
+
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("`code`", sent[0])
+
     def test_a_failure_does_not_consume_the_task_interval(self):
         """Marking a failed run as done costs a fortnightly task a fortnight."""
         self._stub("ascend", RuntimeError("RPC exploded"))
@@ -332,6 +352,46 @@ class TestPersistedSchedule(unittest.TestCase):
 
         self.assertEqual(scheduler.last_run["ascend"], 5.0)
         self.assertNotIn("retired_task", scheduler.last_run)
+
+
+class TestMissingExecutorKey(unittest.TestCase):
+    """A task with no key must fail, not report success while doing nothing."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def scheduler_without_a_key(self):
+        from config.read_config import AscendConfig, SourceConfig, WithdrawalQueueConfig
+
+        config = make_config()
+        config.sources = [
+            SourceConfig(
+                name="OG",
+                rpc="https://rpc.invalid",
+                source_core_helper="0x" + "11" * 20,
+                deployments=(),
+                executor_private_key=None,
+                ascend=AscendConfig(
+                    router="0x" + "22" * 20, rewarders=("0x" + "33" * 20,)
+                ),
+                withdrawal_queue=WithdrawalQueueConfig(address="0x" + "44" * 20),
+            )
+        ]
+        return make_scheduler(
+            config, state_path=os.path.join(self.directory.name, "state.json")
+        )
+
+    def test_ascend_refuses_to_run_without_a_key(self):
+        with self.assertRaises(Exception) as caught:
+            self.scheduler_without_a_key().task_ascend()
+        self.assertIn("OPERATOR_PK", str(caught.exception))
+
+    def test_handle_epoch_refuses_to_run_without_a_key(self):
+        with self.assertRaises(Exception):
+            self.scheduler_without_a_key().task_handle_epoch()
 
 
 class TestOracleTaskFailuresAreVisible(unittest.TestCase):

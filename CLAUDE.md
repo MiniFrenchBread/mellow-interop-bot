@@ -131,6 +131,7 @@ so a default there would enter public history.
 | `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
+| `FORCE_WITHDRAWAL` | Standalone `operator_bot.py` only: pull the **entire** target-chain position back. The scheduler passes `False` explicitly so a stray export cannot trigger it unattended | 0 |
 | `SOURCE_RATIO_D3` | Target source asset ratio (per mille) | 50 |
 | `MAX_SOURCE_RATIO_D3` | Max source ratio before surplus rebalance | 100 |
 

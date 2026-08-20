@@ -201,16 +201,37 @@ def wait_any_receipt(
         time.sleep(min(poll_latency, remaining))
 
 
-def compute_fees(w3: Web3, fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI):
+def priority_ceiling(w3: Web3, fee_cap_gwei: int, bumps: int, bump_percent: int) -> int:
+    """The most the first attempt may offer and still leave room to be replaced.
+
+    A cap applied directly to the opening bid is self-defeating: the suggested
+    tip on the target chain is routinely a third of the cap or more, so the first
+    send lands on the cap and every replacement is then refused for exceeding it
+    -- disabling, under ordinary conditions, the one mechanism that rescues a
+    transaction the network has priced out. Holding back enough for the planned
+    bumps keeps both the ceiling and the ability to climb to it.
+    """
+    cap = w3.to_wei(fee_cap_gwei, "gwei")
+    for _ in range(max(0, bumps)):
+        cap = cap * 100 // bump_percent
+    return max(1, cap)
+
+
+def compute_fees(
+    w3: Web3,
+    fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
+    ceiling: int = None,
+):
     """Return (max_fee_per_gas, max_priority_fee_per_gas) for the next attempt."""
     base_fee = w3.eth.get_block("latest").baseFeePerGas * BASE_FEE_BUFFER_PERCENT // 100
+    if ceiling is None:
+        ceiling = w3.to_wei(fee_cap_gwei, "gwei")
     try:
         max_priority_fee = min(
-            w3.eth.max_priority_fee * PRIORITY_FEE_MULTIPLIER,
-            w3.to_wei(fee_cap_gwei, "gwei"),
+            w3.eth.max_priority_fee * PRIORITY_FEE_MULTIPLIER, ceiling
         )
     except Exception:
-        max_priority_fee = w3.to_wei(FALLBACK_PRIORITY_FEE_GWEI, "gwei")
+        max_priority_fee = min(w3.to_wei(FALLBACK_PRIORITY_FEE_GWEI, "gwei"), ceiling)
     return base_fee + max_priority_fee, max_priority_fee
 
 
@@ -268,7 +289,10 @@ def send_and_confirm(
     if gas is None:
         gas = estimate_gas(contract_function, sender, value)
 
-    max_fee, max_priority_fee = compute_fees(w3, fee_cap_gwei)
+    opening_ceiling = priority_ceiling(
+        w3, fee_cap_gwei, max_attempts - 1, fee_bump_percent
+    )
+    max_fee, max_priority_fee = compute_fees(w3, fee_cap_gwei, opening_ceiling)
 
     required = gas * max_fee + value
     if balance < required:
@@ -334,12 +358,15 @@ def send_and_confirm(
                     )
                 )
             elif is_nonce_too_low(e):
-                receipt = wait_any_receipt(
-                    w3,
-                    sent_hashes,
-                    min(NONCE_CONFLICT_LOOKUP_TIMEOUT, receipt_timeout),
-                    poll_latency,
-                )
+                try:
+                    receipt = wait_any_receipt(
+                        w3,
+                        sent_hashes,
+                        min(NONCE_CONFLICT_LOOKUP_TIMEOUT, receipt_timeout),
+                        poll_latency,
+                    )
+                except Exception as lookup_error:
+                    raise _with_hashes(lookup_error, sent_hashes, nonce)
                 if receipt is not None:
                     return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
                 raise NonceAlreadyUsed(
@@ -352,8 +379,18 @@ def send_and_confirm(
                         prefix, attempt
                     )
                 )
-                max_fee = _bump(max_fee, fee_bump_percent)
-                max_priority_fee = _bump(max_priority_fee, fee_bump_percent)
+                cap = w3.to_wei(fee_cap_gwei, "gwei")
+                bumped = _bump(max_priority_fee, fee_bump_percent)
+                if bumped > cap:
+                    _log(
+                        "{}Replacement underpriced but the {} gwei cap is "
+                        "reached; waiting on what is broadcast".format(
+                            prefix, fee_cap_gwei
+                        )
+                    )
+                else:
+                    max_priority_fee = bumped
+                    max_fee = _bump(max_fee, fee_bump_percent)
                 continue  # nothing new was broadcast; the final sweep still polls
             else:
                 raise _with_hashes(e, sent_hashes, nonce)
@@ -400,7 +437,10 @@ def send_and_confirm(
     # A rejected replacement returns instantly, so the attempts can run out with
     # most of the time budget unspent while an earlier broadcast is still live in
     # the mempool. Spend what is left before declaring the transaction lost.
-    receipt = wait_any_receipt(w3, sent_hashes, remaining_budget(), poll_latency)
+    try:
+        receipt = wait_any_receipt(w3, sent_hashes, remaining_budget(), poll_latency)
+    except Exception as e:
+        raise _with_hashes(e, sent_hashes, nonce)
     if receipt is not None:
         return _confirmed(w3, receipt, nonce, max_attempts, sent_hashes, prefix)
 

@@ -82,9 +82,13 @@ def run_ascend(
         )
         return result
 
-    # One read, then local increments: every claim is signed before the previous
-    # one is mined, so re-reading the nonce per call would hand back a stale value.
-    nonce = w3.eth.get_transaction_count(sender, "pending")
+    # "latest" for the same reason send_and_confirm uses it: an earlier run that
+    # ended in TxNotConfirmed can leave a claim stuck in the mempool, and
+    # counting it would sign this run behind a transaction that may never mine --
+    # or, if it does, claim twice. The explicit per-call nonce below is not what
+    # makes this safe; each send waits for its receipt. It is here so the
+    # sequence is stated rather than inferred from repeated reads.
+    nonce = w3.eth.get_transaction_count(sender, "latest")
 
     for address in rewarders:
         rewarder = get_contract(w3, address, "Rewarder")
@@ -135,8 +139,11 @@ def run_ascend(
     # a clean sweep even when a share was never transferred. A shortfall means
     # rounding dust, or a configured recipient left at the zero address, whose
     # share stays in the router as WETH.
+    # distribute() wraps whatever the router holds at execution time, which can
+    # exceed the balance read a moment earlier if a reward landed in between, so
+    # only a genuine shortfall is worth reporting.
     undistributed = result.router_balance - result.distributed
-    if undistributed:
+    if undistributed > 0:
         print_colored(
             "{} was wrapped but not transferred; it remains in the router "
             "as WETH".format(undistributed),

@@ -17,6 +17,7 @@ bot with nothing to do.
 
 import asyncio
 import json
+import os
 import signal
 import sys
 import time
@@ -60,6 +61,14 @@ def next_due(last_run: float, interval: int) -> float:
     if interval <= 0:
         return last_run
     return (int(last_run) // interval + 1) * interval
+
+
+def require_executor(source) -> str:
+    if not source.executor_private_key:
+        raise Exception(
+            "Source {} has no executor private key; set OPERATOR_PK".format(source.name)
+        )
+    return source.executor_private_key
 
 
 def format_duration(seconds: float) -> str:
@@ -113,7 +122,18 @@ class Scheduler:
         try:
             with open(self.state_path, "r") as handle:
                 stored = json.load(handle)
-        except (FileNotFoundError, ValueError, OSError):
+        except FileNotFoundError:
+            return {}
+        except (ValueError, OSError) as e:
+            # Fails open, so say so: silently reseeding is how a due slot gets
+            # skipped without anyone noticing.
+            print_colored(
+                "Could not read the saved schedule ({}); starting from now".format(e),
+                "yellow",
+            )
+            return {}
+        if not isinstance(stored, dict):
+            print_colored("Saved schedule is not an object; ignoring it", "yellow")
             return {}
         return {
             task: float(value)
@@ -122,9 +142,13 @@ class Scheduler:
         }
 
     def _save_state(self) -> None:
+        # Written to a sibling and renamed: a partial file left by a crash mid
+        # write would be read back as corrupt and forfeit the schedule.
+        temporary = self.state_path + ".tmp"
         try:
-            with open(self.state_path, "w") as handle:
+            with open(temporary, "w") as handle:
                 json.dump(self.last_run, handle)
+            os.replace(temporary, self.state_path)
         except OSError as e:
             print_colored("Could not persist the schedule: {}".format(e), "yellow")
 
@@ -143,6 +167,9 @@ class Scheduler:
     def record_failure(self, task: str, error: Exception) -> None:
         self.failures[task] += 1
         message = mask_all_sensitive_config_data(str(error), self.config)
+        # Backticks would close the code fence below and Telegram would reject
+        # the message, dropping the alert precisely when the error is unusual.
+        alert_text = message.replace("`", "'")
         print_colored(
             "[{}] failed ({} in a row): {}".format(task, self.failures[task], message),
             "red",
@@ -155,7 +182,7 @@ class Scheduler:
         if threshold and self.failures[task] % threshold == 0:
             self.notify(
                 "⚠️ `{}` has failed {} times in a row.\n```\n{}\n```".format(
-                    task, self.failures[task], message
+                    task, self.failures[task], alert_text
                 )
             )
 
@@ -184,7 +211,9 @@ class Scheduler:
         """
         self.skips[task] += 1
         threshold = self.config.scheduler.alert_after_failures
-        if threshold and self.skips[task] == threshold:
+        # Repeats like record_failure does; a task stuck refusing to act has to
+        # keep saying so.
+        if threshold and self.skips[task] % threshold == 0:
             self.notify(
                 "⚠️ `{}` has been skipped {} times in a row: {}".format(
                     task, self.skips[task], reason
@@ -195,8 +224,12 @@ class Scheduler:
 
     def task_ascend(self) -> None:
         for source in self.config.sources:
-            if not source.ascend or not source.executor_private_key:
+            if not source.ascend:
                 continue
+            # Raise rather than skip: with OPERATOR_PK unset this task would
+            # otherwise report success forever while doing nothing, which is the
+            # silence this scheduler exists to break.
+            require_executor(source)
             run_ascend(
                 get_w3(source.rpc),
                 router=source.ascend.router,
@@ -207,7 +240,12 @@ class Scheduler:
             )
 
     def task_rebalance(self) -> None:
-        results = run_rebalance(self.config, interactive=False) or []
+        # force_withdrawal is passed explicitly so a stray FORCE_WITHDRAWAL in
+        # the environment cannot make an unattended run pull the entire target
+        # position back every two hours.
+        results = (
+            run_rebalance(self.config, interactive=False, force_withdrawal=False) or []
+        )
         reasons = [reason for _, reason in results if reason]
         if reasons and len(reasons) == len(results):
             self.record_skip("rebalance", "; ".join(sorted(set(reasons))))
@@ -223,8 +261,9 @@ class Scheduler:
 
     def task_handle_epoch(self) -> None:
         for source in self.config.sources:
-            if not source.withdrawal_queue or not source.executor_private_key:
+            if not source.withdrawal_queue:
                 continue
+            require_executor(source)
             handle_epochs(
                 get_w3(source.rpc),
                 address=source.withdrawal_queue.address,

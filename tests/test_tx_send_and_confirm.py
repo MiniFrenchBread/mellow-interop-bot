@@ -250,6 +250,57 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(len(caught.exception.tx_hashes), 1)
 
+    def test_the_opening_bid_leaves_room_to_be_replaced(self):
+        """A cap on the opening bid disables the replacement it is meant to bound.
+
+        The suggested tip on a busy chain is routinely a large fraction of the
+        cap, so a first send priced straight at the cap can never be replaced --
+        which is the mechanism that rescues a transaction the network outran.
+        """
+        w3, fn = make(resolver=only_after_replacement)
+        w3.eth.max_priority_fee = Web3.to_wei(2, "gwei")  # x3 exceeds the cap
+
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.01,
+            max_attempts=4,
+            fee_cap_gwei=4,
+            poll_latency=0.001,
+        )
+
+        self.assertEqual(outcome.attempts, 2, "a replacement must be possible")
+        first, second = fn.built[0], fn.built[1]
+        self.assertGreater(
+            second["maxPriorityFeePerGas"], first["maxPriorityFeePerGas"]
+        )
+        self.assertLessEqual(
+            second["maxPriorityFeePerGas"], Web3.to_wei(4, "gwei"), "still capped"
+        )
+
+    def test_every_planned_bump_fits_under_the_cap(self):
+        w3, fn = make(receipt_script=[])
+        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=4,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+            )
+
+        self.assertEqual(len(fn.built), 4, "all four attempts signed something new")
+        cap = Web3.to_wei(4, "gwei")
+        for transaction in fn.built:
+            self.assertLessEqual(transaction["maxPriorityFeePerGas"], cap)
+
     def test_the_fee_cap_still_caps_after_a_bump(self):
         """A cap is a limit on what we will pay, replacements included."""
         w3, fn = make(receipt_script=[])
