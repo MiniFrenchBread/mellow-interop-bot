@@ -1,0 +1,18 @@
+[
+  {
+    "type": "function",
+    "name": "claim",
+    "stateMutability": "nonpayable",
+    "inputs": [{ "internalType": "address", "name": "account", "type": "address" }],
+    "outputs": [{ "internalType": "uint256", "name": "reward", "type": "uint256" }]
+  },
+  {
+    "type": "event",
+    "name": "Claimed",
+    "anonymous": false,
+    "inputs": [
+      { "indexed": false, "internalType": "address", "name": "account", "type": "address" },
+      { "indexed": false, "internalType": "uint256", "name": "reward", "type": "uint256" }
+    ]
+  }
+]
