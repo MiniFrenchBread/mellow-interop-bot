@@ -8,7 +8,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import main
-from config.read_config import Config, SafeGlobal
+from config.read_config import Config, Deployment, SafeGlobal, SourceConfig
 from main import OracleData, SafeProposal, needs_attention
 from safe_global.common import PendingTransactionInfo, ThresholdWithOwners
 from web3_scripts import OracleValidationResult
@@ -296,6 +296,101 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         main.send_message = ok_send
 
         self.assertTrue(asyncio.run(main.run_oracle_report(with_telegram())))
+
+
+class TestPostedProposalWiring(unittest.TestCase):
+    """From the exception through to what the signers are shown.
+
+    Setting `posted` on a fixture skips the two links that matter: the except
+    clause that records it, and the message that tells the signers the proposal
+    is waiting for them rather than that it failed.
+    """
+
+    def setUp(self):
+        from safe_global import ProposalPosted
+
+        self.ProposalPosted = ProposalPosted
+        self._propose = main.propose_tx_if_needed
+        # A proposer key is required or propose_tx_to_update_oracle skips the
+        # Safe entirely before it can reach the code under test.
+        self.safe = SafeGlobal(
+            safe_address=SAFE.safe_address,
+            proposer_private_key="0x" + "11" * 32,
+            api_url=SAFE.api_url,
+            web_client_url=SAFE.web_client_url,
+            eip_3770=SAFE.eip_3770,
+        )
+        # A real SourceConfig: the failure path masks against source.rpc, which
+        # the lightweight stand-in used elsewhere does not have.
+        self.source = SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(),
+        )
+        self.deployment = Deployment(
+            name="OG",
+            source_core="0x" + "22" * 20,
+            target_core="0x" + "33" * 20,
+            safe_global=self.safe,
+        )
+
+    def tearDown(self):
+        main.propose_tx_if_needed = self._propose
+
+    def results(self):
+        return [
+            (
+                self.source,
+                OracleData(
+                    name="OG",
+                    deployment=self.deployment,
+                    validation=validation(incorrect_value=True),
+                ),
+            )
+        ]
+
+    def test_a_posted_proposal_is_recorded_as_such(self):
+        def raise_posted(*_args):
+            raise self.ProposalPosted("0xabc", "not visible yet")
+
+        main.propose_tx_if_needed = raise_posted
+
+        proposals = main.propose_tx_to_update_oracle(self.results())
+
+        self.assertEqual(len(proposals), 1)
+        self.assertTrue(proposals[0][2].posted)
+        self.assertEqual(proposals[0][2].posted_reference, "0xabc")
+
+    def test_an_ordinary_failure_is_not_recorded_as_posted(self):
+        def raise_plain(*_args):
+            raise Exception("connection refused")
+
+        main.propose_tx_if_needed = raise_plain
+
+        proposals = main.propose_tx_to_update_oracle(self.results())
+
+        self.assertFalse(proposals[0][2].posted)
+
+    def test_the_signers_are_told_it_is_waiting_not_that_it_failed(self):
+        proposal = one_proposal()[0][2]
+        proposal.transaction = None
+        proposal.posted = True
+        proposal.posted_reference = "0xabc"
+
+        message = main.compose_safe_proposal_message({}, "OG", SAFE, proposal)
+
+        self.assertNotIn("❌", message)
+        self.assertIn("0xabc", message)
+        self.assertIn(SAFE.safe_address, message)
+
+    def test_a_real_failure_still_says_so(self):
+        proposal = one_proposal()[0][2]
+        proposal.transaction = None
+
+        message = main.compose_safe_proposal_message({}, "OG", SAFE, proposal)
+
+        self.assertIn("❌", message)
 
 
 if __name__ == "__main__":

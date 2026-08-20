@@ -50,10 +50,12 @@ class SafeProposal:
     # safeTxHashes of queued proposals sharing this one's Safe nonce. Only one of
     # them can ever execute, so signers need to be told which is the current one.
     superseded: list[str] = field(default_factory=list)
-    # True when the proposal reached the Safe service but could not be read back.
+    # Set when the proposal reached the Safe service but could not be read back.
     # It is queued and signable, so this run did put an update in front of the
-    # signers even though it has no transaction to describe.
+    # signers -- they have to be told that, and told what to look for, because
+    # there is no transaction record to render a link from.
     posted: bool = False
+    posted_reference: str = ""
 
 
 async def main():
@@ -310,7 +312,27 @@ def compose_safe_proposal_message(
     message = f"Approve tx for `{source_name}` to update {len(proposal.deployment_names)} oracle(s):\n"
 
     if proposal.transaction is None:
-        message += "❌ Error occurred during proposal"
+        if proposal.posted:
+            # Queued and signable, just not readable back yet. Saying it failed
+            # would leave the signers ignoring a transaction that is waiting for
+            # them, and a later run will not propose it again.
+            message += (
+                "⚠️ Submitted but not yet visible in the queue"
+                + (
+                    " (`{}`)".format(proposal.posted_reference)
+                    if proposal.posted_reference
+                    and proposal.posted_reference != "unknown"
+                    else ""
+                )
+                + ". It is signable — open the Safe and refresh: "
+                + "{}/transactions/queue?safe={}:{}".format(
+                    safe_global.web_client_url,
+                    safe_global.eip_3770,
+                    safe_global.safe_address,
+                )
+            )
+        else:
+            message += "❌ Error occurred during proposal"
         return message
 
     message += "```solidity\n"
@@ -451,6 +473,7 @@ def propose_tx_to_update_oracle(
         is_newly_created = False
         superseded = []
         posted = False
+        posted_reference = ""
         try:
             transaction, is_newly_created, superseded = propose_tx_if_needed(
                 contract_abi, method, calls, source, safe_global
@@ -459,6 +482,7 @@ def propose_tx_to_update_oracle(
             # Queued and signable; only the read-back failed. Retrying would add
             # a second entry competing for the same nonce.
             posted = True
+            posted_reference = e.safe_tx_hash
             print_colored(
                 f"Proposal for source {source.name} (safe: {safe_address}): {e}",
                 "yellow",
@@ -480,6 +504,7 @@ def propose_tx_to_update_oracle(
             is_newly_created=is_newly_created,
             superseded=superseded,
             posted=posted,
+            posted_reference=posted_reference,
         )
         result.append((source, safe_global, proposal))
 

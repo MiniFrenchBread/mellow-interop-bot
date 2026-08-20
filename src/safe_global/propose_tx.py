@@ -178,6 +178,37 @@ def _resolve_call(
     return to, calldata, operation
 
 
+def _classify_propose_failure(
+    error: Exception,
+    to: str,
+    calldata: str,
+    source: SourceConfig,
+    safe_global: SafeGlobal,
+) -> Exception:
+    """Decide whether a failed POST left a proposal behind.
+
+    Returns ProposalPosted when the queue already holds this exact calldata, so
+    the caller knows not to propose it again; otherwise the original error, so a
+    retry is free to try once more. A lookup that itself fails is treated as
+    "posted", because proposing a duplicate is the worse of the two mistakes.
+    """
+    try:
+        queued = _get_queued_transaction_for_safe(to, calldata, source.rpc, safe_global)
+    except Exception as lookup_error:
+        return ProposalPosted(
+            "unknown",
+            "the proposal failed with '{}' and the queue could not be read "
+            "back either ({}), so it is unclear whether it landed".format(
+                error, lookup_error
+            ),
+        )
+    if queued:
+        return ProposalPosted(
+            queued.id, "the proposal failed with '{}' but it is queued".format(error)
+        )
+    return error
+
+
 def _superseded_hashes(
     to: str, calldata: str, safe_nonce: int, safe_global: SafeGlobal
 ) -> list:
@@ -238,7 +269,15 @@ def propose_tx_if_needed(
         return queued_transaction, False, []
 
     print(f"Proposing transaction: {safe_tx}...")
-    tx_hash = _propose_tx_for_safe(safe_tx, safe_global)
+    try:
+        tx_hash = _propose_tx_for_safe(safe_tx, safe_global)
+    except Exception as e:
+        # The POST itself can fail after the service accepted the proposal: the
+        # gateway validates its own 200 response and can reject it, and a read
+        # timeout on a committed row is retried as a duplicate POST. Ask the
+        # queue which happened rather than assuming, because assuming "not
+        # queued" makes the caller propose again and compete for the nonce.
+        raise _classify_propose_failure(e, to, calldata, source, safe_global)
     print_colored(f"Transaction proposed: {tx_hash}", "green")
 
     # Past this point the proposal exists and is signable. Everything below only
@@ -258,7 +297,10 @@ def propose_tx_if_needed(
                 to, calldata, source.rpc, safe_global
             )
         except Exception as e:
-            raise ProposalPosted(tx_hash, "could not read it back: {}".format(e))
+            # One blip is not an answer; the indexer is often just behind. Only
+            # give up once the attempts are spent.
+            print_colored("Could not read the queue back: {}".format(e), "yellow")
+            transaction = None
         if transaction:
             tx_id = f"multisig_{safe_global.safe_address}_{tx_hash}"
             if transaction.id != tx_id:

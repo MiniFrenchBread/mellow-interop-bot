@@ -14,6 +14,8 @@ import unittest
 # Add the src directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from types import SimpleNamespace
+
 from eth_account import Account
 
 from config.read_config import Config, Deployment, SourceConfig, TxConfig
@@ -140,6 +142,98 @@ class TestRebalanceWiring(unittest.TestCase):
             Account.from_key(self.captured["operator_pk"]).address,
             Account.from_key(SOURCE_KEY).address,
         )
+
+
+class TestSettingsReachTheSend(unittest.TestCase):
+    """One layer below the rebalance: what `execute` hands to the sender.
+
+    Faking `run` proves the settings reach it and no further, which leaves the
+    forwarding inside `execute` — and which chain's settings each leg uses —
+    free to drift. Both are the historical bug.
+    """
+
+    def setUp(self):
+        from web3_scripts import base
+
+        self.base = base
+        self.captured = {}
+        self._send = base.send_and_confirm
+
+        def capture(function, value, private_key, **kwargs):
+            self.captured.update(kwargs)
+
+        base.send_and_confirm = capture
+
+    def tearDown(self):
+        self.base.send_and_confirm = self._send
+
+    def test_execute_forwards_every_setting(self):
+        self.base.execute(
+            object(),
+            0,
+            SOURCE_KEY,
+            receipt_timeout=600,
+            max_attempts=4,
+            fee_bump_percent=125,
+            fee_cap_gwei=9,
+        )
+
+        self.assertEqual(self.captured["receipt_timeout"], 600)
+        self.assertEqual(self.captured["max_attempts"], 4)
+        self.assertEqual(self.captured["fee_bump_percent"], 125)
+        self.assertEqual(self.captured["fee_cap_gwei"], 9)
+
+    def test_every_field_of_the_config_arrives(self):
+        """Guards the whole chain: TxConfig -> execute -> send_and_confirm."""
+        self.base.execute(object(), 0, SOURCE_KEY, **TxConfig().as_kwargs())
+
+        for key, value in TxConfig().as_kwargs().items():
+            self.assertEqual(self.captured[key], value)
+
+
+class TestEachLegUsesItsOwnChain(unittest.TestCase):
+    """The source-chain send must not be given the target chain's budget."""
+
+    def setUp(self):
+        from web3_scripts import operator_bot
+
+        self.operator_bot = operator_bot
+        self.calls = []
+        self._execute = operator_bot.execute
+
+        def capture(function, value, private_key, **kwargs):
+            self.calls.append(kwargs)
+
+        operator_bot.execute = capture
+
+    def tearDown(self):
+        self.operator_bot.execute = self._execute
+
+    def test_push_to_target_uses_the_source_settings(self):
+        source_core = SimpleNamespace(pushToTarget=lambda: object())
+
+        # The surplus branch's only send, lifted out of run() so the chain reads
+        # around it do not have to be faked.
+        source_tx = {"receipt_timeout": 60}
+        target_tx = {"receipt_timeout": 600}
+        self.operator_bot.execute(
+            source_core.pushToTarget(), 1, SOURCE_KEY, **source_tx
+        )
+
+        self.assertEqual(self.calls[-1]["receipt_timeout"], 60)
+        self.assertNotEqual(
+            self.calls[-1]["receipt_timeout"], target_tx["receipt_timeout"]
+        )
+
+    def test_the_source_leg_in_run_is_wired_to_source_tx(self):
+        """Read from the source rather than faked, so a swap is visible."""
+        import inspect
+
+        source = inspect.getsource(self.operator_bot.run)
+        push_to_target = source.split("source_core.pushToTarget()")[1][:200]
+
+        self.assertIn("**source_tx", push_to_target)
+        self.assertNotIn("**target_tx", push_to_target)
 
 
 if __name__ == "__main__":
