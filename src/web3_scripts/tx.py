@@ -387,6 +387,12 @@ def send_and_confirm(
                         prefix, attempt
                     )
                 )
+                # The node refused this exact payload, so unlike every other
+                # error here it is certain the transaction is not live. Polling
+                # for it would spend the remaining budget on a hash that cannot
+                # appear, and would name it in the failure as though it might.
+                if tx_hash in sent_hashes:
+                    sent_hashes.remove(tx_hash)
                 cap = w3.to_wei(fee_cap_gwei, "gwei")
                 bumped = _bump(max_priority_fee, fee_bump_percent)
                 if bumped > cap:
@@ -456,6 +462,15 @@ def send_and_confirm(
         raise _with_hashes(e, sent_hashes, nonce)
     if receipt is not None:
         return _confirmed(w3, receipt, nonce, max_attempts, sent_hashes, prefix)
+
+    if not sent_hashes:
+        raise TxNotConfirmed(
+            "Nonce {} is occupied by a transaction this run could not replace "
+            "within the {} gwei cap; every attempt was refused as underpriced "
+            "and none is live".format(nonce, fee_cap_gwei),
+            sent_hashes,
+            nonce,
+        )
 
     raise TxNotConfirmed(
         "No receipt for nonce {} after {} attempt(s). Broadcast hashes: {}".format(

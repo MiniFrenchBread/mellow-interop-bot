@@ -78,10 +78,17 @@ async def run_oracle_report(config: Config):
     failing validation, which is what a total RPC outage looks like. A single
     deployment or Safe failing is still caught and reported inline, so one broken
     chain does not suppress the others.
+
+    Telegram is best-effort throughout. Reaching the signers matters, but the
+    proposal is what keeps the oracle from expiring, and it must not be
+    cancelled because the channel that announces it is down. Nor may a failed
+    send fail the task: the scheduler would retry, and a retry after the share
+    price has moved proposes different calldata, which lands as a second
+    transaction competing for the same Safe nonce instead of being deduplicated.
     """
-    # Print Telegram info (Bot and group)
-    await print_telegram_info(
-        config.telegram_bot_api_key, config.telegram_group_chat_id
+    await _best_effort(
+        "check the Telegram bot and group",
+        print_telegram_info(config.telegram_bot_api_key, config.telegram_group_chat_id),
     )
 
     # Validate and get oracles data
@@ -111,8 +118,11 @@ async def run_oracle_report(config: Config):
 
     message = compose_oracle_data_message(config, oracle_validation_results)
     status_message = (
-        await send_message(
-            config.telegram_bot_api_key, config.telegram_group_chat_id, message
+        await _best_effort(
+            "send the oracle status message",
+            send_message(
+                config.telegram_bot_api_key, config.telegram_group_chat_id, message
+            ),
         )
         if message
         else None
@@ -149,6 +159,15 @@ async def run_oracle_report(config: Config):
                 ),
             )
     print(f"Sent {len(safe_proposals)} message(s) with safe proposal")
+
+
+async def _best_effort(what: str, awaitable):
+    """Await something whose failure must not stop the run. Returns None if it did."""
+    try:
+        return await awaitable
+    except Exception as e:
+        print_colored("Could not {}: {}".format(what, e), "yellow")
+        return None
 
 
 def needs_attention(

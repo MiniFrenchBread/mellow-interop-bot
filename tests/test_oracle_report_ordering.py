@@ -89,20 +89,35 @@ class TestProposalIsNotGatedOnTelegram(unittest.TestCase):
             lambda results: self.proposed.append(results) or []
         )
 
-        async def no_info(*_args):
-            return None
+        async def failing_info(*_args):
+            # The shape print_telegram_info produces when the API is unreachable.
+            raise Exception("Unable to get telegram info: httpx.ConnectError")
 
-        main.print_telegram_info = no_info
+        main.print_telegram_info = failing_info
 
     def tearDown(self):
         main.validate_oracles = self._validate
         main.propose_tx_to_update_oracle = self._propose
         main.print_telegram_info = self._info
 
-    def test_the_safe_proposal_still_happens_with_telegram_unconfigured(self):
+    def test_the_safe_proposal_survives_telegram_being_unreachable(self):
+        """The first Telegram call happens before anything else in the report.
+
+        Left fatal, it aborts the run before an oracle is even validated, so the
+        proposal that keeps the oracle from expiring never happens -- the exact
+        coupling this ordering exists to remove.
+        """
         asyncio.run(main.run_oracle_report(config_without_telegram()))
 
         self.assertEqual(len(self.proposed), 1, "the proposal is the load-bearing act")
+
+    def test_a_telegram_outage_does_not_fail_the_task(self):
+        """Failing would make the scheduler retry.
+
+        A retry after the share price moved proposes different calldata, which
+        competes for the same Safe nonce instead of being deduplicated.
+        """
+        asyncio.run(main.run_oracle_report(config_without_telegram()))
 
 
 if __name__ == "__main__":

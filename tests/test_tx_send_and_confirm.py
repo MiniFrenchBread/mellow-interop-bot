@@ -404,6 +404,34 @@ class TestSendAndConfirm(unittest.TestCase):
         self.assertEqual(outcome.tx_hash, outcome.tx_hashes[1])
         self.assertNotEqual(outcome.tx_hashes[0], outcome.tx_hashes[1])
 
+    def test_refused_payloads_are_not_polled_for(self):
+        """A refusal is definitive: that payload is in no pool and cannot appear.
+
+        Polling for it spends the whole budget on nothing and names hashes in
+        the failure that an operator will never find on chain.
+        """
+        import time as _time
+
+        w3, fn = make(receipt_script=[], send_script=[Exception(UNDERPRICED)] * 3)
+
+        started = _time.monotonic()
+        with self.assertRaises(TxNotConfirmed) as caught:
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=1,
+                max_attempts=3,
+                fee_cap_gwei=4,
+                poll_latency=0.01,
+            )
+        elapsed = _time.monotonic() - started
+
+        self.assertEqual(caught.exception.tx_hashes, [])
+        self.assertIn("underpriced", str(caught.exception))
+        self.assertLess(elapsed, 1, "must not wait out a budget for nothing")
+
     def test_gives_up_carrying_every_hash(self):
         w3, fn = make(receipt_script=[])
 
