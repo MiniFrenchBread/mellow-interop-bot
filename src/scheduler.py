@@ -34,6 +34,7 @@ from config.read_config import Config
 from process_lock import LockHeld, ProcessLock, resolve_lock_path
 from telegram_bot import send_message
 from web3_scripts import get_w3, print_colored
+from web3_scripts.tx import NonceBlocked
 from web3_scripts.ascend import run_ascend
 from web3_scripts.operator_bot import run_all as run_rebalance
 from web3_scripts.withdrawal_queue import handle_epochs
@@ -165,6 +166,13 @@ class Scheduler:
             print_colored("Could not send Telegram alert: {}".format(e), "yellow")
 
     def record_failure(self, task: str, error: Exception) -> None:
+        if isinstance(error, NonceBlocked):
+            # Not this task's fault and not an outage: another task left a live
+            # transaction on the nonce. Say so, because otherwise it reads
+            # exactly like the RPC being down, and back off without counting it
+            # against this task -- it will run as soon as the nonce frees.
+            print_colored("[{}] {}".format(task, error), "yellow")
+            return
         self.failures[task] += 1
         # A failure breaks a run of skips: "skipped 3 times in a row" should mean
         # three in a row.

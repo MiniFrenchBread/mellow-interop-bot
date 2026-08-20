@@ -10,8 +10,10 @@ from eth_account import Account
 from web3 import Web3
 from web3.exceptions import TransactionNotFound
 
+from web3_scripts import tx as tx_module
 from web3_scripts.tx import (
     NonceAlreadyUsed,
+    NonceBlocked,
     TxNotConfirmed,
     TxReverted,
     is_already_known,
@@ -87,7 +89,13 @@ class FakeEth:
 
     def get_transaction_count(self, _address, block="latest"):
         self.nonce_calls.append(block)
-        return 42
+        return getattr(self, "nonce", 42)
+
+    def get_transaction(self, _tx_hash):
+        # Present unless a test says the node has forgotten it.
+        if getattr(self, "known", True):
+            return {"blockNumber": None}
+        raise TransactionNotFound("not found")
 
     def send_raw_transaction(self, raw):
         self.sent.append(raw)
@@ -242,6 +250,12 @@ class TestPreflightGuards(unittest.TestCase):
 
 
 class TestSendAndConfirm(unittest.TestCase):
+
+    def setUp(self):
+        tx_module._unreconciled.clear()
+
+    def tearDown(self):
+        tx_module._unreconciled.clear()
 
     def test_survives_receipt_indexing_lag(self):
         """A null result and a missing-receipts error must not end the wait."""
@@ -719,6 +733,117 @@ class TestSendAndConfirm(unittest.TestCase):
         )
 
         self.assertEqual(outcome.receipt["status"], 1)
+
+
+class TestNonceIsNotSharedAcrossOperations(unittest.TestCase):
+    """One account signs everything, so there is one nonce sequence per chain.
+
+    That is fine while each send waits for its receipt. It stops being fine when
+    a send times out: the transaction sits in the mempool unmined, the count has
+    not advanced, and the next operation would sign something entirely different
+    onto the same nonce -- only one of which can ever mine.
+    """
+
+    def setUp(self):
+        tx_module._unreconciled.clear()
+
+    def tearDown(self):
+        tx_module._unreconciled.clear()
+
+    def strand_a_transaction(self):
+        """Leave a live, unmined transaction on the nonce."""
+        w3, fn = make(receipt_script=[])
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=1,
+                poll_latency=0.001,
+                label="handleEpoch 7",
+            )
+        return w3
+
+    def test_a_different_operation_will_not_sign_onto_it(self):
+        self.strand_a_transaction()
+        w3, fn = make(receipt_script=[receipt()])
+
+        with self.assertRaises(NonceBlocked) as caught:
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, poll_latency=0.001, label="setValue"
+            )
+
+        self.assertEqual(caught.exception.nonce, 42)
+        self.assertIn("handleEpoch 7", caught.exception.holder)
+        self.assertEqual(w3.eth.sent, [], "and nothing is broadcast")
+
+    def test_the_same_operation_may_replace_its_own(self):
+        """That is what a retry is, and what the 'latest' read exists for."""
+        self.strand_a_transaction()
+        w3, fn = make(receipt_script=[receipt()])
+
+        send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=5,
+            poll_latency=0.001,
+            label="handleEpoch 7",
+        )
+
+        self.assertEqual(len(w3.eth.sent), 1)
+
+    def test_a_mined_transaction_frees_the_nonce(self):
+        self.strand_a_transaction()
+        w3, fn = make(receipt_script=[receipt()])
+        w3.eth.nonce = 43  # the account moved past it
+
+        send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=5,
+            poll_latency=0.001,
+            label="setValue",
+        )
+
+        self.assertEqual(len(w3.eth.sent), 1)
+
+    def test_a_dropped_transaction_frees_the_nonce(self):
+        self.strand_a_transaction()
+        w3, fn = make(receipt_script=[receipt()])
+        w3.eth.known = False  # the node no longer has it
+
+        send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=5,
+            poll_latency=0.001,
+            label="setValue",
+        )
+
+        self.assertEqual(len(w3.eth.sent), 1)
+
+    def test_a_confirmed_send_clears_the_record(self):
+        self.strand_a_transaction()
+        w3, fn = make(receipt_script=[receipt()])
+        send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=5,
+            poll_latency=0.001,
+            label="handleEpoch 7",
+        )
+
+        self.assertEqual(tx_module._unreconciled, {})
 
 
 if __name__ == "__main__":

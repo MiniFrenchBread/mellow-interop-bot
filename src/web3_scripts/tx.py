@@ -21,6 +21,13 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_FEE_BUMP_PERCENT = 115
 DEFAULT_FEE_CAP_GWEI = 4
 DEFAULT_POLL_LATENCY = 0.5
+
+# What each chain's next free nonce is still owed, when a send ended without a
+# receipt. Module state rather than something threaded through every caller,
+# which is safe for the one reason that also makes the "latest" nonce read safe:
+# a single-holder lock and a strictly sequential task loop mean one sender at a
+# time in one process. If either ever changes, this has to change with it.
+_unreconciled = {}
 GAS_BUFFER_PERCENT = 105
 BASE_FEE_BUFFER_PERCENT = 105
 PRIORITY_FEE_MULTIPLIER = 3
@@ -78,6 +85,34 @@ class TxNotConfirmed(Exception):
         self.nonce = nonce
 
 
+class NonceBlocked(Exception):
+    """A different operation left a live transaction on the next free nonce.
+
+    One account signs everything this bot sends, so there is a single nonce
+    sequence per chain and every operation draws from it. That is fine while
+    each send waits for its receipt: the count advances before the next one
+    reads it. It stops being fine when a send times out -- the transaction is
+    still in the mempool, unmined, so the count has not advanced, and the next
+    operation would sign something entirely different onto the same nonce. Only
+    one of the two can ever mine, and the loser is evicted silently.
+
+    Reusing a nonce is right when it is the *same* operation trying again: that
+    is a replacement, and it is what the "latest" read exists for. It is wrong
+    across operations, and this is where the difference is enforced.
+    """
+
+    def __init__(self, nonce: int, holder: str, tx_hashes: List[str]):
+        super().__init__(
+            "Nonce {} still holds a live transaction from {}; not signing a "
+            "different operation onto it. Hashes: {}".format(
+                nonce, holder, ", ".join(tx_hashes)
+            )
+        )
+        self.nonce = nonce
+        self.holder = holder
+        self.tx_hashes = list(tx_hashes)
+
+
 class NonceAlreadyUsed(Exception):
     """The nonce is taken and no receipt for our own attempts turned up.
 
@@ -110,6 +145,55 @@ def _log(text: str, color: str = "yellow") -> None:
         from base import print_colored
 
     print_colored(text, color)
+
+
+def _still_in_flight(w3: Web3, tx_hash: str) -> bool:
+    """Whether the node still knows this transaction. Dropped ones are gone."""
+    try:
+        return w3.eth.get_transaction(tx_hash) is not None
+    except Exception:
+        # TransactionNotFound, or a node that cannot answer. Absent means
+        # dropped, which frees the nonce; an unanswerable node is treated the
+        # same way rather than blocking forever on a question we cannot ask.
+        return False
+
+
+def record_unreconciled(w3: Web3, sender: str, nonce: int, label: str, tx_hashes):
+    _unreconciled[(w3.eth.chain_id, sender)] = {
+        "nonce": nonce,
+        "label": label,
+        "hashes": list(tx_hashes),
+    }
+
+
+def clear_unreconciled(w3: Web3, sender: str) -> None:
+    _unreconciled.pop((w3.eth.chain_id, sender), None)
+
+
+def blocking_transaction(w3: Web3, sender: str, label: str, nonce: int):
+    """The entry standing in this send's way, or None.
+
+    Resolved rather than assumed: the nonce is free once the account has moved
+    past it, or once every hash recorded for it has left the node.
+    """
+    key = (w3.eth.chain_id, sender)
+    entry = _unreconciled.get(key)
+    if entry is None:
+        return None
+    if entry["nonce"] != nonce:
+        # The account has moved past it, so whatever was recorded has settled
+        # one way or the other.
+        _unreconciled.pop(key, None)
+        return None
+    if entry["label"] == label:
+        # The same operation trying again. Reusing the nonce is the replacement
+        # this module is built around.
+        return None
+    if any(_still_in_flight(w3, tx_hash) for tx_hash in entry["hashes"]):
+        return entry
+    # Every hash has left the node, so the nonce is free again.
+    _unreconciled.pop(key, None)
+    return None
 
 
 def _to_hex(value) -> str:
@@ -365,6 +449,12 @@ def send_and_confirm(
         # batches that cannot wait pass their nonce in explicitly.
         nonce = w3.eth.get_transaction_count(sender, "latest")
 
+    blocked = blocking_transaction(w3, sender, label, nonce)
+    if blocked is not None:
+        raise NonceBlocked(
+            nonce, blocked["label"] or "an earlier send", blocked["hashes"]
+        )
+
     sent_hashes: List[str] = []
     # Carried out of the loop so the sweep below reports the attempt actually
     # reached rather than the budget. Diagnostic only -- nothing branches on it,
@@ -435,7 +525,9 @@ def send_and_confirm(
                 except Exception as lookup_error:
                     raise _with_hashes(lookup_error, sent_hashes, nonce)
                 if receipt is not None:
+                    clear_unreconciled(w3, sender)
                     return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
+                record_unreconciled(w3, sender, nonce, label, sent_hashes)
                 raise NonceAlreadyUsed(
                     "Nonce {} is already taken and none of this run's {} "
                     "transaction(s) has a receipt: {}".format(
@@ -493,6 +585,7 @@ def send_and_confirm(
             # caller unable to tell a broadcast transaction from an unsent one.
             raise _with_hashes(e, sent_hashes, nonce)
         if receipt is not None:
+            clear_unreconciled(w3, sender)
             return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
 
         if attempt < max_attempts:
@@ -530,7 +623,12 @@ def send_and_confirm(
     except Exception as e:
         raise _with_hashes(e, sent_hashes, nonce)
     if receipt is not None:
+        clear_unreconciled(w3, sender)
         return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
+
+    # Left without a receipt: whatever is still out there owns this nonce until
+    # it mines or is dropped, and a different operation must not sign onto it.
+    record_unreconciled(w3, sender, nonce, label, sent_hashes)
 
     if not sent_hashes:
         raise TxNotConfirmed(

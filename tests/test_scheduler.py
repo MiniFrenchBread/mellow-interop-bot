@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config.read_config import Config, SchedulerConfig
 from scheduler import Scheduler, format_duration, is_due, next_due
+from web3_scripts.tx import NonceBlocked
 import main as oracle_main_module
 
 DAY = 86400
@@ -188,6 +189,25 @@ class TestCycleIsolation(unittest.TestCase):
         self.scheduler.run_cycle()
 
         self.assertEqual(self.scheduler.failures["rebalance"], 0)
+
+    def test_a_blocked_nonce_is_not_counted_against_the_task(self):
+        """Another task left a live transaction on the nonce.
+
+        That is neither this task's fault nor an outage, and the task that owns
+        the stuck transaction is the one that will alert about it. Counting it
+        here would raise an alarm naming the wrong task and, with a long-enough
+        block, drown the real one.
+        """
+        sent = []
+        self.scheduler.notify = sent.append
+
+        for _ in range(5):
+            self.scheduler.record_failure(
+                "oracle_report", NonceBlocked(42, "handleEpoch 7", ["0xabc"])
+            )
+
+        self.assertEqual(self.scheduler.failures["oracle_report"], 0)
+        self.assertEqual(sent, [])
 
     def test_a_failure_breaks_a_run_of_skips(self):
         """ "Skipped three times in a row" has to mean in a row."""
