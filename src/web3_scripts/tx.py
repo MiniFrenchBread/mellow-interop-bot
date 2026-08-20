@@ -241,6 +241,33 @@ def _bump(value: int, percent: int) -> int:
     return max(value + 1, value * percent // 100)
 
 
+def next_fees(
+    w3: Web3,
+    max_fee: int,
+    max_priority_fee: int,
+    fee_bump_percent: int,
+    fee_cap_gwei: int,
+    consider_network: bool = False,
+):
+    """The fees for a replacement, or None when the cap forbids one.
+
+    A cap bounds replacements as well as opening bids, and once it is reached
+    there is nothing further to offer -- signing again would only repeat the
+    payload under the same hash. `consider_network` also takes the current
+    suggestion into account, for the case where the transaction is merely slow
+    rather than refused.
+    """
+    bumped_priority = _bump(max_priority_fee, fee_bump_percent)
+    bumped_max = _bump(max_fee, fee_bump_percent)
+    if consider_network:
+        fresh_max, fresh_priority = compute_fees(w3, fee_cap_gwei)
+        bumped_priority = max(bumped_priority, fresh_priority)
+        bumped_max = max(bumped_max, fresh_max)
+    if bumped_priority > w3.to_wei(fee_cap_gwei, "gwei"):
+        return None
+    return bumped_max, bumped_priority
+
+
 def estimate_gas(contract_function, sender: str, value: int) -> int:
     try:
         estimated = contract_function.estimate_gas({"from": sender, "value": value})
@@ -249,6 +276,30 @@ def estimate_gas(contract_function, sender: str, value: int) -> int:
             raise TxReverted("Call reverted during gas estimation: {}".format(e))
         raise Exception("Gas estimation failed: {}".format(e))
     return estimated * GAS_BUFFER_PERCENT // 100
+
+
+def _sign(
+    contract_function,
+    w3: Web3,
+    private_key: str,
+    sender: str,
+    nonce: int,
+    gas: int,
+    value: int,
+    max_fee: int,
+    max_priority_fee: int,
+):
+    transaction = contract_function.build_transaction(
+        {
+            "gas": gas,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": max_priority_fee,
+            "value": value,
+            "from": sender,
+            "nonce": nonce,
+        }
+    )
+    return w3.eth.account.sign_transaction(transaction, private_key=private_key)
 
 
 def send_and_confirm(
@@ -326,18 +377,16 @@ def send_and_confirm(
 
     for attempt in range(1, max_attempts + 1):
         try:
-            transaction = contract_function.build_transaction(
-                {
-                    "gas": gas,
-                    "maxFeePerGas": max_fee,
-                    "maxPriorityFeePerGas": max_priority_fee,
-                    "value": value,
-                    "from": sender,
-                    "nonce": nonce,
-                }
-            )
-            signed = w3.eth.account.sign_transaction(
-                transaction, private_key=private_key
+            signed = _sign(
+                contract_function,
+                w3,
+                private_key,
+                sender,
+                nonce,
+                gas,
+                value,
+                max_fee,
+                max_priority_fee,
             )
         except Exception as e:
             # Building a replacement still talks to the node. On the first
@@ -395,9 +444,10 @@ def send_and_confirm(
                 # would spend the remaining budget on a hash that cannot appear,
                 # and name it in the failure as though it might.
                 sent_hashes.remove(tx_hash)
-                cap = w3.to_wei(fee_cap_gwei, "gwei")
-                bumped = _bump(max_priority_fee, fee_bump_percent)
-                if bumped > cap:
+                raised = next_fees(
+                    w3, max_fee, max_priority_fee, fee_bump_percent, fee_cap_gwei
+                )
+                if raised is None:
                     _log(
                         "{}Replacement underpriced but the {} gwei cap is "
                         "reached; nothing further can outbid the incumbent".format(
@@ -405,8 +455,7 @@ def send_and_confirm(
                         )
                     )
                     break
-                max_priority_fee = bumped
-                max_fee = _bump(max_fee, fee_bump_percent)
+                max_fee, max_priority_fee = raised
                 continue  # nothing new was broadcast; the final sweep still polls
             else:
                 raise _with_hashes(e, sent_hashes, nonce)
@@ -428,29 +477,25 @@ def send_and_confirm(
 
         if attempt < max_attempts:
             try:
-                fresh_max_fee, fresh_priority = compute_fees(w3, fee_cap_gwei)
+                raised = next_fees(
+                    w3,
+                    max_fee,
+                    max_priority_fee,
+                    fee_bump_percent,
+                    fee_cap_gwei,
+                    consider_network=True,
+                )
             except Exception as e:
                 # Reads the latest block over the connection that just failed to
                 # serve a receipt, so it is a likely place to lose the hashes.
                 raise _with_hashes(e, sent_hashes, nonce)
-            bumped_priority = max(
-                _bump(max_priority_fee, fee_bump_percent), fresh_priority
-            )
-            cap = w3.to_wei(fee_cap_gwei, "gwei")
-            if bumped_priority > cap:
-                # A configured cap is a limit on what we are willing to pay, so
-                # it also limits replacements. Stop attempting rather than
-                # continuing: with the fees pinned the next attempt would sign a
-                # byte-identical payload under the same hash, which is pure
-                # noise -- and would make it ambiguous whether a later refusal
-                # referred to a payload that had already been accepted.
+            if raised is None:
                 _log(
                     "{}Fee cap of {} gwei reached; waiting on the broadcast "
                     "transaction rather than replacing it".format(prefix, fee_cap_gwei)
                 )
                 break
-            max_priority_fee = bumped_priority
-            max_fee = max(_bump(max_fee, fee_bump_percent), fresh_max_fee)
+            max_fee, max_priority_fee = raised
             _log(
                 "{}No receipt after {}s, replacing nonce {} at {} gwei".format(
                     prefix, receipt_timeout, nonce, max_fee / 1e9
