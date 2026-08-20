@@ -9,6 +9,7 @@
     "loop-sleep-seconds": "${LOOP_SLEEP_SECONDS:300}",
     "post-ascend-gap-seconds": "${POST_ASCEND_GAP_SECONDS:60}",
     "lock-file": "${SCHEDULER_LOCK_FILE:.scheduler.lock}",
+    "state-file": "${SCHEDULER_STATE_FILE:.scheduler-state.json}",
     "alert-after-failures": "${ALERT_AFTER_FAILURES:3}",
     "tasks": {
       "ascend": { "interval-seconds": "${ASCEND_INTERVAL_SECONDS:1209600}" },

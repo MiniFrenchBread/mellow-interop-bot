@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from web3 import Web3
 from web3.contract import Contract
@@ -144,8 +145,18 @@ def get_w3(rpc: str) -> Web3:
     return w3
 
 
+# Anchored to this file like the config and lock paths are. Left relative to the
+# working directory, every task fails for a scheduler started from anywhere but
+# the repo root -- and because config and lock still resolve, the failure gives
+# no hint that the working directory is the cause.
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+ABI_DIR = os.path.join(_REPO_ROOT, "abi")
+
+
 def get_contract(w3: Web3, address: str, name: str) -> Contract:
-    with open("./abi/{}.json".format(name), "r") as f:
+    with open(os.path.join(ABI_DIR, "{}.json".format(name)), "r") as f:
         abi = json.load(f)
         return w3.eth.contract(address=w3.to_checksum_address(address), abi=abi)
 

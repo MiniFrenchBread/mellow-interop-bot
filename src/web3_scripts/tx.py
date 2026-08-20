@@ -279,11 +279,26 @@ def send_and_confirm(
         )
 
     if nonce is None:
-        # "pending" so a transaction still sitting in the mempool is counted;
-        # "latest" would hand back a nonce that is already spoken for.
-        nonce = w3.eth.get_transaction_count(sender, "pending")
+        # "latest", deliberately, even though a transaction may still be sitting
+        # in the mempool at this nonce. Nothing here reconciles across calls, so
+        # when a caller retries an operation that previously timed out, counting
+        # the stuck transaction would sign the retry one slot further along --
+        # and if the stuck one later mines, the retry mines behind it and the
+        # operation happens twice. Reusing the nonce makes the retry a
+        # replacement instead, which is what a retry is meant to be. Within a
+        # single call this is safe because every send waits for its receipt, and
+        # batches that cannot wait pass their nonce in explicitly.
+        nonce = w3.eth.get_transaction_count(sender, "latest")
 
     sent_hashes: List[str] = []
+    # The whole call gets one budget. Attempts that fail without waiting -- a
+    # rejected replacement returns instantly -- must not each buy another full
+    # timeout, or one send could hold the scheduler for the better part of an
+    # hour while the tasks behind it never run.
+    deadline = time.monotonic() + receipt_timeout * max_attempts
+
+    def remaining_budget() -> float:
+        return max(0.0, deadline - time.monotonic())
 
     for attempt in range(1, max_attempts + 1):
         transaction = contract_function.build_transaction(
@@ -341,18 +356,41 @@ def send_and_confirm(
                 max_priority_fee = _bump(max_priority_fee, fee_bump_percent)
                 continue  # nothing new was broadcast; the final sweep still polls
             else:
-                raise
+                raise _with_hashes(e, sent_hashes, nonce)
 
-        receipt = wait_any_receipt(w3, sent_hashes, receipt_timeout, poll_latency)
+        try:
+            receipt = wait_any_receipt(
+                w3,
+                sent_hashes,
+                min(receipt_timeout, remaining_budget()),
+                poll_latency,
+            )
+        except Exception as e:
+            # An RPC outage during polling says nothing about the transaction.
+            # Reporting it as a bare error would drop the hashes and leave the
+            # caller unable to tell a broadcast transaction from an unsent one.
+            raise _with_hashes(e, sent_hashes, nonce)
         if receipt is not None:
             return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
 
         if attempt < max_attempts:
             fresh_max_fee, fresh_priority = compute_fees(w3, fee_cap_gwei)
-            max_fee = max(_bump(max_fee, fee_bump_percent), fresh_max_fee)
-            max_priority_fee = max(
+            bumped_priority = max(
                 _bump(max_priority_fee, fee_bump_percent), fresh_priority
             )
+            cap = w3.to_wei(fee_cap_gwei, "gwei")
+            if bumped_priority > cap:
+                # A configured cap is a limit on what we are willing to pay, so
+                # it also limits replacements. Below the client's minimum premium
+                # a replacement would only be rejected, so keep waiting on what
+                # is already broadcast instead of re-signing.
+                _log(
+                    "{}Fee cap of {} gwei reached; waiting on the broadcast "
+                    "transaction rather than replacing it".format(prefix, fee_cap_gwei)
+                )
+                continue
+            max_priority_fee = bumped_priority
+            max_fee = max(_bump(max_fee, fee_bump_percent), fresh_max_fee)
             _log(
                 "{}No receipt after {}s, replacing nonce {} at {} gwei".format(
                     prefix, receipt_timeout, nonce, max_fee / 1e9
@@ -362,7 +400,7 @@ def send_and_confirm(
     # A rejected replacement returns instantly, so the attempts can run out with
     # most of the time budget unspent while an earlier broadcast is still live in
     # the mempool. Spend what is left before declaring the transaction lost.
-    receipt = wait_any_receipt(w3, sent_hashes, receipt_timeout, poll_latency)
+    receipt = wait_any_receipt(w3, sent_hashes, remaining_budget(), poll_latency)
     if receipt is not None:
         return _confirmed(w3, receipt, nonce, max_attempts, sent_hashes, prefix)
 
@@ -373,6 +411,25 @@ def send_and_confirm(
         sent_hashes,
         nonce,
     )
+
+
+def _with_hashes(error: Exception, sent_hashes: List[str], nonce: int) -> Exception:
+    """Re-shape an error raised after a broadcast so it carries the hashes.
+
+    Whatever went wrong, the transactions named here may still be on chain, and
+    losing track of them is the one outcome this module must never produce.
+    """
+    if not sent_hashes:
+        return error
+    wrapped = TxNotConfirmed(
+        "Interrupted while confirming nonce {}: {}. Broadcast hashes: {}".format(
+            nonce, error, ", ".join(sent_hashes)
+        ),
+        sent_hashes,
+        nonce,
+    )
+    wrapped.__cause__ = error
+    return wrapped
 
 
 def _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix) -> TxOutcome:

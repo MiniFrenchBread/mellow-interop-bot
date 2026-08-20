@@ -54,74 +54,80 @@ class SafeProposal:
 
 
 async def main():
+    """Standalone entry point: report a failure and exit rather than traceback."""
     config = None
     try:
-        # Load environment variables
         dotenv.load_dotenv()
-
-        # Read config
         config = read_config(str(CONFIG_PATH))
-
-        # Print Telegram info (Bot and group)
-        await print_telegram_info(
-            config.telegram_bot_api_key, config.telegram_group_chat_id
-        )
-
-        # Validate and get oracles data
-        oracle_validation_results = validate_oracles(config)
-
-        # Compose message with oracle statuses
-        message = compose_oracle_data_message(config, oracle_validation_results)
-        if not message:
-            print("No invalid oracle statuses to report")
-            return
-
-        # Send message with oracle statuses
-        status_message = await send_message(
-            config.telegram_bot_api_key, config.telegram_group_chat_id, message
-        )
-
-        # Propose tx to update oracle
-        safe_proposals = propose_tx_to_update_oracle(oracle_validation_results)
-
-        # Compose message with safe data
-        for source, safe_global, safe_proposal in safe_proposals:
-            message = compose_safe_proposal_message(
-                config.telegram_owner_nicknames,
-                source.name,
-                safe_global,
-                safe_proposal,
-            )
-
-            # Send message with safe proposal for each source
-            if message:
-                # Only add prefix for newly created transactions
-                if (
-                    config.telegram_proposal_message_prefix
-                    and safe_proposal.is_newly_created
-                ):
-                    message = (
-                        config.telegram_proposal_message_prefix.replace("_", "\\_")
-                        + "\n"
-                        + message
-                    )
-
-                await send_message(
-                    config.telegram_bot_api_key,
-                    config.telegram_group_chat_id,
-                    message,
-                    reply_to_message_id=(
-                        status_message.message_id if status_message else None
-                    ),
-                )
-        print(f"Sent {len(safe_proposals)} message(s) with safe proposal")
+        await run_oracle_report(config)
     except FileNotFoundError:
         print(f"Error: config.json not found")
     except Exception as e:
-        error_message = str(e)
-        # Mask all sensitive config data if config was loaded
-        error_message = mask_all_sensitive_config_data(error_message, config)
+        error_message = mask_all_sensitive_config_data(str(e), config)
         print(f"Unexpected error: {error_message}")
+
+
+async def run_oracle_report(config: Config):
+    """Validate every oracle, alert, and propose updates. Raises on failure.
+
+    Kept separate from main() because the scheduler needs to see failures: with
+    the catch-all wrapped around this work, a broken oracle report always looked
+    like a successful one, and the whole retry-and-alert path was dead for the
+    one task whose silence started this.
+    """
+    # Print Telegram info (Bot and group)
+    await print_telegram_info(
+        config.telegram_bot_api_key, config.telegram_group_chat_id
+    )
+
+    # Validate and get oracles data
+    oracle_validation_results = validate_oracles(config)
+
+    # Compose message with oracle statuses
+    message = compose_oracle_data_message(config, oracle_validation_results)
+    if not message:
+        print("No invalid oracle statuses to report")
+        return
+
+    # Send message with oracle statuses
+    status_message = await send_message(
+        config.telegram_bot_api_key, config.telegram_group_chat_id, message
+    )
+
+    # Propose tx to update oracle
+    safe_proposals = propose_tx_to_update_oracle(oracle_validation_results)
+
+    # Compose message with safe data
+    for source, safe_global, safe_proposal in safe_proposals:
+        message = compose_safe_proposal_message(
+            config.telegram_owner_nicknames,
+            source.name,
+            safe_global,
+            safe_proposal,
+        )
+
+        # Send message with safe proposal for each source
+        if message:
+            # Only add prefix for newly created transactions
+            if (
+                config.telegram_proposal_message_prefix
+                and safe_proposal.is_newly_created
+            ):
+                message = (
+                    config.telegram_proposal_message_prefix.replace("_", "\\_")
+                    + "\n"
+                    + message
+                )
+
+            await send_message(
+                config.telegram_bot_api_key,
+                config.telegram_group_chat_id,
+                message,
+                reply_to_message_id=(
+                    status_message.message_id if status_message else None
+                ),
+            )
+    print(f"Sent {len(safe_proposals)} message(s) with safe proposal")
 
 
 def compose_oracle_data_message(

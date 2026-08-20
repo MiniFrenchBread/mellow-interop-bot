@@ -16,6 +16,7 @@ bot with nothing to do.
 """
 
 import asyncio
+import json
 import signal
 import sys
 import time
@@ -29,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import read_config
 from config.mask_sensitive_data import mask_all_sensitive_config_data
 from config.read_config import Config
-from process_lock import LockHeld, ProcessLock
+from process_lock import LockHeld, ProcessLock, resolve_lock_path
 from telegram_bot import send_message
 from web3_scripts import get_w3, print_colored
 from web3_scripts.ascend import run_ascend
@@ -77,15 +78,26 @@ def format_duration(seconds: float) -> str:
 
 
 class Scheduler:
-    def __init__(self, config: Config, now=time.time, sleep=time.sleep):
+    def __init__(
+        self, config: Config, now=time.time, sleep=time.sleep, state_path=None
+    ):
         self.config = config
         self._now = now
         self._sleep = sleep
         self.stopping = False
         started = now()
-        # Starting from "now" means a task whose bucket already passed waits for
-        # the next one, so restarting never replays work that was already done.
+        self.state_path = (
+            state_path
+            if state_path is not None
+            else resolve_lock_path(config.scheduler.state_file)
+        )
+        # Seeded from "now" so a first start does not replay a bucket that has
+        # already passed, then overridden by whatever the last run recorded.
+        # Without that record a restart minutes after a boundary would skip the
+        # bucket entirely and say nothing -- for a fortnightly task that is
+        # twenty-eight days between reward distributions, invisibly.
         self.last_run = {task: started for task in TASK_ORDER}
+        self.last_run.update(self._load_state())
         self.failures = {task: 0 for task in TASK_ORDER}
         self.skips = {task: 0 for task in TASK_ORDER}
         # A task that failed is retried on a backoff rather than at its next
@@ -94,6 +106,27 @@ class Scheduler:
         # three consecutive failures six weeks apart -- long enough that the
         # failure alert would never fire.
         self.retry_after = {task: 0.0 for task in TASK_ORDER}
+
+    # -- persisted schedule ------------------------------------------------
+
+    def _load_state(self) -> dict:
+        try:
+            with open(self.state_path, "r") as handle:
+                stored = json.load(handle)
+        except (FileNotFoundError, ValueError, OSError):
+            return {}
+        return {
+            task: float(value)
+            for task, value in stored.items()
+            if task in TASK_ORDER and isinstance(value, (int, float))
+        }
+
+    def _save_state(self) -> None:
+        try:
+            with open(self.state_path, "w") as handle:
+                json.dump(self.last_run, handle)
+        except OSError as e:
+            print_colored("Could not persist the schedule: {}".format(e), "yellow")
 
     # -- notifications -----------------------------------------------------
 
@@ -116,7 +149,10 @@ class Scheduler:
         )
         traceback.print_exc()
         threshold = self.config.scheduler.alert_after_failures
-        if threshold and self.failures[task] == threshold:
+        # Every threshold-th failure, not only the first. A task that stays
+        # broken must keep saying so; one alert followed by silence is the
+        # failure mode this exists to close.
+        if threshold and self.failures[task] % threshold == 0:
             self.notify(
                 "⚠️ `{}` has failed {} times in a row.\n```\n{}\n```".format(
                     task, self.failures[task], message
@@ -179,9 +215,11 @@ class Scheduler:
             self.skips["rebalance"] = 0
 
     def task_oracle_report(self) -> None:
-        from main import main as oracle_main
+        from main import run_oracle_report
 
-        asyncio.run(oracle_main())
+        # The raising variant, not main(): main() swallows everything so the
+        # scheduler could never see this task fail.
+        asyncio.run(run_oracle_report(self.config))
 
     def task_handle_epoch(self) -> None:
         for source in self.config.sources:
@@ -232,6 +270,7 @@ class Scheduler:
                 self.handler(task)()
                 self.record_success(task)
                 self.last_run[task] = now
+                self._save_state()
             except Exception as e:
                 # Isolated per task: the shell scheduler got this from running
                 # each task in its own process, and losing it would let one

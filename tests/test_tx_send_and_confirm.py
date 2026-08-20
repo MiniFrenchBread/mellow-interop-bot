@@ -209,12 +209,90 @@ class TestSendAndConfirm(unittest.TestCase):
         self.assertEqual(outcome.attempts, 1)
         self.assertEqual(len(outcome.tx_hashes), 1)
 
-    def test_nonce_comes_from_pending_not_latest(self):
+    def test_nonce_comes_from_latest_so_a_retry_replaces(self):
+        """A retry of a timed-out operation must reuse the nonce, not skip it.
+
+        Counting a stuck transaction would sign the retry one slot further
+        along, and if the stuck one later mined the retry would mine behind it
+        and the operation would happen twice.
+        """
         w3, fn = make(receipt_script=[receipt()])
 
         send_and_confirm(fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001)
 
-        self.assertEqual(w3.eth.nonce_calls, ["pending"])
+        self.assertEqual(w3.eth.nonce_calls, ["latest"])
+
+    def test_an_rpc_outage_while_polling_keeps_the_hashes(self):
+        """A polling failure says nothing about the transaction.
+
+        Losing the hashes would leave the caller unable to tell a broadcast
+        transaction from one that was never sent.
+        """
+        w3, fn = make(receipt_script=[ConnectionError("All 2 RPC endpoint(s) failed")])
+
+        with self.assertRaises(TxNotConfirmed) as caught:
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001
+            )
+
+        self.assertEqual(len(caught.exception.tx_hashes), 1)
+        self.assertIsInstance(caught.exception.__cause__, ConnectionError)
+
+    def test_an_unexpected_send_error_keeps_the_hashes(self):
+        w3, fn = make(
+            receipt_script=[], send_script=[Exception("insufficient funds for gas")]
+        )
+
+        with self.assertRaises(TxNotConfirmed) as caught:
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, receipt_timeout=1, poll_latency=0.001
+            )
+
+        self.assertEqual(len(caught.exception.tx_hashes), 1)
+
+    def test_the_fee_cap_still_caps_after_a_bump(self):
+        """A cap is a limit on what we will pay, replacements included."""
+        w3, fn = make(receipt_script=[])
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=4,
+                fee_cap_gwei=1,
+                poll_latency=0.001,
+            )
+
+        cap = Web3.to_wei(1, "gwei")
+        for transaction in fn.built:
+            self.assertLessEqual(transaction["maxPriorityFeePerGas"], cap)
+
+    def test_the_whole_call_shares_one_time_budget(self):
+        """Attempts that fail instantly must not each buy another full timeout."""
+        import time as _time
+
+        w3, fn = make(
+            receipt_script=[],
+            send_script=[None, Exception(UNDERPRICED), Exception(UNDERPRICED)],
+        )
+
+        started = _time.monotonic()
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.2,
+                max_attempts=3,
+                poll_latency=0.01,
+            )
+        elapsed = _time.monotonic() - started
+
+        self.assertLess(elapsed, 0.2 * 3 + 0.2)
 
     def test_timeout_replaces_same_nonce_with_a_higher_fee(self):
         w3, fn = make(resolver=only_after_replacement)

@@ -17,6 +17,7 @@ DEFAULT_TX_FEE_CAP_GWEI = 4
 DEFAULT_LOOP_SLEEP_SECONDS = 300
 DEFAULT_POST_ASCEND_GAP_SECONDS = 60
 DEFAULT_LOCK_FILE = ".scheduler.lock"
+DEFAULT_STATE_FILE = ".scheduler-state.json"
 DEFAULT_ALERT_AFTER_FAILURES = 3
 DEFAULT_TASK_INTERVALS = {
     "ascend": 1209600,
@@ -66,6 +67,7 @@ class SchedulerConfig:
     loop_sleep_seconds: int = DEFAULT_LOOP_SLEEP_SECONDS
     post_ascend_gap_seconds: int = DEFAULT_POST_ASCEND_GAP_SECONDS
     lock_file: str = DEFAULT_LOCK_FILE
+    state_file: str = DEFAULT_STATE_FILE
     alert_after_failures: int = DEFAULT_ALERT_AFTER_FAILURES
     task_intervals: Dict[str, int] = field(
         default_factory=lambda: dict(DEFAULT_TASK_INTERVALS)
@@ -448,6 +450,7 @@ def _create_scheduler_config(
             )
         ),
         lock_file=scheduler_dict.get("lock_file") or DEFAULT_LOCK_FILE,
+        state_file=scheduler_dict.get("state_file") or DEFAULT_STATE_FILE,
         alert_after_failures=int(
             scheduler_dict.get("alert_after_failures", DEFAULT_ALERT_AFTER_FAILURES)
         ),

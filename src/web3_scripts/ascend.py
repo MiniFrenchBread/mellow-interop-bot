@@ -123,15 +123,23 @@ def run_ascend(
     )
     result.distributed = sum(event["args"]["amount"] for event in events)
 
-    remaining = w3.eth.get_balance(router)
     print_colored(
-        "Distributed {} across {} recipient(s). Router balance now {}".format(
-            result.distributed, len(events), remaining
+        "Distributed {} of {} across {} recipient(s)".format(
+            result.distributed, result.router_balance, len(events)
         ),
         "green",
     )
-    if remaining != 0:
+    # Checked against what went in, not against the router's native balance:
+    # distribute() wraps the whole balance into WETH before paying out the
+    # shares, so the native balance afterwards is always zero and would report
+    # a clean sweep even when a share was never transferred. A shortfall means
+    # rounding dust, or a configured recipient left at the zero address, whose
+    # share stays in the router as WETH.
+    undistributed = result.router_balance - result.distributed
+    if undistributed:
         print_colored(
-            "Router still holds {} after distribute".format(remaining), "yellow"
+            "{} was wrapped but not transferred; it remains in the router "
+            "as WETH".format(undistributed),
+            "yellow",
         )
     return result

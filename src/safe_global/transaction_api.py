@@ -72,9 +72,14 @@ def _get_queued_transactions(
     api_key: str,
     safe_address: str,
     safe_nonce: int,
-    to: str,
+    to: str = None,
 ):
-    url = f"{api_url.rstrip('/')}/api/v2/safes/{safe_address}/multisig-transactions/?nonce__gte={safe_nonce}&to={to}&executed=false&trusted=true"
+    url = (
+        f"{api_url.rstrip('/')}/api/v2/safes/{safe_address}/multisig-transactions/"
+        f"?nonce__gte={safe_nonce}&executed=false&trusted=true"
+    )
+    if to is not None:
+        url += f"&to={to}"
     headers = _headers(api_key, {"Content-Type": "application/json"})
 
     def fetch():
@@ -132,7 +137,12 @@ def get_superseded_transactions(
     win rather than both being applied in turn -- but signers cannot tell which
     of two entries is the current one unless they are told.
     """
-    queued = _get_queued_transactions(api_url, api_key, safe_address, safe_nonce, to)
+    # Fetched without a target filter on purpose. A proposal covering one stale
+    # oracle is sent straight to that oracle, while two or more go through the
+    # MultiSend contract; both bind the same Safe nonce and void each other, so
+    # filtering by target would hide the competitor in exactly the case where
+    # the number of stale oracles changed between proposals.
+    queued = _get_queued_transactions(api_url, api_key, safe_address, safe_nonce)
 
     def same_nonce(transaction) -> bool:
         # The service reports nonce as a string while the contract returns an int.
@@ -149,8 +159,10 @@ def get_superseded_transactions(
         transaction
         for transaction in queued
         if same_nonce(transaction)
-        and same_target(transaction)
-        and (transaction.get("data") or "").lower() != (calldata or "").lower()
+        and not (
+            same_target(transaction)
+            and (transaction.get("data") or "").lower() == (calldata or "").lower()
+        )
     ]
 
 

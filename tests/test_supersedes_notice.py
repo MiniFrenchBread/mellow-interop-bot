@@ -52,7 +52,7 @@ class TestSupersededLookup(unittest.TestCase):
     def setUp(self):
         self.calls = []
 
-        def fake_fetch(api_url, api_key, safe_address, safe_nonce, to):
+        def fake_fetch(api_url, api_key, safe_address, safe_nonce, to=None):
             self.calls.append(safe_nonce)
             return self.queue
 
@@ -74,17 +74,28 @@ class TestSupersededLookup(unittest.TestCase):
         self.queue = [queued(11, "0xOLD", OLD_HASH)]
         self.assertEqual([t["safeTxHash"] for t in self.find()], [OLD_HASH])
 
-    def test_identical_calldata_is_reuse_not_supersession(self):
+    def test_identical_calldata_to_the_same_target_is_reuse(self):
         self.queue = [queued(11, "0xNEW", OLD_HASH)]
         self.assertEqual(self.find(), [])
+
+    def test_identical_calldata_to_a_different_target_still_competes(self):
+        self.queue = [queued(11, "0xNEW", OLD_HASH, to=SAFE_ADDRESS)]
+        self.assertEqual([t["safeTxHash"] for t in self.find()], [OLD_HASH])
 
     def test_a_later_nonce_is_queued_behind_not_competing(self):
         self.queue = [queued(12, "0xOLD", OLD_HASH)]
         self.assertEqual(self.find(), [])
 
-    def test_a_different_target_is_ignored(self):
-        self.queue = [queued(11, "0xOLD", OLD_HASH, to=SAFE_ADDRESS)]
-        self.assertEqual(self.find(), [])
+    def test_a_competitor_with_a_different_target_still_counts(self):
+        """One stale oracle is proposed direct, several go via MultiSend.
+
+        Both bind the same Safe nonce and void each other, so the target is not
+        what decides whether a queued proposal competes.
+        """
+        multi_send = "0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526"
+        self.queue = [queued(11, "0xOLD", OLD_HASH, to=multi_send)]
+
+        self.assertEqual([t["safeTxHash"] for t in self.find()], [OLD_HASH])
 
     def test_target_casing_does_not_matter(self):
         self.queue = [queued(11, "0xOLD", OLD_HASH, to=ORACLE.lower())]

@@ -13,4 +13,6 @@ COPY config.json .
 ENV PYTHONPATH=/app/src
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "src/main.py"]
+# The scheduler, not the one-shot oracle report: main.py runs a single pass
+# and exits, which is not what a container of this bot should do.
+CMD ["python", "-u", "src/scheduler.py"]

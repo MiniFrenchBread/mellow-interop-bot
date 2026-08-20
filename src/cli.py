@@ -90,9 +90,10 @@ def cmd_handle_epoch(config: Config, args) -> None:
 
 
 def cmd_oracle(config: Config, args) -> None:
-    from main import main as oracle_main
+    from main import run_oracle_report
 
-    asyncio.run(oracle_main())
+    # The raising variant, so a failure leaves a non-zero exit status.
+    asyncio.run(run_oracle_report(config))
 
 
 def cmd_rebalance(config: Config, args) -> None:

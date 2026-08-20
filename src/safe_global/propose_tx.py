@@ -176,6 +176,8 @@ def _superseded_hashes(
     not a reason to report a proposal that already succeeded as failed.
     """
     try:
+        if not _is_transaction_api(safe_global):
+            return []
         superseded = transaction_api.get_superseded_transactions(
             safe_global.api_url,
             safe_global.api_key,

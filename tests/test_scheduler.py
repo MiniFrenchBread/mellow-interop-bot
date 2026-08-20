@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 
 # Add the src directory to the Python path
@@ -7,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config.read_config import Config, SchedulerConfig
 from scheduler import Scheduler, format_duration, is_due, next_due
+import main as oracle_main_module
 
 DAY = 86400
 HOUR = 3600
@@ -34,6 +36,21 @@ def make_config(**scheduler_kwargs) -> Config:
         sources=[],
         scheduler=SchedulerConfig(task_intervals=intervals, **scheduler_kwargs),
     )
+
+
+def make_scheduler(config, now=None, sleep=None, state_path=None):
+    """Always give the scheduler its own state file.
+
+    Sharing the real one would let tests read each other's persisted schedule.
+    """
+    kwargs = {
+        "state_path": state_path or os.path.join(tempfile.mkdtemp(), "state.json")
+    }
+    if now is not None:
+        kwargs["now"] = now
+    if sleep is not None:
+        kwargs["sleep"] = sleep
+    return Scheduler(config, **kwargs)
 
 
 class FakeClock:
@@ -75,8 +92,8 @@ class TestRestartBehaviour(unittest.TestCase):
 
     def test_restart_keeps_the_same_next_fire_time(self):
         started = 10 * DAY + 5 * HOUR
-        first = Scheduler(make_config(), now=lambda: started)
-        restarted = Scheduler(make_config(), now=lambda: started + 2 * HOUR)
+        first = make_scheduler(make_config(), now=lambda: started)
+        restarted = make_scheduler(make_config(), now=lambda: started + 2 * HOUR)
 
         self.assertEqual(
             next_due(first.last_run["oracle_report"], DAY),
@@ -85,12 +102,12 @@ class TestRestartBehaviour(unittest.TestCase):
 
     def test_restart_does_not_replay_a_bucket_already_served(self):
         started = 10 * DAY + 5 * HOUR
-        scheduler = Scheduler(make_config(), now=lambda: started)
+        scheduler = make_scheduler(make_config(), now=lambda: started)
         self.assertFalse(is_due(scheduler.last_run["oracle_report"], started, DAY))
 
     def test_a_crossed_boundary_still_fires_after_a_restart(self):
         started = 10 * DAY + 5 * HOUR
-        scheduler = Scheduler(make_config(), now=lambda: started)
+        scheduler = make_scheduler(make_config(), now=lambda: started)
         self.assertTrue(is_due(scheduler.last_run["oracle_report"], 11 * DAY + 1, DAY))
 
 
@@ -108,7 +125,7 @@ class TestCycleIsolation(unittest.TestCase):
             },
             post_ascend_gap_seconds=0,
         )
-        self.scheduler = Scheduler(
+        self.scheduler = make_scheduler(
             self.config, now=self.clock.time, sleep=self.clock.sleep
         )
         self.ran = []
@@ -135,17 +152,32 @@ class TestCycleIsolation(unittest.TestCase):
         self.assertEqual(self.scheduler.failures["rebalance"], 1)
         self.assertEqual(self.scheduler.failures["ascend"], 0)
 
-    def test_failures_alert_once_at_the_threshold(self):
+    def test_a_task_that_stays_broken_keeps_alerting(self):
+        """One alert then silence is the failure mode the alerting exists to close."""
+        self._stub("rebalance", RuntimeError("RPC exploded"))
+        sent = []
+        self.scheduler.notify = sent.append
+
+        for _ in range(6):
+            self.scheduler.retry_after["rebalance"] = 0.0
+            self.clock.advance(10)
+            self.scheduler.run_cycle()
+
+        self.assertEqual(self.scheduler.failures["rebalance"], 6)
+        self.assertEqual(len(sent), 2, "at the threshold and every threshold after")
+
+    def test_failures_do_not_alert_on_every_cycle(self):
         self._stub("rebalance", RuntimeError("RPC exploded"))
         sent = []
         self.scheduler.notify = sent.append
 
         for _ in range(5):
+            self.scheduler.retry_after["rebalance"] = 0.0
             self.clock.advance(10)
             self.scheduler.run_cycle()
 
         self.assertEqual(self.scheduler.failures["rebalance"], 5)
-        self.assertEqual(len(sent), 1, "alert once at the threshold, not every cycle")
+        self.assertEqual(len(sent), 1, "at the threshold, not on every failure")
 
     def test_recovery_clears_the_counter(self):
         self._stub("rebalance", RuntimeError("RPC exploded"))
@@ -237,6 +269,105 @@ class TestFormatDuration(unittest.TestCase):
         self.assertEqual(format_duration(90), "1m")
         self.assertEqual(format_duration(3 * HOUR + 4 * 60), "3h 4m")
         self.assertEqual(format_duration(2 * DAY + HOUR), "2d 1h")
+
+
+class TestPersistedSchedule(unittest.TestCase):
+    """A restart must not be able to skip a slot that was already due."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "state.json")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_a_restart_after_a_boundary_still_owes_the_run(self):
+        boundary = 100 * DAY
+        interval = DAY
+
+        before = make_scheduler(
+            make_config(task_intervals={"oracle_report": interval}),
+            now=lambda: boundary - HOUR,
+            state_path=self.path,
+        )
+        before._save_state()
+
+        after = make_scheduler(
+            make_config(task_intervals={"oracle_report": interval}),
+            now=lambda: boundary + 60,
+            state_path=self.path,
+        )
+
+        self.assertTrue(
+            is_due(after.last_run["oracle_report"], boundary + 60, interval),
+            "the slot was owed before the restart and is still owed after it",
+        )
+
+    def test_a_first_start_does_not_replay_the_current_bucket(self):
+        fresh = make_scheduler(
+            make_config(), now=lambda: 100 * DAY + HOUR, state_path=self.path
+        )
+
+        self.assertFalse(is_due(fresh.last_run["oracle_report"], 100 * DAY + HOUR, DAY))
+
+    def test_a_corrupt_state_file_falls_back_to_now(self):
+        with open(self.path, "w") as handle:
+            handle.write("{ not json")
+
+        scheduler = make_scheduler(
+            make_config(), now=lambda: 100 * DAY, state_path=self.path
+        )
+
+        self.assertEqual(scheduler.last_run["ascend"], 100 * DAY)
+
+    def test_unknown_tasks_in_the_file_are_ignored(self):
+        import json
+
+        with open(self.path, "w") as handle:
+            json.dump({"ascend": 5.0, "retired_task": 1.0}, handle)
+
+        scheduler = make_scheduler(
+            make_config(), now=lambda: 100 * DAY, state_path=self.path
+        )
+
+        self.assertEqual(scheduler.last_run["ascend"], 5.0)
+        self.assertNotIn("retired_task", scheduler.last_run)
+
+
+class TestOracleTaskFailuresAreVisible(unittest.TestCase):
+    """The oracle report is the 21-day heartbeat; its silence must be loud."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.scheduler = make_scheduler(
+            make_config(),
+            state_path=os.path.join(self.directory.name, "state.json"),
+        )
+        self._original = oracle_main_module.run_oracle_report
+
+    def tearDown(self):
+        oracle_main_module.run_oracle_report = self._original
+        self.directory.cleanup()
+
+    def test_a_failing_oracle_report_reaches_the_scheduler(self):
+        async def boom(_config):
+            raise RuntimeError("RPC down")
+
+        oracle_main_module.run_oracle_report = boom
+
+        with self.assertRaises(RuntimeError):
+            self.scheduler.task_oracle_report()
+
+    def test_the_standalone_entry_point_still_swallows(self):
+        """main() is the standalone path and should exit cleanly, not traceback."""
+        import asyncio
+
+        async def boom(_config):
+            raise RuntimeError("RPC down")
+
+        oracle_main_module.run_oracle_report = boom
+
+        asyncio.run(oracle_main_module.main())
 
 
 if __name__ == "__main__":

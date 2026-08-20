@@ -125,10 +125,11 @@ so a default there would enter public history.
 | `SAFE_API_KEY` | Global Safe API key | (optional) |
 | `DRY_RUN` | Skip Telegram messages | false |
 | `OPERATOR_PK` | Signs every transaction: rebalancing, ascend claims, epoch advances | (required) |
-| `OG_EXECUTOR_PK` | Overrides `OPERATOR_PK` for the 0G chain only | `OPERATOR_PK` |
+| `OG_EXECUTOR_PK` | Overrides `OPERATOR_PK` for the OG source, signing **both** legs of its rebalance — the target-chain calls included | `OPERATOR_PK` |
 | `OG_RECEIPT_TIMEOUT` / `TARGET_RECEIPT_TIMEOUT` | Seconds to wait for a receipt before replacing the transaction at a higher fee | 60 / 600 |
 | `ASCEND_INTERVAL_SECONDS` / `REBALANCE_INTERVAL_SECONDS` / `ORACLE_REPORT_INTERVAL_SECONDS` / `HANDLE_EPOCH_INTERVAL_SECONDS` | Task intervals | 1209600 / 7200 / 86400 / 300 |
-| `ALERT_AFTER_FAILURES` | Consecutive failures or skips before a Telegram alert | 3 |
+| `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
+| `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
 | `SOURCE_RATIO_D3` | Target source asset ratio (per mille) | 50 |
 | `MAX_SOURCE_RATIO_D3` | Max source ratio before surplus rebalance | 100 |
@@ -161,7 +162,8 @@ proposers for one Safe.
 - Safe nonces do not advance for queued-but-unexecuted proposals, so a proposal carrying a newer
   oracle value lands on the same nonce as the pending one and voids it when executed. That is the
   intended outcome, and the Telegram message names the displaced proposal so signers pick the current one.
-- Each source's `executor-private-key` signs both legs of that source's rebalance, including the
+- A target-chain executor key does not exist: each source's `executor-private-key` signs both legs of
+  that source's rebalance, including the
   target-chain calls. Today every task shares one account (`OPERATOR_PK`), so this is the same key
   either way; the per-source indirection exists so the roles can be split later without a code
   change, and there is deliberately no separate target-chain executor key until one is needed.
