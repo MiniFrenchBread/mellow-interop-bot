@@ -8,26 +8,49 @@ import time
 
 LAYER_ZERO_DUST = 1000_000_000_000
 
+# Observed finalization takes 1-5 minutes. The ceiling exists so a message that
+# never arrives cannot pin this call open forever: the scheduler runs the other
+# tasks in the same process, so an unbounded wait here would stop oracle
+# monitoring and epoch handling too.
+LAYER_ZERO_FINALIZATION_TIMEOUT = 1800
+LAYER_ZERO_POLL_INTERVAL = 60
+
+
+class LayerZeroFinalizationTimeout(Exception):
+    pass
+
 
 def wait_for_layer_zero_finalization(
     source_helper,
     target_helper,
     source_core_address: str,
     target_core_address: str,
+    timeout: float = LAYER_ZERO_FINALIZATION_TIMEOUT,
 ) -> None:
     iteration = 1
-    time.sleep(60)
+    deadline = time.monotonic() + timeout
+    time.sleep(min(LAYER_ZERO_POLL_INTERVAL, timeout))
     while True:
         source_nonces = source_helper.getNonces(source_core_address).call()
         target_nonces = target_helper.getNonces(target_core_address).call()
         # requirement: source.inboundNonce == target.outboundNonce && source.outboundNonce == target.inboundNonce
-        if source_nonces[0] != target_nonces[1] or source_nonces[1] != target_nonces[0]:
-            print("Waiting for LayerZero finalization ({})...".format(iteration))
-            iteration += 1
-            time.sleep(60)
-        else:
+        if (
+            source_nonces[0] == target_nonces[1]
+            and source_nonces[1] == target_nonces[0]
+        ):
             time.sleep(15)
-            break
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LayerZeroFinalizationTimeout(
+                "LayerZero transfer did not finalize within {}s. "
+                "source nonces {}, target nonces {}".format(
+                    timeout, source_nonces, target_nonces
+                )
+            )
+        print("Waiting for LayerZero finalization ({})...".format(iteration))
+        iteration += 1
+        time.sleep(min(LAYER_ZERO_POLL_INTERVAL, remaining))
 
 
 def run(

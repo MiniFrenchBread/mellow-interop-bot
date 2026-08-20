@@ -1,0 +1,328 @@
+import os
+import sys
+import unittest
+from types import SimpleNamespace
+
+# Add the src directory to the Python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from eth_account import Account
+from web3 import Web3
+from web3.exceptions import TransactionNotFound
+
+from web3_scripts.tx import (
+    NonceAlreadyUsed,
+    TxNotConfirmed,
+    TxReverted,
+    is_already_known,
+    is_receipt_pending,
+    is_revert,
+    send_and_confirm,
+)
+
+TEST_KEY = "0x" + "11" * 32
+TEST_ADDRESS = Account.from_key(TEST_KEY).address
+CHAIN_ID = 16661
+TARGET = "0x000000000000000000000000000000000000dEaD"
+
+# The exact error a 0G reth node returns while a block's receipts are still
+# being indexed, and the one a node returns for a payload it already holds.
+RECEIPTS_NOT_INDEXED = (
+    "server returned an error response: error code -32000: "
+    "no matching receipts found: this may indicate potential data corruption"
+)
+ALREADY_KNOWN = "server returned an error response: error code -32000: already known"
+NONCE_TOO_LOW = (
+    "server returned an error response: error code -32000: "
+    "nonce too low: next nonce 2129, tx nonce 2128"
+)
+REVERTED = "execution reverted: SourceCore: zero shares"
+
+
+def receipt(status=1, block_number=100, tx_hash=None):
+    return {
+        "status": status,
+        "blockNumber": block_number,
+        "transactionHash": tx_hash or ("0x" + "ab" * 32),
+    }
+
+
+class FakeEth:
+    """Minimal eth namespace driven by scripted responses.
+
+    receipt_script and send_script are consumed one entry per call; an entry that
+    is an Exception instance is raised, anything else is returned. A resolver
+    callable takes precedence over receipt_script and decides from the fake's own
+    state, which keeps tests about replacement behaviour independent of timing.
+    Signing uses the real offline signer so hashes behave like production hashes.
+    """
+
+    def __init__(
+        self, receipt_script=None, send_script=None, resolver=None, balance=10**18
+    ):
+        self.account = Web3().eth.account
+        self.chain_id = CHAIN_ID
+        self.max_priority_fee = 10**9
+        self._balance = balance
+        self.receipt_script = list(receipt_script or [])
+        self.send_script = list(send_script or [])
+        self.resolver = resolver
+        self.sent = []
+        self.receipt_queries = []
+        self.nonce_calls = []
+
+    def get_balance(self, _address):
+        return self._balance
+
+    def get_block(self, _identifier):
+        return SimpleNamespace(baseFeePerGas=7)
+
+    def get_transaction_count(self, _address, block="latest"):
+        self.nonce_calls.append(block)
+        return 42
+
+    def send_raw_transaction(self, raw):
+        self.sent.append(raw)
+        if self.send_script:
+            entry = self.send_script.pop(0)
+            if isinstance(entry, Exception):
+                raise entry
+        return b"\x00"
+
+    def get_transaction_receipt(self, tx_hash):
+        self.receipt_queries.append(tx_hash)
+        if self.resolver is not None:
+            entry = self.resolver(self, tx_hash)
+        elif self.receipt_script:
+            entry = self.receipt_script.pop(0)
+        else:
+            entry = None
+        if isinstance(entry, Exception):
+            raise entry
+        if entry is None:
+            raise TransactionNotFound("not found")
+        return entry
+
+
+class FakeW3:
+    def __init__(self, eth):
+        self.eth = eth
+        self.provider = None
+
+    def to_wei(self, amount, unit):
+        return Web3.to_wei(amount, unit)
+
+
+class FakeContractFunction:
+    def __init__(self, w3, gas=100000, estimate_error=None):
+        self.w3 = w3
+        self._gas = gas
+        self._estimate_error = estimate_error
+        self.built = []
+
+    def estimate_gas(self, _params):
+        if self._estimate_error is not None:
+            raise self._estimate_error
+        return self._gas
+
+    def build_transaction(self, params):
+        transaction = dict(params)
+        transaction.update({"to": TARGET, "data": "0x", "chainId": CHAIN_ID})
+        self.built.append(transaction)
+        return transaction
+
+
+def make(receipt_script=None, send_script=None, estimate_error=None, resolver=None):
+    eth = FakeEth(
+        receipt_script=receipt_script, send_script=send_script, resolver=resolver
+    )
+    w3 = FakeW3(eth)
+    return w3, FakeContractFunction(w3, estimate_error=estimate_error)
+
+
+def only_after_replacement(eth, tx_hash):
+    """No receipt exists until a second transaction has been broadcast."""
+    if len(eth.sent) >= 2:
+        return receipt(tx_hash=tx_hash)
+    return None
+
+
+def only_the_replacement_lands(eth, tx_hash):
+    """Only the second broadcast ever gets a receipt; the original never does."""
+    if len(eth.sent) >= 2 and tx_hash != eth.receipt_queries[0]:
+        return receipt(tx_hash=tx_hash)
+    return None
+
+
+class TestErrorClassification(unittest.TestCase):
+
+    def test_missing_receipts_is_treated_as_pending(self):
+        self.assertTrue(is_receipt_pending(Exception(RECEIPTS_NOT_INDEXED)))
+
+    def test_transaction_not_found_is_pending(self):
+        self.assertTrue(is_receipt_pending(TransactionNotFound("not found")))
+
+    def test_already_known_is_recognised(self):
+        self.assertTrue(is_already_known(Exception(ALREADY_KNOWN)))
+
+    def test_revert_is_recognised(self):
+        self.assertTrue(is_revert(Exception(REVERTED)))
+
+    def test_missing_receipts_is_not_a_revert(self):
+        self.assertFalse(is_revert(Exception(RECEIPTS_NOT_INDEXED)))
+
+
+class TestSendAndConfirm(unittest.TestCase):
+
+    def test_survives_receipt_indexing_lag(self):
+        """A null result and a missing-receipts error must not end the wait."""
+        w3, fn = make(
+            receipt_script=[
+                None,
+                Exception(RECEIPTS_NOT_INDEXED),
+                None,
+                receipt(),
+            ]
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.attempts, 1)
+        self.assertEqual(outcome.nonce, 42)
+        self.assertEqual(len(w3.eth.sent), 1, "must not rebroadcast while polling")
+
+    def test_already_known_counts_as_broadcast(self):
+        w3, fn = make(
+            receipt_script=[receipt()], send_script=[Exception(ALREADY_KNOWN)]
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.attempts, 1)
+        self.assertEqual(len(outcome.tx_hashes), 1)
+
+    def test_nonce_comes_from_pending_not_latest(self):
+        w3, fn = make(receipt_script=[receipt()])
+
+        send_and_confirm(fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001)
+
+        self.assertEqual(w3.eth.nonce_calls, ["pending"])
+
+    def test_timeout_replaces_same_nonce_with_a_higher_fee(self):
+        w3, fn = make(resolver=only_after_replacement)
+
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.01,
+            max_attempts=2,
+            poll_latency=0.001,
+        )
+
+        self.assertEqual(outcome.attempts, 2)
+        first, second = fn.built[0], fn.built[1]
+        self.assertEqual(first["nonce"], second["nonce"], "replacement, not a new tx")
+        self.assertGreaterEqual(
+            second["maxFeePerGas"] * 100,
+            first["maxFeePerGas"] * 110,
+            "replacement must clear the node's 10% premium",
+        )
+        self.assertGreaterEqual(
+            second["maxPriorityFeePerGas"] * 100,
+            first["maxPriorityFeePerGas"] * 110,
+        )
+        self.assertEqual(len(outcome.tx_hashes), 2)
+
+    def test_original_hash_is_still_polled_after_a_replacement(self):
+        """A replaced transaction can still be the one that lands."""
+        w3, fn = make(resolver=only_after_replacement)
+
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.01,
+            max_attempts=2,
+            poll_latency=0.001,
+        )
+
+        self.assertEqual(outcome.tx_hash, outcome.tx_hashes[0])
+
+    def test_replacement_hash_is_polled_too(self):
+        w3, fn = make(resolver=only_the_replacement_lands)
+
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.01,
+            max_attempts=2,
+            poll_latency=0.001,
+        )
+
+        self.assertEqual(outcome.tx_hash, outcome.tx_hashes[1])
+        self.assertNotEqual(outcome.tx_hashes[0], outcome.tx_hashes[1])
+
+    def test_gives_up_carrying_every_hash(self):
+        w3, fn = make(receipt_script=[])
+
+        with self.assertRaises(TxNotConfirmed) as caught:
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.01,
+                max_attempts=2,
+                poll_latency=0.001,
+            )
+
+        self.assertEqual(caught.exception.nonce, 42)
+        self.assertEqual(len(caught.exception.tx_hashes), 2)
+
+    def test_revert_during_estimation_is_not_retried(self):
+        w3, fn = make(estimate_error=Exception(REVERTED))
+
+        with self.assertRaises(TxReverted):
+            send_and_confirm(fn, 0, TEST_KEY, w3=w3, poll_latency=0.001)
+
+        self.assertEqual(w3.eth.sent, [], "a reverting call must never be broadcast")
+
+    def test_on_chain_failure_status_raises(self):
+        w3, fn = make(receipt_script=[receipt(status=0)])
+
+        with self.assertRaises(TxReverted):
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001
+            )
+
+    def test_nonce_too_low_without_our_receipt_raises(self):
+        w3, fn = make(receipt_script=[], send_script=[Exception(NONCE_TOO_LOW)])
+
+        with self.assertRaises(NonceAlreadyUsed):
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.01, poll_latency=0.001
+            )
+
+    def test_nonce_too_low_after_our_tx_landed_is_success(self):
+        w3, fn = make(
+            receipt_script=[receipt()], send_script=[Exception(NONCE_TOO_LOW)]
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.01, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

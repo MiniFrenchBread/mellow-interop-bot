@@ -4,13 +4,38 @@ from web3.contract import Contract
 from eth_account import Account
 from web3.middleware import ExtraDataToPOAMiddleware
 
+try:
+    from .tx import (
+        DEFAULT_FEE_CAP_GWEI,
+        DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_RECEIPT_TIMEOUT,
+        NonceAlreadyUsed,
+        TxNotConfirmed,
+        TxOutcome,
+        TxReverted,
+        send_and_confirm,
+    )
+except ImportError:
+    from tx import (
+        DEFAULT_FEE_CAP_GWEI,
+        DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_RECEIPT_TIMEOUT,
+        NonceAlreadyUsed,
+        TxNotConfirmed,
+        TxOutcome,
+        TxReverted,
+        send_and_confirm,
+    )
+
 
 BLOCK_GAP = 10000
 SECURE_INTERVAL = 15
 ORACLE_VALUE_TOLERANCE = 10**9  # 1 gwei
 
 
-def is_oracle_value_incorrect(oracle_value: int, actual_value: int, tolerance: int = ORACLE_VALUE_TOLERANCE) -> bool:
+def is_oracle_value_incorrect(
+    oracle_value: int, actual_value: int, tolerance: int = ORACLE_VALUE_TOLERANCE
+) -> bool:
     """Returns True if oracle_value deviates from actual_value beyond tolerance."""
     return abs(oracle_value - actual_value) > tolerance
 
@@ -41,63 +66,25 @@ def get_contract(w3: Web3, address: str, name: str) -> Contract:
         return w3.eth.contract(address=w3.to_checksum_address(address), abi=abi)
 
 
-def execute(contractFunction, value: int, operator_pk: str):
-    operator_address = Account.from_key(operator_pk).address
-    w3 = contractFunction.w3
-
-    operator_balance = w3.eth.get_balance(operator_address)
-    if operator_balance < value:
-        raise Exception(
-            "Operator balance is too low: {}. Required for LayerZero payment: {}".format(
-                operator_balance / 1e18, value / 1e18
-            )
-        )
-
-    base_fee = w3.eth.get_block("latest").baseFeePerGas * 105 // 100
-    try:
-        max_priority_fee = min(w3.eth.max_priority_fee * 3, w3.to_wei(4, "gwei"))
-    except:
-        max_priority_fee = w3.to_wei(2, "gwei")
-
-    try:
-        gas = (
-            contractFunction.estimate_gas(
-                {"from": Web3.to_checksum_address(operator_address), "value": value}
-            )
-            * 105
-            // 100
-        )
-    except Exception as e:
-        raise Exception("Gas estimation failed: {}".format(e))
-
-    require_value_for_transaction_execution = (
-        gas * (base_fee + max_priority_fee) + value
-    )
-    if operator_balance < require_value_for_transaction_execution:
-        raise Exception(
-            "Operator balance is too low: {}. Required for transaction execution: {}".format(
-                operator_balance / 1e18, require_value_for_transaction_execution / 1e18
-            )
-        )
-
-    transaction = contractFunction.build_transaction(
-        {
-            "gas": gas,
-            "maxFeePerGas": base_fee + max_priority_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "value": value,
-            "from": operator_address,
-            "nonce": w3.eth.get_transaction_count(operator_address),
-        }
-    )
-    signed_txn = w3.eth.account.sign_transaction(transaction, private_key=operator_pk)
-    tx = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-    print("Transaction sent: {}".format(tx.hex()))
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    print(
-        "Transaction mined in block: {}. Chain id: {}".format(
-            receipt.blockNumber, w3.eth.chain_id
-        )
+def execute(
+    contractFunction,
+    value: int,
+    operator_pk: str,
+    nonce: int = None,
+    receipt_timeout: float = DEFAULT_RECEIPT_TIMEOUT,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
+    label: str = "",
+) -> TxOutcome:
+    return send_and_confirm(
+        contractFunction,
+        value,
+        operator_pk,
+        nonce=nonce,
+        receipt_timeout=receipt_timeout,
+        max_attempts=max_attempts,
+        fee_cap_gwei=fee_cap_gwei,
+        label=label,
     )
 
 
