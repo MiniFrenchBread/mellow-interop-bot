@@ -9,9 +9,18 @@ from safe_global.common import (
 )
 
 
+def _headers(api_key: str, extra: dict = None) -> dict:
+    headers = {"Accept": "application/json"}
+    if extra:
+        headers.update(extra)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
 def get_version(api_url: str, api_key: str) -> str:
-    url = f"{api_url.rstrip('/')}/api/v1/about"
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+    url = f"{api_url.rstrip('/')}/api/v1/about/"
+    headers = _headers(api_key)
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
         raise Exception(
@@ -24,12 +33,8 @@ def get_version(api_url: str, api_key: str) -> str:
 
 
 def propose_safe_tx(api_url: str, api_key: str, safe_tx: SafeTx) -> str:
-    url = f"{api_url.rstrip('/')}/api/v2/safes/{safe_tx.safe_address}/multisig-transactions"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    url = f"{api_url.rstrip('/')}/api/v2/safes/{safe_tx.safe_address}/multisig-transactions/"
+    headers = _headers(api_key, {"Content-Type": "application/json"})
     body = {
         "to": str(safe_tx.to),
         "value": str(safe_tx.value),
@@ -47,7 +52,12 @@ def propose_safe_tx(api_url: str, api_key: str, safe_tx: SafeTx) -> str:
     }
 
     def propose():
-        response = requests.post(url, headers=headers, json=body, timeout=15)
+        # allow_redirects=False so a server-side redirect (e.g. Django APPEND_SLASH
+        # on self-hosted instances) can never silently downgrade this POST into a
+        # bodyless GET and drop the signed transaction.
+        response = requests.post(
+            url, headers=headers, json=body, timeout=15, allow_redirects=False
+        )
         if response.status_code != 201:
             raise Exception(
                 f"Failed to propose safe tx: {response.status_code} - {response.text}"
@@ -62,14 +72,15 @@ def _get_queued_transactions(
     api_key: str,
     safe_address: str,
     safe_nonce: int,
-    to: str,
+    to: str = None,
 ):
-    url = f"{api_url.rstrip('/')}/api/v2/safes/{safe_address}/multisig-transactions?nonce__gte={safe_nonce}&to={to}&executed=false&trusted=true"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
+    url = (
+        f"{api_url.rstrip('/')}/api/v2/safes/{safe_address}/multisig-transactions/"
+        f"?nonce__gte={safe_nonce}&executed=false&trusted=true"
+    )
+    if to is not None:
+        url += f"&to={to}"
+    headers = _headers(api_key, {"Content-Type": "application/json"})
 
     def fetch():
         response = requests.get(url, headers=headers, timeout=10)
@@ -108,14 +119,61 @@ def _get_queued_transaction_by_calldata(
     return None
 
 
+def get_superseded_transactions(
+    api_url: str,
+    api_key: str,
+    safe_address: str,
+    safe_nonce: int,
+    to: str,
+    calldata: str,
+):
+    """Queued transactions this proposal would compete with.
+
+    A Safe transaction is bound to a nonce, and the nonce read from the contract
+    does not advance for proposals that are queued but not executed. So a second
+    proposal carrying a newer oracle value lands on the same nonce as the first:
+    both stay signable, only one can ever execute, and executing either voids the
+    other. That is the right outcome for an oracle -- the freshest value should
+    win rather than both being applied in turn -- but signers cannot tell which
+    of two entries is the current one unless they are told.
+    """
+    # Fetched without a target filter on purpose. A proposal covering one stale
+    # oracle is sent straight to that oracle, while two or more go through the
+    # MultiSend contract; both bind the same Safe nonce and void each other, so
+    # filtering by target would hide the competitor in exactly the case where
+    # the number of stale oracles changed between proposals.
+    queued = _get_queued_transactions(api_url, api_key, safe_address, safe_nonce)
+
+    def same_nonce(transaction) -> bool:
+        # The service reports nonce as a string while the contract returns an int.
+        try:
+            return int(transaction.get("nonce")) == int(safe_nonce)
+        except (TypeError, ValueError):
+            return False
+
+    def same_target(transaction) -> bool:
+        target = transaction.get("to") or ""
+        return target.lower() == (to or "").lower()
+
+    return [
+        transaction
+        for transaction in queued
+        if same_nonce(transaction)
+        and not (
+            same_target(transaction)
+            and (transaction.get("data") or "").lower() == (calldata or "").lower()
+        )
+    ]
+
+
 def _get_owners_and_threshold(
     api_url: str, api_key: str, safe_address: str
 ) -> ThresholdWithOwners:
     """
     Get Safe owners and threshold information.
     """
-    url = f"{api_url.rstrip('/')}/api/v1/safes/{safe_address}"
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
+    url = f"{api_url.rstrip('/')}/api/v1/safes/{safe_address}/"
+    headers = _headers(api_key)
 
     def fetch():
         response = requests.get(url, headers=headers, timeout=10)

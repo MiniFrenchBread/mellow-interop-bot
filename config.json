@@ -3,8 +3,29 @@
   "telegram-group-chat-id": "${TELEGRAM_GROUP_CHAT_ID}",
   "telegram-owner-nicknames": "${TELEGRAM_OWNER_NICKNAMES}",
   "telegram-proposal-message-prefix": "${TELEGRAM_PROPOSAL_MESSAGE_PREFIX}",
-  "oracle-expiry-threshold-seconds": "${ORACLE_EXPIRY_THRESHOLD_SECONDS:3600}",
+  "oracle-expiry-threshold-seconds": "${ORACLE_EXPIRY_THRESHOLD_SECONDS:172800}",
   "oracle-recent-update-threshold-seconds": "${ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS:0}",
+  "scheduler": {
+    "loop-sleep-seconds": "${LOOP_SLEEP_SECONDS:300}",
+    "post-ascend-gap-seconds": "${POST_ASCEND_GAP_SECONDS:60}",
+    "lock-file": "${SCHEDULER_LOCK_FILE:.scheduler.lock}",
+    "state-file": "${SCHEDULER_STATE_FILE:.scheduler-state.json}",
+    "alert-after-failures": "${ALERT_AFTER_FAILURES:3}",
+    "tasks": {
+      "ascend": { "interval-seconds": "${ASCEND_INTERVAL_SECONDS:1209600}" },
+      "rebalance": { "interval-seconds": "${REBALANCE_INTERVAL_SECONDS:7200}" },
+      "oracle-report": { "interval-seconds": "${ORACLE_REPORT_INTERVAL_SECONDS:86400}" },
+      "handle-epoch": { "interval-seconds": "${HANDLE_EPOCH_INTERVAL_SECONDS:300}" }
+    }
+  },
+  "tx": {
+    "target": {
+      "receipt-timeout-seconds": "${TARGET_RECEIPT_TIMEOUT:600}",
+      "max-attempts": "${TARGET_TX_MAX_ATTEMPTS:4}",
+      "fee-bump-percent": "${TX_FEE_BUMP_PERCENT:115}",
+      "fee-cap-gwei": "${TARGET_FEE_CAP_GWEI:4}"
+    }
+  },
   "target-rpc": "${TARGET_RPC:}",
   "target-core-helper": "0xb417a4a14047281608F83414f2770987ca0ca8F5",
   "sources": [
@@ -12,6 +33,25 @@
       "name": "OG",
       "rpc": "${ZG_RPC:}",
       "source-core-helper": "0x59890cDA7F434657F95341ADF7F861138a043DB5",
+      "executor-private-key": "${OG_EXECUTOR_PK:${OPERATOR_PK}}",
+      "tx": {
+        "receipt-timeout-seconds": "${OG_RECEIPT_TIMEOUT:60}",
+        "max-attempts": "${OG_TX_MAX_ATTEMPTS:3}",
+        "fee-bump-percent": "${TX_FEE_BUMP_PERCENT:115}",
+        "fee-cap-gwei": "${OG_FEE_CAP_GWEI:4}"
+      },
+      "ascend": {
+        "router": "0x4af366C80Eb17F24923fE956Cc21A11A6864B33a",
+        "rewarders": [
+          "0x8163e79a5ade5a453e129f36b957fef15a3736b5",
+          "0xb3c5650c74100f96400a9d1ac71e9d0df324f567",
+          "0x73d346e827435b88e0bf46ed6efa7e09e546b388"
+        ]
+      },
+      "withdrawal-queue": {
+        "address": "0x10A98a5344742308744Bd59829786584A12C1146",
+        "max-iterations": "${HANDLE_EPOCH_MAX_ITERATIONS:8}"
+      },
       "deployments": [
         {
           "name": "OG",

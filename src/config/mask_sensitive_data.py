@@ -18,8 +18,17 @@ def mask_sensitive_data(message: str, sensitive_value: str) -> str:
 
 
 def mask_url_credentials(message: str, url: str) -> str:
-    """Mask credentials in URLs (API keys in query params or auth)"""
+    """Mask credentials in URLs (API keys in query params or auth).
+
+    Supports comma-separated RPC values (multiple endpoints), masking each
+    endpoint independently so a single leaked URL still gets matched.
+    """
     if not url:
+        return message
+
+    if "," in url:
+        for single_url in url.split(","):
+            message = mask_url_credentials(message, single_url.strip())
         return message
 
     # Check if URL contains credentials, API keys, or paths (RPC URLs often have sensitive paths)
@@ -62,17 +71,26 @@ def mask_source_sensitive_data(message: str, source: "SourceConfig") -> str:
     if source.rpc:
         message = mask_url_credentials(message, source.rpc)
 
-    # Mask safe global sensitive data
-    if source.safe_global:
-        # Mask proposer private key
-        if source.safe_global.proposer_private_key:
-            message = mask_sensitive_data(
-                message, source.safe_global.proposer_private_key
-            )
+    # Mask the key this source signs transactions with. The scheduler pipes
+    # failure text through here on its way to Telegram, which is the one path
+    # where a configured secret leaves the machine.
+    if getattr(source, "executor_private_key", None):
+        message = mask_sensitive_data(message, source.executor_private_key)
 
-        # Mask safe API key
-        if source.safe_global.api_key:
-            message = mask_sensitive_data(message, source.safe_global.api_key)
+    # Mask safe global sensitive data, including any a deployment overrode. The
+    # proposal path uses the merged per-deployment config, so an override's own
+    # proposer key or API key is what would appear in an error from it.
+    safes = [source.safe_global]
+    for deployment in getattr(source, "deployments", ()) or ():
+        safes.append(getattr(deployment, "safe_global", None))
+
+    for safe in safes:
+        if not safe:
+            continue
+        if safe.proposer_private_key:
+            message = mask_sensitive_data(message, safe.proposer_private_key)
+        if safe.api_key:
+            message = mask_sensitive_data(message, safe.api_key)
 
     return message
 

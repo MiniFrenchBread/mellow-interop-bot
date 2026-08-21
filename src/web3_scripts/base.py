@@ -1,8 +1,44 @@
 import json
+import os
+import time
 from web3 import Web3
 from web3.contract import Contract
+from web3.providers.rpc import HTTPProvider
 from eth_account import Account
 from web3.middleware import ExtraDataToPOAMiddleware
+
+try:
+    from .tx import (
+        DEFAULT_FEE_BUMP_PERCENT,
+        DEFAULT_FEE_CAP_GWEI,
+        DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_RECEIPT_TIMEOUT,
+        NonceAlreadyUsed,
+        TxNotConfirmed,
+        TxOutcome,
+        TxReverted,
+        send_and_confirm,
+    )
+except ImportError:
+    # Loaded outside its package -- as a standalone script, or by file path, which
+    # is how the config validator and some tests pull this module in. Neither puts
+    # this directory on the path, so the sibling import needs it added first.
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+    from tx import (
+        DEFAULT_FEE_BUMP_PERCENT,
+        DEFAULT_FEE_CAP_GWEI,
+        DEFAULT_MAX_ATTEMPTS,
+        DEFAULT_RECEIPT_TIMEOUT,
+        NonceAlreadyUsed,
+        TxNotConfirmed,
+        TxOutcome,
+        TxReverted,
+        send_and_confirm,
+    )
 
 
 BLOCK_GAP = 10000
@@ -10,9 +46,16 @@ SECURE_INTERVAL = 15
 ORACLE_VALUE_TOLERANCE = 10**9  # 1 gwei
 
 
-def is_oracle_value_incorrect(oracle_value: int, actual_value: int, tolerance: int = ORACLE_VALUE_TOLERANCE) -> bool:
+def is_oracle_value_incorrect(
+    oracle_value: int, actual_value: int, tolerance: int = ORACLE_VALUE_TOLERANCE
+) -> bool:
     """Returns True if oracle_value deviates from actual_value beyond tolerance."""
     return abs(oracle_value - actual_value) > tolerance
+
+
+RETRY_ATTEMPTS_PER_ENDPOINT = 3
+RETRY_DELAY_SECONDS = 0.25
+RETRY_BACKOFF_MULTIPLIER = 2
 
 
 def add_color(text: str, color="yellow") -> str:
@@ -29,75 +72,116 @@ def print_colored(text: str, color="yellow") -> str:
     print(add_color(text, color))
 
 
+class FallbackHTTPProvider(HTTPProvider):
+    """HTTPProvider that fails over across multiple endpoints per request.
+
+    Each endpoint is attempted ``attempts_per_endpoint`` times before moving on
+    to the next one. Between retries of the SAME endpoint the delay starts at
+    ``retry_delay_seconds`` and is multiplied by ``backoff_multiplier`` after
+    each wait; the backoff resets when failing over to the next endpoint, which
+    happens immediately (no delay on switch). For two endpoints with the
+    defaults (3 attempts, 0.25s, x2) the schedule is:
+    try 0 -> 0.25s -> try 0 -> 0.5s -> try 0 -> try 1 -> 0.25s -> try 1 -> 0.5s -> try 1.
+    """
+
+    def __init__(
+        self,
+        endpoint_uris,
+        attempts_per_endpoint=RETRY_ATTEMPTS_PER_ENDPOINT,
+        retry_delay_seconds=RETRY_DELAY_SECONDS,
+        backoff_multiplier=RETRY_BACKOFF_MULTIPLIER,
+        **kwargs,
+    ):
+        uris = [uri.strip() for uri in endpoint_uris if uri and uri.strip()]
+        if not uris:
+            raise ValueError("FallbackHTTPProvider requires at least one endpoint")
+        self._attempts_per_endpoint = attempts_per_endpoint
+        self._retry_delay_seconds = retry_delay_seconds
+        self._backoff_multiplier = backoff_multiplier
+        # Disable web3's built-in per-request retry so this class fully controls
+        # the attempt/backoff schedule below.
+        kwargs.setdefault("exception_retry_configuration", None)
+        super().__init__(uris[0], **kwargs)
+        self._providers = [HTTPProvider(uri, **kwargs) for uri in uris]
+
+    def make_request(self, method, params):
+        last_error = None
+        for index, provider in enumerate(self._providers):
+            delay = self._retry_delay_seconds
+            for attempt in range(self._attempts_per_endpoint):
+                if attempt > 0:
+                    time.sleep(delay)
+                    delay *= self._backoff_multiplier
+                # Log every attempt except the very first (RPC index only, never
+                # the URL, which may contain an API key).
+                if index > 0 or attempt > 0:
+                    print_colored(
+                        f"Retrying with RPC #{index}, attempt {attempt + 1}...",
+                        "yellow",
+                    )
+                try:
+                    response = provider.make_request(method, params)
+                    self.endpoint_uri = provider.endpoint_uri
+                    return response
+                except Exception as e:
+                    last_error = e
+        raise ConnectionError(
+            f"All {len(self._providers)} RPC endpoint(s) failed for method {method} "
+            f"after {self._attempts_per_endpoint} attempt(s) each"
+        ) from last_error
+
+
 def get_w3(rpc: str) -> Web3:
-    w3 = Web3(Web3.HTTPProvider(rpc))
+    endpoints = [uri.strip() for uri in rpc.split(",") if uri.strip()]
+    if not endpoints:
+        raise ValueError("No RPC endpoint provided")
+    provider = (
+        Web3.HTTPProvider(endpoints[0])
+        if len(endpoints) == 1
+        else FallbackHTTPProvider(endpoints)
+    )
+    w3 = Web3(provider)
     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
     return w3
 
 
+# Anchored to this file like the config and lock paths are. Left relative to the
+# working directory, every task fails for a scheduler started from anywhere but
+# the repo root -- and because config and lock still resolve, the failure gives
+# no hint that the working directory is the cause.
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+ABI_DIR = os.path.join(_REPO_ROOT, "abi")
+
+
 def get_contract(w3: Web3, address: str, name: str) -> Contract:
-    with open("./abi/{}.json".format(name), "r") as f:
+    with open(os.path.join(ABI_DIR, "{}.json".format(name)), "r") as f:
         abi = json.load(f)
         return w3.eth.contract(address=w3.to_checksum_address(address), abi=abi)
 
 
-def execute(contractFunction, value: int, operator_pk: str):
-    operator_address = Account.from_key(operator_pk).address
-    w3 = contractFunction.w3
-
-    operator_balance = w3.eth.get_balance(operator_address)
-    if operator_balance < value:
-        raise Exception(
-            "Operator balance is too low: {}. Required for LayerZero payment: {}".format(
-                operator_balance / 1e18, value / 1e18
-            )
-        )
-
-    base_fee = w3.eth.get_block("latest").baseFeePerGas * 105 // 100
-    try:
-        max_priority_fee = min(w3.eth.max_priority_fee * 3, w3.to_wei(4, "gwei"))
-    except:
-        max_priority_fee = w3.to_wei(2, "gwei")
-
-    try:
-        gas = (
-            contractFunction.estimate_gas(
-                {"from": Web3.to_checksum_address(operator_address), "value": value}
-            )
-            * 105
-            // 100
-        )
-    except Exception as e:
-        raise Exception("Gas estimation failed: {}".format(e))
-
-    require_value_for_transaction_execution = (
-        gas * (base_fee + max_priority_fee) + value
-    )
-    if operator_balance < require_value_for_transaction_execution:
-        raise Exception(
-            "Operator balance is too low: {}. Required for transaction execution: {}".format(
-                operator_balance / 1e18, require_value_for_transaction_execution / 1e18
-            )
-        )
-
-    transaction = contractFunction.build_transaction(
-        {
-            "gas": gas,
-            "maxFeePerGas": base_fee + max_priority_fee,
-            "maxPriorityFeePerGas": max_priority_fee,
-            "value": value,
-            "from": operator_address,
-            "nonce": w3.eth.get_transaction_count(operator_address),
-        }
-    )
-    signed_txn = w3.eth.account.sign_transaction(transaction, private_key=operator_pk)
-    tx = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-    print("Transaction sent: {}".format(tx.hex()))
-    receipt = w3.eth.wait_for_transaction_receipt(tx)
-    print(
-        "Transaction mined in block: {}. Chain id: {}".format(
-            receipt.blockNumber, w3.eth.chain_id
-        )
+def execute(
+    contractFunction,
+    value: int,
+    operator_pk: str,
+    nonce: int = None,
+    receipt_timeout: float = DEFAULT_RECEIPT_TIMEOUT,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    fee_bump_percent: int = DEFAULT_FEE_BUMP_PERCENT,
+    fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
+    label: str = "",
+) -> TxOutcome:
+    return send_and_confirm(
+        contractFunction,
+        value,
+        operator_pk,
+        nonce=nonce,
+        receipt_timeout=receipt_timeout,
+        max_attempts=max_attempts,
+        fee_bump_percent=fee_bump_percent,
+        fee_cap_gwei=fee_cap_gwei,
+        label=label,
     )
 
 

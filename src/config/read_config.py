@@ -2,7 +2,83 @@ import os
 import json
 from web3 import Web3, constants
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+# Chains differ enough that one set of transaction settings cannot serve both.
+# 0G produces blocks in about a second, so a transaction that has not appeared
+# after a minute is genuinely stuck. Ethereum's inclusion depends on fee
+# competition and routinely takes several minutes, which is why the previous
+# two-minute wait kept abandoning transactions that were merely slow.
+DEFAULT_RECEIPT_TIMEOUT_SECONDS = 180
+DEFAULT_TX_MAX_ATTEMPTS = 3
+DEFAULT_TX_FEE_BUMP_PERCENT = 115
+DEFAULT_TX_FEE_CAP_GWEI = 4
+
+DEFAULT_LOOP_SLEEP_SECONDS = 300
+DEFAULT_POST_ASCEND_GAP_SECONDS = 60
+DEFAULT_LOCK_FILE = ".scheduler.lock"
+DEFAULT_STATE_FILE = ".scheduler-state.json"
+DEFAULT_ALERT_AFTER_FAILURES = 3
+# Every task runs on one of these unless the config names a different
+# interval. Omitting a task does not stop it; ascend and handle-epoch are
+# stopped by removing the source section each needs (`ascend`,
+# `withdrawal-queue`), and rebalance and oracle-report have no off switch.
+DEFAULT_TASK_INTERVALS = {
+    "ascend": 1209600,
+    "rebalance": 7200,
+    "oracle_report": 86400,
+    "handle_epoch": 300,
+}
+DEFAULT_HANDLE_EPOCH_MAX_ITERATIONS = 8
+
+
+@dataclass(frozen=True)
+class TxConfig:
+    receipt_timeout_seconds: float = DEFAULT_RECEIPT_TIMEOUT_SECONDS
+    max_attempts: int = DEFAULT_TX_MAX_ATTEMPTS
+    fee_bump_percent: int = DEFAULT_TX_FEE_BUMP_PERCENT
+    fee_cap_gwei: int = DEFAULT_TX_FEE_CAP_GWEI
+
+    def as_kwargs(self) -> Dict[str, Any]:
+        """Every field, keyed for execute(). A single accessor so that adding a
+        setting here cannot leave a call site silently using the default."""
+        return {
+            "receipt_timeout": self.receipt_timeout_seconds,
+            "max_attempts": self.max_attempts,
+            "fee_bump_percent": self.fee_bump_percent,
+            "fee_cap_gwei": self.fee_cap_gwei,
+        }
+
+
+@dataclass(frozen=True)
+class AscendConfig:
+    router: str
+    rewarders: Tuple[str, ...]
+    claim_account: Optional[str] = None
+
+    def resolved_claim_account(self) -> str:
+        return self.claim_account or self.router
+
+
+@dataclass(frozen=True)
+class WithdrawalQueueConfig:
+    address: str
+    max_iterations: int = DEFAULT_HANDLE_EPOCH_MAX_ITERATIONS
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    loop_sleep_seconds: int = DEFAULT_LOOP_SLEEP_SECONDS
+    post_ascend_gap_seconds: int = DEFAULT_POST_ASCEND_GAP_SECONDS
+    lock_file: str = DEFAULT_LOCK_FILE
+    state_file: str = DEFAULT_STATE_FILE
+    alert_after_failures: int = DEFAULT_ALERT_AFTER_FAILURES
+    task_intervals: Dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_TASK_INTERVALS)
+    )
+
+    def interval(self, task: str) -> int:
+        return int(self.task_intervals.get(task, DEFAULT_TASK_INTERVALS.get(task, 0)))
 
 
 @dataclass(frozen=True)
@@ -55,6 +131,14 @@ class SourceConfig:
     source_core_helper: str
     deployments: Tuple[Deployment, ...]  # Changed from List to tuple for hashability
     safe_global: SafeGlobal = None
+    # Signs transactions sent to this chain. Defaults to OPERATOR_PK, which today
+    # is the same key that claims rewards, rebalances, advances the withdrawal
+    # queue and signs Safe proposals; the indirection is here so those roles can
+    # be split onto separate keys without a code change.
+    executor_private_key: str = None
+    tx: TxConfig = field(default_factory=TxConfig)
+    ascend: Optional[AscendConfig] = None
+    withdrawal_queue: Optional[WithdrawalQueueConfig] = None
 
 
 @dataclass
@@ -68,6 +152,8 @@ class Config:
     target_rpc: str
     target_core_helper: str
     sources: List[SourceConfig]
+    target_tx: TxConfig = field(default_factory=TxConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
 
 def read_config(config_path: str) -> Config:
@@ -300,6 +386,101 @@ def _merge_safe_global_overrides(
     return merged
 
 
+def _at_least(name: str, value: Any, minimum: int) -> int:
+    """Reject a setting that would silently disable what it configures."""
+    parsed = int(value)
+    if parsed < minimum:
+        raise ValueError("{} must be at least {}, got {}".format(name, minimum, parsed))
+    return parsed
+
+
+def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
+    if not tx_dict:
+        return TxConfig()
+    return TxConfig(
+        receipt_timeout_seconds=float(
+            tx_dict.get("receipt_timeout_seconds", DEFAULT_RECEIPT_TIMEOUT_SECONDS)
+        ),
+        max_attempts=_at_least(
+            "max-attempts", tx_dict.get("max_attempts", DEFAULT_TX_MAX_ATTEMPTS), 1
+        ),
+        # Above 100 or a replacement cannot clear the node's minimum premium
+        # and every attempt after the first is refused.
+        fee_bump_percent=_at_least(
+            "fee-bump-percent",
+            tx_dict.get("fee_bump_percent", DEFAULT_TX_FEE_BUMP_PERCENT),
+            101,
+        ),
+        fee_cap_gwei=int(tx_dict.get("fee_cap_gwei", DEFAULT_TX_FEE_CAP_GWEI)),
+    )
+
+
+def _create_ascend_config(
+    ascend_dict: Optional[Dict[str, Any]],
+) -> Optional[AscendConfig]:
+    if not ascend_dict:
+        return None
+    rewarders = tuple(ascend_dict.get("rewarders") or ())
+    if not ascend_dict.get("router"):
+        raise ValueError("ascend config is missing required field: router")
+    if not rewarders:
+        raise ValueError("ascend config is missing required field: rewarders")
+    return AscendConfig(
+        router=ascend_dict["router"],
+        rewarders=rewarders,
+        claim_account=ascend_dict.get("claim_account") or None,
+    )
+
+
+def _create_withdrawal_queue_config(
+    queue_dict: Optional[Dict[str, Any]],
+) -> Optional[WithdrawalQueueConfig]:
+    if not queue_dict:
+        return None
+    if not queue_dict.get("address"):
+        raise ValueError("withdrawal-queue config is missing required field: address")
+    return WithdrawalQueueConfig(
+        address=queue_dict["address"],
+        max_iterations=int(
+            queue_dict.get("max_iterations", DEFAULT_HANDLE_EPOCH_MAX_ITERATIONS)
+        ),
+    )
+
+
+def _create_scheduler_config(
+    scheduler_dict: Optional[Dict[str, Any]],
+) -> SchedulerConfig:
+    if not scheduler_dict:
+        return SchedulerConfig()
+    intervals = dict(DEFAULT_TASK_INTERVALS)
+    for task, interval in (scheduler_dict.get("tasks") or {}).items():
+        if isinstance(interval, dict):
+            interval = interval.get("interval_seconds")
+        if interval is not None and str(interval) != "":
+            # Rejected rather than accepted as "off": a non-positive interval
+            # makes the task due on every cycle, so the value an operator would
+            # reach for to stop it does the opposite, at maximum frequency, to
+            # real on-chain operations. There is no interval that means off --
+            # omitting a task here leaves it on its default below, not stopped.
+            intervals[task] = _at_least("interval-seconds for " + task, interval, 1)
+    return SchedulerConfig(
+        loop_sleep_seconds=int(
+            scheduler_dict.get("loop_sleep_seconds", DEFAULT_LOOP_SLEEP_SECONDS)
+        ),
+        post_ascend_gap_seconds=int(
+            scheduler_dict.get(
+                "post_ascend_gap_seconds", DEFAULT_POST_ASCEND_GAP_SECONDS
+            )
+        ),
+        lock_file=scheduler_dict.get("lock_file") or DEFAULT_LOCK_FILE,
+        state_file=scheduler_dict.get("state_file") or DEFAULT_STATE_FILE,
+        alert_after_failures=int(
+            scheduler_dict.get("alert_after_failures", DEFAULT_ALERT_AFTER_FAILURES)
+        ),
+        task_intervals=intervals,
+    )
+
+
 def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
     """
     Convert a dictionary to a typed Config object.
@@ -353,6 +534,13 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
             source_core_helper=source_dict["source_core_helper"],
             deployments=deployments,
             safe_global=chain_safe_global,
+            executor_private_key=source_dict.get("executor_private_key")
+            or os.getenv("OPERATOR_PK"),
+            tx=_create_tx_config(source_dict.get("tx")),
+            ascend=_create_ascend_config(source_dict.get("ascend")),
+            withdrawal_queue=_create_withdrawal_queue_config(
+                source_dict.get("withdrawal_queue")
+            ),
         )
 
     # Convert all sources
@@ -376,4 +564,6 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
         target_rpc=config_dict["target_rpc"],
         target_core_helper=config_dict["target_core_helper"],
         sources=sources,
+        target_tx=_create_tx_config(config_dict.get("tx", {}).get("target")),
+        scheduler=_create_scheduler_config(config_dict.get("scheduler")),
     )

@@ -111,6 +111,36 @@ class TestMaskUrlCredentials(unittest.TestCase):
         # Should remain unchanged
         self.assertEqual(message, result)
 
+    def test_mask_comma_separated_masks_single_leaked_endpoint(self):
+        """A real error contains only ONE of several configured endpoints; it must still be masked."""
+        configured = (
+            "https://primary.example.com/v3/KEY1," "https://backup.example.com/v3/KEY2"
+        )
+        # Transport error mentions only the endpoint that actually failed.
+        message = "Failed to connect to https://backup.example.com/v3/KEY2"
+
+        result = mask_url_credentials(message, configured)
+
+        self.assertNotIn("KEY2", result)
+        self.assertIn("https://backup.example.com/***", result)
+
+    def test_mask_comma_separated_masks_all_endpoints(self):
+        """When several endpoints appear in one message, each is masked independently."""
+        configured = (
+            "https://primary.example.com/v3/KEY1, " "https://backup.example.com/v3/KEY2"
+        )
+        message = (
+            "Tried https://primary.example.com/v3/KEY1 then "
+            "https://backup.example.com/v3/KEY2"
+        )
+
+        result = mask_url_credentials(message, configured)
+
+        self.assertNotIn("KEY1", result)
+        self.assertNotIn("KEY2", result)
+        self.assertIn("https://primary.example.com/***", result)
+        self.assertIn("https://backup.example.com/***", result)
+
 
 class TestMaskSourceSensitiveData(unittest.TestCase):
 
@@ -452,6 +482,93 @@ class TestMaskAllSensitiveConfigData(unittest.TestCase):
 
         # Should not crash and return message
         self.assertEqual(message, result)
+
+
+class TestExecutorKeyMasking(unittest.TestCase):
+    """The scheduler pipes failure text through the masker on its way to Telegram.
+
+    That is the one path where a key held in config leaves the machine.
+    """
+
+    EXECUTOR_KEY = "0x" + "ab" * 32
+
+    def make_source(self):
+        return SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid/token",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(),
+            executor_private_key=self.EXECUTOR_KEY,
+        )
+
+    def test_the_executor_key_is_masked(self):
+        message = f"boom while signing with {self.EXECUTOR_KEY}"
+
+        masked = mask_source_sensitive_data(message, self.make_source())
+
+        self.assertNotIn(self.EXECUTOR_KEY, masked)
+
+    def test_it_is_masked_through_the_whole_config_helper(self):
+        config = Config(
+            telegram_bot_api_key="",
+            telegram_group_chat_id="",
+            telegram_owner_nicknames={},
+            telegram_proposal_message_prefix="",
+            oracle_expiry_threshold_seconds=3600,
+            oracle_recent_update_threshold_seconds=0,
+            target_rpc="",
+            target_core_helper="",
+            sources=[self.make_source()],
+        )
+
+        masked = mask_all_sensitive_config_data(f"boom {self.EXECUTOR_KEY}", config)
+
+        self.assertNotIn(self.EXECUTOR_KEY, masked)
+
+
+class TestDeploymentOverrideMasking(unittest.TestCase):
+    """A deployment can override the Safe config, keys included.
+
+    The proposal path uses the merged per-deployment config, so an override's
+    own key is what appears in an error from it -- and errors reach Telegram.
+    """
+
+    OVERRIDE_KEY = "0x" + "cd" * 32
+    OVERRIDE_API_KEY = "override-api-key-value"
+
+    def source(self):
+        return SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(
+                Deployment(
+                    name="OG",
+                    source_core="0x" + "22" * 20,
+                    target_core="0x" + "33" * 20,
+                    safe_global=SafeGlobal(
+                        safe_address="0x" + "fc" * 20,
+                        proposer_private_key=self.OVERRIDE_KEY,
+                        api_url="https://api.safe.global",
+                        api_key=self.OVERRIDE_API_KEY,
+                    ),
+                ),
+            ),
+        )
+
+    def test_an_override_proposer_key_is_masked(self):
+        masked = mask_source_sensitive_data(
+            "signing failed with " + self.OVERRIDE_KEY, self.source()
+        )
+
+        self.assertNotIn(self.OVERRIDE_KEY, masked)
+
+    def test_an_override_api_key_is_masked(self):
+        masked = mask_source_sensitive_data(
+            "rejected: " + self.OVERRIDE_API_KEY, self.source()
+        )
+
+        self.assertNotIn(self.OVERRIDE_API_KEY, masked)
 
 
 if __name__ == "__main__":
