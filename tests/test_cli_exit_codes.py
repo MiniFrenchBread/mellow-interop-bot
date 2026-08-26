@@ -39,26 +39,28 @@ def config() -> Config:
 class TestOracleExitStatus(unittest.TestCase):
     """A person is watching the CLI, so it has to say when nobody was told.
 
-    The scheduler deliberately does not treat this as a failure -- retrying
-    would propose again against the same Safe nonce -- so the CLI is the only
-    place that surfaces it.
+    The scheduler deliberately does not treat this as a failure -- the write has
+    already happened and a retry would only repeat the announcement -- so the
+    CLI is the only place that surfaces it.
     """
 
     def setUp(self):
         import main
 
-        self._run = main.run_oracle_report
+        self._run = main.run_oracle_update
         self.main = main
 
     def tearDown(self):
-        self.main.run_oracle_report = self._run
+        self.main.run_oracle_update = self._run
 
     def run_oracle(self, delivered: bool):
-        async def report(_config):
-            return delivered
+        from main import OracleRunSummary
 
-        self.main.run_oracle_report = report
-        return cli.cmd_oracle(config(), SimpleNamespace())
+        async def update(_config, force=False, dry_run=False):
+            return OracleRunSummary(notified=delivered)
+
+        self.main.run_oracle_update = update
+        return cli.cmd_oracle(config(), SimpleNamespace(force=False, dry_run=False))
 
     def test_full_delivery_is_not_an_error(self):
         self.run_oracle(delivered=True)

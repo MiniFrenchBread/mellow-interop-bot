@@ -43,7 +43,13 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 
 # Order matters: ascend changes the vault's value, so everything that reads that
 # value runs after it, and after the settling gap.
-TASK_ORDER = ("ascend", "rebalance", "oracle_report", "handle_epoch")
+#
+# oracle_update sits between ascend and rebalance rather than after both.
+# Rebalancing refuses whenever the oracle disagrees with the computed value, and
+# ascend is the thing that makes them disagree -- so with rebalance running
+# first, the pass immediately after every reward distribution was guaranteed to
+# refuse. Refreshing the oracle in between removes that.
+TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 
 
 def is_due(last_run: float, now: float, interval: int) -> bool:
@@ -265,18 +271,31 @@ class Scheduler:
         else:
             self.skips["rebalance"] = 0
 
-    def task_oracle_report(self) -> None:
-        from main import run_oracle_report
+    def task_oracle_update(self) -> None:
+        from main import run_oracle_update
 
         # The raising variant, not main(): main() swallows everything so the
         # scheduler could never see this task fail.
-        notified = asyncio.run(run_oracle_report(self.config))
-        if not notified:
-            # Not raised: failing would retry, and a retry after the share price
-            # moved proposes different calldata competing for the same Safe
-            # nonce. The alert would go over the channel that is down anyway.
+        summary = asyncio.run(run_oracle_update(self.config))
+
+        if summary.skip_reasons and not summary.written:
+            # Nothing was written and every deployment had a reason. One is
+            # routine -- a transfer settles in minutes -- but a run of them means
+            # the oracle has stopped being refreshed while every task still
+            # reports success, which is exactly the silence this tracking exists
+            # to break.
+            self.record_skip(
+                "oracle_update", "; ".join(sorted(set(summary.skip_reasons)))
+            )
+        else:
+            self.skips["oracle_update"] = 0
+
+        if not summary.notified:
+            # Not raised: the write already happened, so a retry would only
+            # repeat the announcement, and it would repeat it over the channel
+            # that is down anyway.
             print_colored(
-                "[oracle_report] proposals are queued but no one was notified",
+                "[oracle_update] the oracle needs attention and no one was notified",
                 "red",
             )
 

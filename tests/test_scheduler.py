@@ -16,12 +16,16 @@ HOUR = 3600
 
 
 def make_config(**scheduler_kwargs) -> Config:
+    # Deliberately not the production numbers: these exercise the bucket
+    # arithmetic, and spreading them across four magnitudes is what makes a
+    # due/not-due bug visible. The real intervals are asserted against
+    # config.json in test_oracle_expiry_window.
     intervals = scheduler_kwargs.pop(
         "task_intervals",
         {
-            "ascend": 1209600,
+            "ascend": DAY,
             "rebalance": 7200,
-            "oracle_report": DAY,
+            "oracle_update": DAY,
             "handle_epoch": 300,
         },
     )
@@ -125,19 +129,19 @@ class TestRestartBehaviour(unittest.TestCase):
         restarted = make_scheduler(make_config(), now=lambda: started + 2 * HOUR)
 
         self.assertEqual(
-            next_due(first.last_run["oracle_report"], DAY),
-            next_due(restarted.last_run["oracle_report"], DAY),
+            next_due(first.last_run["oracle_update"], DAY),
+            next_due(restarted.last_run["oracle_update"], DAY),
         )
 
     def test_restart_does_not_replay_a_bucket_already_served(self):
         started = 10 * DAY + 5 * HOUR
         scheduler = make_scheduler(make_config(), now=lambda: started)
-        self.assertFalse(is_due(scheduler.last_run["oracle_report"], started, DAY))
+        self.assertFalse(is_due(scheduler.last_run["oracle_update"], started, DAY))
 
     def test_a_crossed_boundary_still_fires_after_a_restart(self):
         started = 10 * DAY + 5 * HOUR
         scheduler = make_scheduler(make_config(), now=lambda: started)
-        self.assertTrue(is_due(scheduler.last_run["oracle_report"], 11 * DAY + 1, DAY))
+        self.assertTrue(is_due(scheduler.last_run["oracle_update"], 11 * DAY + 1, DAY))
 
 
 class TestCycleIsolation(unittest.TestCase):
@@ -149,7 +153,7 @@ class TestCycleIsolation(unittest.TestCase):
             task_intervals={
                 "ascend": 1,
                 "rebalance": 1,
-                "oracle_report": 1,
+                "oracle_update": 1,
                 "handle_epoch": 1,
             },
             post_ascend_gap_seconds=0,
@@ -158,7 +162,7 @@ class TestCycleIsolation(unittest.TestCase):
             self.config, now=self.clock.time, sleep=self.clock.sleep
         )
         self.ran = []
-        for task in ("ascend", "rebalance", "oracle_report", "handle_epoch"):
+        for task in ("ascend", "rebalance", "oracle_update", "handle_epoch"):
             self._stub(task)
 
     def _stub(self, task, error=None):
@@ -176,10 +180,31 @@ class TestCycleIsolation(unittest.TestCase):
         self.scheduler.run_cycle()
 
         self.assertEqual(
-            self.ran, ["ascend", "rebalance", "oracle_report", "handle_epoch"]
+            self.ran, ["ascend", "oracle_update", "rebalance", "handle_epoch"]
         )
         self.assertEqual(self.scheduler.failures["rebalance"], 1)
         self.assertEqual(self.scheduler.failures["ascend"], 0)
+
+    def test_the_oracle_is_refreshed_before_rebalancing(self):
+        """Rebalancing refuses while the oracle disagrees with the computed
+        value, and ascend is what makes them disagree. Running rebalance first
+        therefore guaranteed a refusal on every pass that followed a reward
+        distribution -- the ordering is the fix, so it is worth binding.
+        """
+        self.clock.advance(10)
+
+        self.scheduler.run_cycle()
+
+        self.assertLess(
+            self.ran.index("oracle_update"),
+            self.ran.index("rebalance"),
+            "the oracle must be written before rebalancing reads it",
+        )
+        self.assertLess(
+            self.ran.index("ascend"),
+            self.ran.index("oracle_update"),
+            "ascend moves the value the oracle is about to record",
+        )
 
     def test_a_task_that_stays_broken_keeps_alerting(self):
         """One alert then silence is the failure mode the alerting exists to close."""
@@ -231,10 +256,10 @@ class TestCycleIsolation(unittest.TestCase):
 
         for _ in range(5):
             self.scheduler.record_failure(
-                "oracle_report", NonceBlocked(42, "handleEpoch 7", ["0xabc"])
+                "oracle_update", NonceBlocked(42, "handleEpoch 7", ["0xabc"])
             )
 
-        self.assertEqual(self.scheduler.failures["oracle_report"], 0)
+        self.assertEqual(self.scheduler.failures["oracle_update"], 0)
         self.assertEqual(sent, [])
 
     def test_a_failure_breaks_a_run_of_skips(self):
@@ -395,20 +420,20 @@ class TestPersistedSchedule(unittest.TestCase):
         interval = DAY
 
         before = make_scheduler(
-            make_config(task_intervals={"oracle_report": interval}),
+            make_config(task_intervals={"oracle_update": interval}),
             now=lambda: boundary - HOUR,
             state_path=self.path,
         )
         before._save_state()
 
         after = make_scheduler(
-            make_config(task_intervals={"oracle_report": interval}),
+            make_config(task_intervals={"oracle_update": interval}),
             now=lambda: boundary + 60,
             state_path=self.path,
         )
 
         self.assertTrue(
-            is_due(after.last_run["oracle_report"], boundary + 60, interval),
+            is_due(after.last_run["oracle_update"], boundary + 60, interval),
             "the slot was owed before the restart and is still owed after it",
         )
 
@@ -417,7 +442,7 @@ class TestPersistedSchedule(unittest.TestCase):
             make_config(), now=lambda: 100 * DAY + HOUR, state_path=self.path
         )
 
-        self.assertFalse(is_due(fresh.last_run["oracle_report"], 100 * DAY + HOUR, DAY))
+        self.assertFalse(is_due(fresh.last_run["oracle_update"], 100 * DAY + HOUR, DAY))
 
     def test_a_corrupt_state_file_falls_back_to_now(self):
         with open(self.path, "w") as handle:
@@ -483,8 +508,15 @@ class TestMissingExecutorKey(unittest.TestCase):
             self.scheduler_without_a_key().task_handle_epoch()
 
 
-class TestOracleTaskFailuresAreVisible(unittest.TestCase):
-    """The oracle report is the 21-day heartbeat; its silence must be loud."""
+class TestOracleSkipsAreTracked(unittest.TestCase):
+    """A run of skips means the oracle quietly stopped being written.
+
+    Skipping is the right call while a cross-chain transfer is in flight, and a
+    single skip is an ordinary few minutes of the day -- so it is not alerted
+    on. What must not happen is skipping forever while the task reports success
+    every time, which is indistinguishable from a healthy bot until the vault
+    freezes.
+    """
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -492,20 +524,90 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
             make_config(),
             state_path=os.path.join(self.directory.name, "state.json"),
         )
-        self._original = oracle_main_module.run_oracle_report
+        self.alerts = []
+        self.scheduler.notify = self.alerts.append
+        self._original = oracle_main_module.run_oracle_update
 
     def tearDown(self):
-        oracle_main_module.run_oracle_report = self._original
+        oracle_main_module.run_oracle_update = self._original
         self.directory.cleanup()
 
-    def test_a_failing_oracle_report_reaches_the_scheduler(self):
+    def _returns(self, summary):
+        async def run(_config):
+            return summary
+
+        oracle_main_module.run_oracle_update = run
+
+    def test_a_single_skip_does_not_alert(self):
+        self._returns(
+            oracle_main_module.OracleRunSummary(skip_reasons=["OG/OG: in flight"])
+        )
+
+        self.scheduler.task_oracle_update()
+
+        self.assertEqual(self.scheduler.skips["oracle_update"], 1)
+        self.assertEqual(self.alerts, [])
+
+    def test_a_run_of_skips_alerts(self):
+        self._returns(
+            oracle_main_module.OracleRunSummary(skip_reasons=["OG/OG: in flight"])
+        )
+
+        for _ in range(self.scheduler.config.scheduler.alert_after_failures):
+            self.scheduler.task_oracle_update()
+
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("in flight", self.alerts[0])
+
+    def test_a_write_clears_the_run(self):
+        """Otherwise an occasional transfer accumulates into a false alarm."""
+        self._returns(
+            oracle_main_module.OracleRunSummary(skip_reasons=["OG/OG: in flight"])
+        )
+        self.scheduler.task_oracle_update()
+
+        self._returns(oracle_main_module.OracleRunSummary(written=1))
+        self.scheduler.task_oracle_update()
+
+        self.assertEqual(self.scheduler.skips["oracle_update"], 0)
+
+    def test_a_partial_run_is_not_a_skip(self):
+        """One deployment skipped while another was written is not the oracle
+        going unwritten, and counting it would alert on a healthy bot."""
+        self._returns(
+            oracle_main_module.OracleRunSummary(
+                skip_reasons=["OG/OG: in flight"], written=1
+            )
+        )
+
+        self.scheduler.task_oracle_update()
+
+        self.assertEqual(self.scheduler.skips["oracle_update"], 0)
+
+
+class TestOracleTaskFailuresAreVisible(unittest.TestCase):
+    """The oracle write is what keeps the vault open; its silence must be loud."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.scheduler = make_scheduler(
+            make_config(),
+            state_path=os.path.join(self.directory.name, "state.json"),
+        )
+        self._original = oracle_main_module.run_oracle_update
+
+    def tearDown(self):
+        oracle_main_module.run_oracle_update = self._original
+        self.directory.cleanup()
+
+    def test_a_failing_oracle_update_reaches_the_scheduler(self):
         async def boom(_config):
             raise RuntimeError("RPC down")
 
-        oracle_main_module.run_oracle_report = boom
+        oracle_main_module.run_oracle_update = boom
 
         with self.assertRaises(RuntimeError):
-            self.scheduler.task_oracle_report()
+            self.scheduler.task_oracle_update()
 
     def test_the_standalone_entry_point_still_swallows(self):
         """main() is the standalone path and should exit cleanly, not traceback."""
@@ -514,7 +616,7 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
         async def boom(_config):
             raise RuntimeError("RPC down")
 
-        oracle_main_module.run_oracle_report = boom
+        oracle_main_module.run_oracle_update = boom
 
         asyncio.run(oracle_main_module.main())
 
@@ -545,7 +647,7 @@ class TestRetryBackoff(unittest.TestCase):
             raise RuntimeError("RPC exploded")
 
         self.scheduler.task_ascend = failing
-        for task in ("rebalance", "oracle_report", "handle_epoch"):
+        for task in ("rebalance", "oracle_update", "handle_epoch"):
             setattr(self.scheduler, "task_" + task, lambda: None)
         self.scheduler.last_run["ascend"] = 0
 

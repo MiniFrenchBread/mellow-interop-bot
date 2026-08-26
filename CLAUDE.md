@@ -2,21 +2,23 @@
 
 ## Project Overview
 
-A Python bot that monitors cross-chain oracle states for the Mellow interop protocol across multiple blockchain networks (0G, BSC, Fraxtal, Lisk). When oracle values are stale, expired, or incorrect, the bot proposes multisig transactions via Safe Global to update them, and sends Telegram alerts to notify signers. It also includes operator scripts for cross-chain asset rebalancing via LayerZero OFT transfers.
+A Python bot that keeps the Mellow interop protocol's cross-chain oracle fresh and its vault asset ratios balanced. It writes the oracle directly with a dedicated key on a short heartbeat, claims and distributes restaking rewards on the same cadence, rebalances across chains via LayerZero OFT transfers, and advances the withdrawal queue.
 
-This bot is the operational automation layer for the Mellow interop protocol -- it keeps cross-chain oracle prices fresh and vault asset ratios balanced.
+This bot is the operational automation layer for the Mellow interop protocol.
 
 ## Architecture
 
 ### Core Workflow (main.py)
 
 1. Load config from `config.json` (with env var substitution)
-2. For each source chain and deployment, call on-chain helper contracts to validate oracle state
-3. Compare oracle value vs computed "secure value" (source + target TVL / total supply)
-4. If oracle is almost expired, already expired, has incorrect value, or has in-flight OFT transfers, compose a status message
-5. Send status message to Telegram
-6. For each source chain needing oracle updates, propose a Safe multisig transaction (single or batched multi-send) calling `Oracle.setValue(newValue)`
-7. Send Telegram message with Safe transaction link, confirmation status, and @-mentions of signers who still need to confirm
+2. For each source chain and deployment, call on-chain helper contracts to read oracle state
+3. Compute the "secure value" (source + target TVL / total supply)
+4. Skip if an OFT transfer is in flight -- the two sides are counted at different points, so their sum is wrong until it settles
+5. Run the guards; refuse and alert if the value would move too far or fall
+6. Otherwise call `Oracle.setValue(newValue)` with `ORACLE_UPDATER_PK` and wait for the receipt
+7. Send Telegram **only** when a person is needed -- a refusal, a failure, or a low gas balance. A successful heartbeat is silent
+
+Safe multisig proposals still exist but are no longer on any schedule: `cli.py oracle-propose` is the manual recovery path when a guard refuses. See "Oracle updates" in `README.md`.
 
 ### Key Components
 
@@ -27,7 +29,8 @@ This bot is the operational automation layer for the Mellow interop protocol -- 
   - `mask_sensitive_data.py` -- Masks private keys, API keys, and RPC URL credentials in error messages.
 - **`src/web3_scripts/`** -- On-chain interaction logic.
   - `base.py` -- Shared Web3 utilities: `get_w3()`, `get_contract()` (loads ABI from `./abi/`), `execute()` (build+sign+send transactions with EIP-1559 gas), `get_block_before_timestamp()` (binary search for block by timestamp).
-  - `oracle_script.py` -- Core oracle validation with retry/backoff. Reads source/target nonces (detects in-flight OFT transfers), oracle value/timestamp/maxAge, computes `secure_value = (sourceValue + targetValue) * 1e18 / totalSupply`, checks expiry and value correctness.
+  - `oracle_script.py` -- Core oracle validation with retry/backoff. Reads source/target nonces (detects in-flight OFT transfers), oracle value/timestamp/maxAge, computes `secure_value = (sourceValue + targetValue) * 1e18 / totalSupply`, checks expiry and value correctness. Read-only.
+  - `oracle_update.py` -- The heartbeat. Validates via `oracle_script`, applies the deviation and decrease guards, then writes `Oracle.setValue`. Guard arithmetic (`exceeds_deviation`, `is_decrease`) is separated out so it is testable without any chain access.
   - `operator_script.py` -- Read-only analysis of vault asset ratios. Determines if rebalancing actions are needed (redeem, claim, pushToSource, pushToTarget, deposit).
   - `operator_bot.py` -- Automated version of operator_script that actually executes rebalancing transactions using an operator private key, with LayerZero finalization waiting.
 - **`src/safe_global/`** -- Safe multisig transaction management.
@@ -42,20 +45,29 @@ This bot is the operational automation layer for the Mellow interop protocol -- 
 ### Scheduler and CLI
 
 - **`src/scheduler.py`** -- Production task loop, replacing the former `run_bot.sh`. Runs four tasks
-  on independent intervals in one process: ascend (2 weeks), rebalance (2 hours), oracle report
-  (1 day), handle-epoch (5 minutes). Tasks fire on multiples of their interval measured from the
+  on independent intervals in one process: ascend (8 hours), oracle-update (8 hours), rebalance
+  (2 hours), handle-epoch (5 minutes). Tasks fire on multiples of their interval measured from the
   Unix epoch, so a restart neither shifts the schedule nor skips a beat. Each task is isolated so
   one failure cannot stop the others, and repeated failures or repeated guard-skips raise a
   Telegram alert.
+  `TASK_ORDER` is `ascend -> oracle_update -> rebalance -> handle_epoch`, and the order is
+  load-bearing: ascend moves the vault's value, rebalance refuses while the oracle disagrees with
+  the computed value, so refreshing the oracle in between is what stops every post-distribution
+  rebalance from being skipped.
   Task intervals come from `scheduler.tasks` in `config.json`, falling back to built-in
   defaults. Omitting a task does **not** stop it — it runs on its default — and no interval
   value means "off" (a non-positive one is rejected, because it would otherwise make the task
   due every cycle). `ascend` and `handle-epoch` are stopped by removing the source section each
-  needs (`ascend`, `withdrawal-queue`); `rebalance` and `oracle-report` have no off switch.
+  needs (`ascend`, `withdrawal-queue`); `rebalance` and `oracle-update` have no off switch.
 - **`src/cli.py`** -- One-shot entry points for the same code paths: `ascend` (with `--dry-run`),
-  `handle-epoch`, `oracle`, `rebalance`, `validate-config`.
+  `handle-epoch`, `oracle` (with `--dry-run` / `--force`), `oracle-propose` (with `--value` /
+  `--dry-run`), `rebalance`, `validate-config`.
 - **`src/process_lock.py`** -- Single-holder lock shared by the scheduler and the CLI. One account
-  signs every transaction, so two processes running at once would collide over its nonce.
+  signs every broadcast transaction, so two processes running at once would collide over its nonce.
+  `validate-config` and `oracle-propose` are exempt (`LOCK_FREE`): neither broadcasts anything.
+  That exemption matters for `oracle-propose` in particular — it is the recovery path used while
+  the oracle is going unwritten, and requiring the lock would mean stopping the rest of the bot
+  to use it.
 
 The bot no longer shells out to `forge` or `cast`, and no longer needs a checkout of
 `0g-restaking-contracts`.
@@ -122,7 +134,11 @@ so a default there would enter public history.
 | `TELEGRAM_BOT_API_KEY` | Telegram bot token | (required unless DRY_RUN) |
 | `TELEGRAM_GROUP_CHAT_ID` | Target chat ID | (required unless DRY_RUN) |
 | `TELEGRAM_OWNER_NICKNAMES` | Safe signer nicknames, optionally with addresses | (optional) |
-| `ORACLE_EXPIRY_THRESHOLD_SECONDS` | How far ahead of expiry to start asking the signers to refresh. Must exceed the oracle-report interval or the window can be stepped over entirely | 172800 |
+| `ORACLE_UPDATER_PK` | Signs `Oracle.setValue`. Must hold `SET_VALUE_ROLE` on the SourceCore — granted from the Safe, checked by `validate-config`. Separate from `OPERATOR_PK` on purpose: it is the only key that can move the share price | (required for oracle-update) |
+| `ORACLE_MAX_DEVIATION_BPS` | Refuse to write a value further than this from the one on chain | 100 (1%) |
+| `ORACLE_DECREASE_TOLERANCE_WEI` | Refuse to write a value that fell by more than this; below it a dip is rounding | 1e9 |
+| `ORACLE_UPDATER_MIN_BALANCE_WEI` | Warn (but still write) below this gas balance | 1e17 |
+| `ORACLE_EXPIRY_THRESHOLD_SECONDS` | How close to expiry counts as urgent. No longer triggers the write — the heartbeat is unconditional — but it decides how loudly a refusal is worded. Must exceed the oracle-update interval or the window can be stepped over | 172800 |
 | `ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS` | Window for "recently updated" notifications | 0 |
 | `TARGET_RPC` | Target chain (Ethereum) RPC | (required, no default in config) |
 | `ZG_RPC` | 0G chain RPC | (required, no default in config) |
@@ -132,7 +148,7 @@ so a default there would enter public history.
 | `OPERATOR_PK` | Signs every transaction: rebalancing, ascend claims, epoch advances | (required) |
 | `OG_EXECUTOR_PK` | Overrides `OPERATOR_PK` for the OG source, signing **both** legs of its rebalance — the target-chain calls included | `OPERATOR_PK` |
 | `OG_RECEIPT_TIMEOUT` / `TARGET_RECEIPT_TIMEOUT` | Seconds to wait for a receipt before replacing the transaction at a higher fee | 60 / 600 |
-| `ASCEND_INTERVAL_SECONDS` / `REBALANCE_INTERVAL_SECONDS` / `ORACLE_REPORT_INTERVAL_SECONDS` / `HANDLE_EPOCH_INTERVAL_SECONDS` | Task intervals | 1209600 / 7200 / 86400 / 300 |
+| `ASCEND_INTERVAL_SECONDS` / `REBALANCE_INTERVAL_SECONDS` / `ORACLE_UPDATE_INTERVAL_SECONDS` / `HANDLE_EPOCH_INTERVAL_SECONDS` | Task intervals. Keep ascend **≤** oracle-update, or most writes record a value nothing has changed | 28800 / 7200 / 28800 / 300 |
 | `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
@@ -164,6 +180,22 @@ proposers for one Safe.
 
 - Oracle "secure value" is computed as `(sourceValue + targetValue) * 1e18 / totalSupply`, queried at a block 15 seconds before latest (SECURE_INTERVAL) to avoid using very recent state.
 - OFT transfer detection: compares source chain inbound/outbound nonces with target chain outbound/inbound nonces; mismatch means a LayerZero cross-chain transfer is in flight.
+- The oracle write is **unconditional** — rewriting an unchanged value is the point, because it
+  refreshes `lastUpdated` and `getValue()` reverts once `maxAge` passes. A heartbeat that only
+  fired when the number changed would let the oracle drift to expiry during any quiet period.
+- The vault's assets only move when `AscendRouter.distribute()` transfers rewards into the
+  SourceCore, so the share price is a step function whose stride is the **ascend** interval, not
+  the oracle interval. Writing the oracle more often than ascend runs just rewrites the same
+  number; a test binds `ascend <= oracle_update`.
+- `send_and_confirm`'s label for the oracle write is the constant `SET_VALUE_LABEL`, deliberately
+  carrying no value in it. `tx.blocking_transaction` treats a differing label as a *different*
+  operation and refuses to reuse the nonce, so a label naming the value would make every tick
+  after one slow send raise `NonceBlocked` instead of replacing it — the heartbeat would stop
+  silently after a single timeout.
+- The oracle updater and the executor are separate accounts, so their nonce sequences do not
+  interact: `tx._unreconciled` is keyed by `(chain_id, sender)`.
+- The guards refuse rather than write, and a refusal **does not self-heal** — ascend keeps adding
+  rewards, so the gap widens daily, and rebalance starts refusing too. `maxAge` is the deadline.
 - Safe transaction proposals: the bot first checks for an existing queued transaction with matching calldata before proposing a new one, to avoid duplicates.
 - Safe nonces do not advance for queued-but-unexecuted proposals, so a proposal carrying a newer
   oracle value lands on the same nonce as the pending one and voids it when executed. That is the

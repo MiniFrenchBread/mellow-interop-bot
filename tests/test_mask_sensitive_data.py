@@ -526,6 +526,79 @@ class TestExecutorKeyMasking(unittest.TestCase):
         self.assertNotIn(self.EXECUTOR_KEY, masked)
 
 
+class TestOracleUpdaterKeyMasking(unittest.TestCase):
+    """The updater key is the one that can move the share price.
+
+    It signs on the same chain as the executor key but is a different account,
+    so masking one does nothing for the other -- and this task's alerts are sent
+    precisely when something has gone wrong, which is when unexpected text ends
+    up in an exception.
+    """
+
+    UPDATER_KEY = "0x" + "cd" * 32
+    EXECUTOR_KEY = "0x" + "ab" * 32
+
+    def make_source(self):
+        from config.read_config import OracleUpdateConfig
+
+        return SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid/token",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(),
+            executor_private_key=self.EXECUTOR_KEY,
+            oracle_update=OracleUpdateConfig(updater_private_key=self.UPDATER_KEY),
+        )
+
+    def test_the_updater_key_is_masked(self):
+        message = f"reverted while signing with {self.UPDATER_KEY}"
+
+        masked = mask_source_sensitive_data(message, self.make_source())
+
+        self.assertNotIn(self.UPDATER_KEY, masked)
+
+    def test_both_keys_are_masked_together(self):
+        source = self.make_source()
+        message = f"boom {self.EXECUTOR_KEY} and {self.UPDATER_KEY}"
+
+        masked = mask_source_sensitive_data(message, source)
+
+        self.assertNotIn(self.EXECUTOR_KEY, masked)
+        self.assertNotIn(self.UPDATER_KEY, masked)
+
+    def test_a_source_without_the_section_still_masks(self):
+        """Most sources have no oracle-update section; reading it unguarded
+        would raise inside the masker and drop the alert entirely."""
+        source = SourceConfig(
+            name="OG",
+            rpc="https://rpc.invalid/token",
+            source_core_helper="0x" + "11" * 20,
+            deployments=(),
+            executor_private_key=self.EXECUTOR_KEY,
+        )
+
+        masked = mask_source_sensitive_data(f"boom {self.EXECUTOR_KEY}", source)
+
+        self.assertNotIn(self.EXECUTOR_KEY, masked)
+
+    def test_it_is_masked_through_the_whole_config_helper(self):
+        config = Config(
+            telegram_bot_api_key="",
+            telegram_group_chat_id="",
+            telegram_owner_nicknames={},
+            telegram_proposal_message_prefix="",
+            oracle_expiry_threshold_seconds=3600,
+            oracle_recent_update_threshold_seconds=0,
+            target_rpc="",
+            target_core_helper="",
+            sources=[self.make_source()],
+        )
+
+        masked = mask_all_sensitive_config_data(f"boom {self.UPDATER_KEY}", config)
+
+        self.assertNotIn(self.UPDATER_KEY, masked)
+
+
 class TestDeploymentOverrideMasking(unittest.TestCase):
     """A deployment can override the Safe config, keys included.
 

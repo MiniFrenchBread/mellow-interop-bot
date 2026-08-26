@@ -145,7 +145,7 @@ class TestTotalValidationOutage(unittest.TestCase):
         ]
 
         with self.assertRaises(Exception) as caught:
-            asyncio.run(main.run_oracle_report(base_config()))
+            asyncio.run(main.run_oracle_propose(base_config()))
 
         self.assertIn("Could not validate any", str(caught.exception))
 
@@ -163,9 +163,9 @@ class TestTotalValidationOutage(unittest.TestCase):
             ),
         ]
         propose = main.propose_tx_to_update_oracle
-        main.propose_tx_to_update_oracle = lambda _results: []
+        main.propose_tx_to_update_oracle = lambda _results, **_kwargs: one_proposal()
         try:
-            asyncio.run(main.run_oracle_report(base_config()))
+            asyncio.run(main.run_oracle_propose(base_config()))
         finally:
             main.propose_tx_to_update_oracle = propose
 
@@ -182,7 +182,7 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
 
         main.validate_oracles = lambda _config: result(incorrect_value=True)
 
-        def propose(results):
+        def propose(results, **_kwargs):
             self.proposed.append(results)
             return one_proposal()
 
@@ -206,39 +206,42 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         main.send_message = self._send
 
     def test_the_proposal_survives_telegram_being_unreachable(self):
-        """The first Telegram call happens before anything else in the report.
+        """Queueing the transaction is the act; announcing it is not.
 
-        Left fatal, it aborts the run before an oracle is even validated, so the
-        proposal that keeps the oracle from expiring never happens.
+        This is reached for when the oracle is already going unwritten, so a
+        Telegram outage must not be allowed to stop the one thing that puts an
+        update in front of the signers.
         """
-        asyncio.run(main.run_oracle_report(with_telegram()))
+        asyncio.run(main.run_oracle_propose(with_telegram()))
 
         self.assertEqual(len(self.proposed), 1, "the proposal is the load-bearing act")
 
-    def test_a_failed_announcement_does_not_fail_the_task(self):
-        """Failing would make the scheduler retry.
+    def test_a_failed_announcement_does_not_raise(self):
+        """The proposal is queued, so raising would misreport what happened.
 
-        A retry after the share price moved proposes different calldata, which
-        competes for the same Safe nonce instead of being deduplicated.
+        It returns False instead, and the CLI turns that into a non-zero exit --
+        the operator needs to know to send the Safe link by hand, not to think
+        the proposal failed and make a second one competing for the same nonce.
         """
-        delivered = asyncio.run(main.run_oracle_report(with_telegram()))
+        delivered = asyncio.run(main.run_oracle_propose(with_telegram()))
 
         self.assertGreater(len(self.sends), 1, "the announcement path must run")
         self.assertFalse(delivered, "and it must report that nobody was told")
 
-    def test_a_status_message_with_no_proposal_is_still_counted(self):
-        """When nothing is proposed the status message is the only announcement.
+    def test_proposing_nothing_is_an_error_now_that_a_person_asked(self):
+        """Nothing to propose used to be routine and is now a failure.
 
-        A transfer in flight, a recent update, or a missing proposer key all
-        produce this shape; leaving it out of the tally reported a clean run for
-        exactly the outage the tally exists to expose.
+        On a schedule, "no oracle needed updating" was the common case. Invoked
+        by hand it means the opposite: someone reached for the recovery path and
+        got silence, most likely because no proposer key is configured. Exiting
+        zero there would let them believe an update is queued when none is.
         """
-        main.propose_tx_to_update_oracle = lambda _results: []
+        main.propose_tx_to_update_oracle = lambda _results, **_kwargs: []
 
-        delivered = asyncio.run(main.run_oracle_report(with_telegram()))
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(main.run_oracle_propose(with_telegram()))
 
-        self.assertGreater(len(self.sends), 0)
-        self.assertFalse(delivered)
+        self.assertIn("Nothing was proposed", str(caught.exception))
 
     def test_a_dry_run_send_is_not_a_delivery_failure(self):
         """Dry-run send_message returns None on success.
@@ -253,18 +256,18 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
 
         main.send_message = dry_run_send
 
-        self.assertTrue(asyncio.run(main.run_oracle_report(with_telegram())))
+        self.assertTrue(asyncio.run(main.run_oracle_propose(with_telegram())))
 
     def test_every_proposal_failing_fails_the_run(self):
         """Nothing reached the service, so the scheduler must see it and retry."""
         proposals = one_proposal()
         proposals[0][2].transaction = None
-        main.propose_tx_to_update_oracle = lambda _results: proposals
+        main.propose_tx_to_update_oracle = lambda _results, **_kwargs: proposals
 
         with self.assertRaises(Exception) as caught:
-            asyncio.run(main.run_oracle_report(with_telegram()))
+            asyncio.run(main.run_oracle_propose(with_telegram()))
 
-        self.assertIn("queued no update", str(caught.exception))
+        self.assertIn("nothing is queued", str(caught.exception))
 
     def test_one_failure_among_several_does_not_fail_the_run(self):
         """Retrying would re-propose against the Safe whose proposal succeeded.
@@ -275,18 +278,18 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         proposals = one_proposal() + one_proposal()
         proposals[0][2].transaction = None
 
-        main.propose_tx_to_update_oracle = lambda _results: proposals
+        main.propose_tx_to_update_oracle = lambda _results, **_kwargs: proposals
 
-        asyncio.run(main.run_oracle_report(with_telegram()))
+        asyncio.run(main.run_oracle_propose(with_telegram()))
 
     def test_a_posted_but_unconfirmed_proposal_does_not_fail_the_run(self):
         """It is queued and signable; a retry would compete for its nonce."""
         proposals = one_proposal()
         proposals[0][2].transaction = None
         proposals[0][2].posted = True
-        main.propose_tx_to_update_oracle = lambda _results: proposals
+        main.propose_tx_to_update_oracle = lambda _results, **_kwargs: proposals
 
-        asyncio.run(main.run_oracle_report(with_telegram()))
+        asyncio.run(main.run_oracle_propose(with_telegram()))
 
     def test_a_partial_delivery_is_not_reported_as_complete(self):
         """The status message got through and the proposal message did not.
@@ -304,7 +307,7 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
 
         main.send_message = first_ok_then_fail
 
-        self.assertFalse(asyncio.run(main.run_oracle_report(with_telegram())))
+        self.assertFalse(asyncio.run(main.run_oracle_propose(with_telegram())))
 
     def test_a_working_telegram_reports_delivery(self):
         async def ok_send(*_args, **_kwargs):
@@ -313,7 +316,7 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
 
         main.send_message = ok_send
 
-        self.assertTrue(asyncio.run(main.run_oracle_report(with_telegram())))
+        self.assertTrue(asyncio.run(main.run_oracle_propose(with_telegram())))
 
 
 class TestPostedProposalWiring(unittest.TestCase):

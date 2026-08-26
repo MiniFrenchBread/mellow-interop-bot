@@ -41,7 +41,41 @@ def validate_source(target_w3: Web3, source: SourceConfig):
     validate_rpc_url(w3, source.name)
     validate_source_helper(w3, source)
     validate_deployments(w3, target_w3, source)
+    validate_oracle_updater(w3, source)
     validate_all_safe_globals(w3, source)
+
+
+# keccak256("ORACLE:SET_VALUE_ROLE"), the role Oracle.setValue checks against the
+# SourceCore's access control. Hard-coded rather than read from the Oracle so
+# that a wrong or unreachable oracle address cannot make this check pass by
+# accident.
+SET_VALUE_ROLE = Web3.keccak(text="ORACLE:SET_VALUE_ROLE")
+
+
+def validate_oracle_updater(w3: Web3, source: SourceConfig):
+    """Check the heartbeat key can actually write the oracle.
+
+    Granting the role is a separate, manual multisig step, and forgetting it
+    produces a bot that starts cleanly and then fails every eight hours with
+    "Oracle: forbidden". Checking it here turns that into one line at deploy
+    time.
+    """
+    config = getattr(source, "oracle_update", None)
+    if config is None or not config.updater_private_key:
+        print(f"No oracle-update key set for {source.name}, skipping the role check...")
+        return
+
+    updater = Account.from_key(config.updater_private_key).address
+    for deployment in source.deployments:
+        core = get_contract(w3, deployment.source_core, "SourceCore")
+        if not core.functions.hasRole(SET_VALUE_ROLE, updater).call():
+            raise Exception(
+                f"Oracle updater {updater} does not hold SET_VALUE_ROLE on "
+                f"{deployment.source_core} ({source.name}/{deployment.name}). "
+                f"Grant it from the Safe: "
+                f"grantRole({SET_VALUE_ROLE.hex()}, {updater})"
+            )
+        print(f"Oracle updater {updater} can write {deployment.name}'s oracle")
 
 
 def validate_all_safe_globals(w3: Web3, source: SourceConfig):

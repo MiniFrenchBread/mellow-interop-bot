@@ -16,9 +16,11 @@ from config import (
     mask_all_sensitive_config_data,
 )
 from web3_scripts import (
+    OracleUpdateResult,
     OracleValidationResult,
     run_oracle_validation,
     format_remaining_time,
+    update_oracle,
 )
 from safe_global import PendingTransactionInfo, ProposalPosted, propose_tx_if_needed
 from dataclasses import dataclass, field
@@ -36,6 +38,21 @@ class OracleData:
     name: str
     deployment: Deployment
     validation: Optional[OracleValidationResult]
+
+
+@dataclass
+class OracleRunSummary:
+    """What the caller needs after a heartbeat run.
+
+    `notified` and `skip_reasons` are both here because they escalate through
+    different channels: a failed announcement is shouted locally and dropped,
+    while a run of skips is the scheduler's to notice -- one skip is routine,
+    three in a row means the oracle has quietly stopped being written.
+    """
+
+    notified: bool = True
+    skip_reasons: list = field(default_factory=list)
+    written: int = 0
 
 
 @dataclass
@@ -64,7 +81,7 @@ async def main():
     try:
         dotenv.load_dotenv()
         config = read_config(str(CONFIG_PATH))
-        await run_oracle_report(config)
+        await run_oracle_update(config)
     except FileNotFoundError:
         print(f"Error: config.json not found")
     except Exception as e:
@@ -72,78 +89,258 @@ async def main():
         print(f"Unexpected error: {error_message}")
 
 
-async def run_oracle_report(config: Config) -> bool:
-    """Validate every oracle, alert, and propose updates.
+async def run_oracle_update(
+    config: Config, force: bool = False, dry_run: bool = False
+) -> OracleRunSummary:
+    """Refresh every oracle, and tell someone only when a person is needed.
 
     Returns whether every announcement it tried to send got through, so a caller
     that a human is watching can say otherwise. Never raises for a delivery
     failure -- see below.
 
     Kept separate from main() because the scheduler needs to see failures: with
-    the catch-all wrapped around this work, a broken oracle report always looked
+    the catch-all wrapped around this work, a broken oracle run always looked
     like a successful one, and the whole retry-and-alert path was dead for the
     one task whose silence started this.
 
-    Raises on anything that stops the report being produced, and on every oracle
-    failing validation, which is what a total RPC outage looks like. A single
-    deployment or Safe failing is still caught and reported inline, so one broken
-    chain does not suppress the others.
+    Silence on success is deliberate. This runs three times a day, and a
+    "refreshed the oracle" message on each would train everyone to ignore the
+    channel that the refusals and the failures also arrive on.
 
-    Telegram is best-effort throughout. Reaching the signers matters, but the
-    proposal is what keeps the oracle from expiring, and it must not be
-    cancelled because the channel that announces it is down. Nor may a failed
-    send fail the task: the scheduler would retry, and a retry after the share
-    price has moved proposes different calldata, which lands as a second
-    transaction competing for the same Safe nonce instead of being deduplicated.
+    Raises when nothing could be written at all, which is what a total RPC
+    outage looks like. A single deployment failing is caught and reported
+    inline, so one broken chain does not suppress the others.
+
+    Telegram is best-effort throughout: the write is what keeps the oracle
+    alive, and it must not be cancelled or retried because the channel that
+    announces it is down.
     """
-    await _best_effort(
-        "check the Telegram bot and group",
-        print_telegram_info(config.telegram_bot_api_key, config.telegram_group_chat_id),
-    )
-
-    # Validate and get oracles data
-    oracle_validation_results = validate_oracles(config)
-
-    if oracle_validation_results and all(
-        oracle_data.validation is None for _, oracle_data in oracle_validation_results
-    ):
-        # validate_oracles catches per deployment so one broken chain cannot
-        # suppress the others, but every one failing is an outage rather than a
-        # report. Returning normally here would reset the scheduler's failure
-        # counter and keep the alert from ever arming.
-        raise Exception(
-            "Could not validate any of {} oracle deployment(s)".format(
-                len(oracle_validation_results)
-            )
+    if config.telegram_bot_api_key and config.telegram_group_chat_id:
+        await _best_effort(
+            "check the Telegram bot and group",
+            print_telegram_info(
+                config.telegram_bot_api_key, config.telegram_group_chat_id
+            ),
         )
 
-    if not needs_attention(oracle_validation_results):
-        print("No invalid oracle statuses to report")
+    results = update_oracles(config, force=force, dry_run=dry_run)
+
+    if not results:
+        print("No deployments configured; nothing to update")
+        return OracleRunSummary()
+
+    if all(result is None for _, result in results):
+        # update_oracles catches per deployment so one broken chain cannot
+        # suppress the others, but every one failing is an outage rather than a
+        # run. Returning normally here would reset the scheduler's failure
+        # counter and keep the alert from ever arming.
+        raise Exception(
+            "Could not update any of {} oracle deployment(s)".format(len(results))
+        )
+
+    summary = OracleRunSummary(
+        skip_reasons=[
+            "{}/{}: {}".format(source.name, result.name, result.skip_reason)
+            for source, result in results
+            if result is not None and result.skip_reason
+        ],
+        written=sum(
+            1 for _, result in results if result is not None and result.written
+        ),
+    )
+
+    message = compose_oracle_update_message(config, results)
+    if not message:
+        print(
+            "Oracle(s) refreshed: {}".format(
+                ", ".join(
+                    "{}={}".format(result.name, result.new_value)
+                    for _, result in results
+                    if result is not None and result.written
+                )
+                or "none written"
+            )
+        )
+        return summary
+
+    ok, _sent = await _best_effort(
+        "send the oracle alert",
+        send_message(
+            config.telegram_bot_api_key, config.telegram_group_chat_id, message
+        ),
+    )
+    if not ok:
+        # Everything else already happened, so nothing else will report this.
+        # Say it loudly here, because the channel that would normally carry the
+        # alarm is the one that is down.
+        print_colored(
+            "The oracle needs attention and nobody could be told:\n" + message,
+            "red",
+        )
+    summary.notified = ok
+    return summary
+
+
+def update_oracles(
+    config: Config, force: bool = False, dry_run: bool = False
+) -> List[Tuple[SourceConfig, Optional[OracleUpdateResult]]]:
+    """Run the heartbeat for every deployment, isolating per-deployment failures.
+
+    A None result means this deployment could not be reached or its send failed.
+    It is kept in the list rather than dropped so the caller can tell "every one
+    failed" -- an outage -- from "some succeeded".
+    """
+    results: List[Tuple[SourceConfig, Optional[OracleUpdateResult]]] = []
+    for source in config.sources:
+        for deployment in source.deployments:
+            result: Optional[OracleUpdateResult] = None
+            try:
+                result = update_oracle(
+                    source=source,
+                    deployment=deployment,
+                    target_rpc=config.target_rpc,
+                    target_core_helper=config.target_core_helper,
+                    oracle_expiry_threshold_seconds=config.oracle_expiry_threshold_seconds,
+                    force=force,
+                    dry_run=dry_run,
+                )
+            except Exception as e:
+                masked_error = mask_source_sensitive_data(str(e), source)
+                masked_error = mask_url_credentials(masked_error, config.target_rpc)
+                print_colored(
+                    "Could not update the oracle for {}/{}: {}".format(
+                        source.name, deployment.name, masked_error
+                    ),
+                    "red",
+                )
+            results.append((source, result))
+    return results
+
+
+def compose_oracle_update_message(
+    config: Config,
+    results: List[Tuple[SourceConfig, Optional[OracleUpdateResult]]],
+) -> str:
+    """Render only what needs a person, or "" when nothing does.
+
+    Built from what the run actually did, never from the pre-write validation.
+    Before a write the value on chain is nearly always stale by a basis point or
+    so -- that is the condition this task exists to correct -- so a message
+    driven by the pre-write state would fire every eight hours and say nothing.
+    """
+    if not config.telegram_bot_api_key or not config.telegram_group_chat_id:
+        return ""
+
+    lines = []
+    needs_mention = False
+    for source, result in results:
+        if result is None:
+            lines.append(
+                "- `{}`: ❌ could not be updated (see the logs)".format(source.name)
+            )
+            needs_mention = True
+            continue
+        if result.alerts:
+            lines.append(
+                "- `{}/{}`: ⚠️ {}".format(source.name, result.name, result.alert)
+            )
+            if not result.written:
+                needs_mention = True
+        # A skip is deliberately not reported here. A cross-chain transfer in
+        # flight is an ordinary few minutes of the day, and announcing each one
+        # would put a message in the group most days for something nobody acts
+        # on. Repeated skips do matter, and the scheduler is what notices them.
+
+    if not lines:
+        return ""
+
+    message = "Oracle update needs attention:\n" + "\n".join(lines)
+    if needs_mention:
+        mentions = format_mentions(list(config.telegram_owner_nicknames))
+        if mentions:
+            message += "\n\ncc {}".format(mentions)
+        message += (
+            "\n\nThe oracle is not being refreshed and will not resume on its own. "
+            "Check with `cli.py oracle --dry-run`, then either propose the value "
+            "through the Safe (`cli.py oracle-propose`) or fix the source of the "
+            "bad reading."
+        )
+    return message
+
+
+async def run_oracle_propose(
+    config: Config, value_override: Optional[int] = None, dry_run: bool = False
+) -> bool:
+    """Queue an oracle update through the Safe and tell the signers.
+
+    The recovery path, invoked by hand. It signs off chain and posts to the Safe
+    service, so it broadcasts nothing and consumes no nonce -- which is why it
+    can run while the scheduler is up, and why it stays usable once the heartbeat
+    key lives somewhere a person cannot reach.
+    """
+    oracle_validation_results = validate_oracles(config)
+
+    if not oracle_validation_results or all(
+        oracle_data.validation is None for _, oracle_data in oracle_validation_results
+    ):
+        raise Exception(
+            "Could not validate any of {} oracle deployment(s); nothing to "
+            "propose".format(len(oracle_validation_results))
+        )
+
+    if dry_run:
+        for source, oracle_data in oracle_validation_results:
+            validation = oracle_data.validation
+            if validation is None:
+                print("{}/{}: validation failed".format(source.name, oracle_data.name))
+                continue
+            safe = oracle_data.deployment.safe_global
+            value = (
+                value_override
+                if value_override is not None
+                else validation.actual_value
+            )
+            print(
+                "{}/{}: would propose setValue({}) on {} via Safe {} (on chain: {})".format(
+                    source.name,
+                    oracle_data.name,
+                    value,
+                    validation.oracle_address,
+                    safe.safe_address if safe else "<none configured>",
+                    validation.oracle_value,
+                )
+            )
         return True
 
-    # Proposed before anything is sent. The proposal is the action that keeps
-    # the oracle alive; the messages only tell people about it, and an outage in
-    # the telling must not cancel the doing.
-    safe_proposals = propose_tx_to_update_oracle(oracle_validation_results)
+    safe_proposals = propose_tx_to_update_oracle(
+        oracle_validation_results, force=True, value_override=value_override
+    )
+
+    if not safe_proposals:
+        raise Exception(
+            "Nothing was proposed; no deployment has a Safe with a proposer key "
+            "configured"
+        )
 
     attempted = 0
     delivered = 0
     status_message = None
 
-    message = compose_oracle_data_message(config, oracle_validation_results)
-    if message:
-        # Counted like any other announcement. When nothing is proposed -- a
-        # transfer in flight, a recent update, no proposer key -- this is the
-        # only thing that gets sent, and leaving it out of the tally reported a
-        # clean run for precisely the outage the tally exists to expose.
+    # Sent first, and the proposals reply to it. Signers are being asked to
+    # approve a number; the oracle's current value, the computed one and how
+    # long is left before expiry are what make that number checkable rather
+    # than something to rubber-stamp.
+    status = compose_oracle_data_message(config, oracle_validation_results)
+    if status:
         attempted += 1
         ok, status_message = await _best_effort(
             "send the oracle status message",
             send_message(
-                config.telegram_bot_api_key, config.telegram_group_chat_id, message
+                config.telegram_bot_api_key, config.telegram_group_chat_id, status
             ),
         )
         delivered += ok
+
     for source, safe_global, safe_proposal in safe_proposals:
         message = compose_safe_proposal_message(
             config.telegram_owner_nicknames,
@@ -151,67 +348,43 @@ async def run_oracle_report(config: Config) -> bool:
             safe_global,
             safe_proposal,
         )
-
-        # Send message with safe proposal for each source
-        if message:
-            # Only add prefix for newly created transactions
-            if (
-                config.telegram_proposal_message_prefix
-                and safe_proposal.is_newly_created
-            ):
-                message = (
-                    config.telegram_proposal_message_prefix.replace("_", "\\_")
-                    + "\n"
-                    + message
-                )
-
-            # Wrapped per proposal: this is the message carrying the Safe link,
-            # the missing confirmations and the supersedes notice, so one source
-            # failing must not take the others' announcements with it -- and it
-            # must not fail the run, or the retry proposes again against a moved
-            # share price and competes for the same Safe nonce.
-            ok, _sent = await _best_effort(
-                "send the proposal message for {}".format(source.name),
-                send_message(
-                    config.telegram_bot_api_key,
-                    config.telegram_group_chat_id,
-                    message,
-                    reply_to_message_id=(
-                        status_message.message_id if status_message else None
-                    ),
-                ),
+        if not message:
+            continue
+        if config.telegram_proposal_message_prefix and safe_proposal.is_newly_created:
+            message = (
+                config.telegram_proposal_message_prefix.replace("_", "\\_")
+                + "\n"
+                + message
             )
-            delivered += ok
-            attempted += 1
+        attempted += 1
+        ok, _sent = await _best_effort(
+            "send the proposal message for {}".format(source.name),
+            send_message(
+                config.telegram_bot_api_key,
+                config.telegram_group_chat_id,
+                message,
+                reply_to_message_id=(
+                    status_message.message_id if status_message else None
+                ),
+            ),
+        )
+        delivered += ok
 
-    if safe_proposals and all(
+    if all(
         proposal.transaction is None and not proposal.posted
         for _, _, proposal in safe_proposals
     ):
-        # Raised after the messages so the per-Safe error still reaches Telegram.
-        # Only when nothing reached the service at all: a proposal that was
-        # posted but not confirmed is already queued, and a retry would compete
-        # with it rather than replace it.
         raise Exception(
             "Every one of {} Safe proposal(s) failed before reaching the service; "
-            "this run queued no update".format(len(safe_proposals))
+            "nothing is queued".format(len(safe_proposals))
         )
 
     if attempted and not delivered:
-        # Everything else succeeded, so nothing else will report this. Say it
-        # loudly here, because the channel that would normally carry the alarm
-        # is the one that is down.
         print_colored(
-            "Nothing could be announced; signers have not been told"
-            + (
-                " about {} Safe transaction(s)".format(len(safe_proposals))
-                if safe_proposals
-                else ""
-            ),
+            "The proposal is queued but nobody could be told; send the Safe link "
+            "to the signers by hand",
             "red",
         )
-    else:
-        print(f"Sent {delivered} message(s) with safe proposal")
     return delivered == attempted
 
 
@@ -406,7 +579,22 @@ def compose_safe_tx_confirmations(proposal: SafeProposal) -> tuple[str, bool]:
 
 def propose_tx_to_update_oracle(
     oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
+    force: bool = False,
+    value_override: Optional[int] = None,
 ) -> List[Tuple[SourceConfig, SafeGlobal, SafeProposal]]:
+    """Queue a Safe transaction setting the oracle, for the operator to sign.
+
+    No longer on any schedule. The heartbeat writes the oracle directly, and
+    this is what a person reaches for when a guard refused that write: it moves
+    the decision to a different authority -- a quorum of signers rather than the
+    key the bot holds -- which is the right shape for a value the bot has just
+    declined to write unreviewed.
+
+    `force` skips the freshness heuristics, because being asked to run this at
+    all is the reason to act; the automatic caller that needed them is gone.
+    `value_override` supplies a number worked out by hand, for the case where
+    the guard fired precisely because the computed one cannot be trusted.
+    """
     result: List[Tuple[SourceConfig, SafeGlobal, SafeProposal]] = []
 
     # Group validation results by effective Safe identity (chain prefix + address)
@@ -449,17 +637,29 @@ def propose_tx_to_update_oracle(
             if validation is None:
                 continue
 
-            # Skip if transfer is in progress
-            if validation.transfer_in_progress:
+            # Skip if transfer is in progress. An explicit value is exempt: it
+            # was not derived from the two sides that a transfer in flight puts
+            # out of step, so the reason to wait does not apply to it.
+            if validation.transfer_in_progress and value_override is None:
                 continue
 
             # Skip if oracle is not expired or incorrect
-            if not validation.almost_expired and not validation.incorrect_value:
+            if (
+                not force
+                and not validation.almost_expired
+                and not validation.incorrect_value
+            ):
                 continue
 
             # Update is required, add oracle data to calls
             to = validation.oracle_address
-            args = [validation.actual_value]
+            args = [
+                (
+                    value_override
+                    if value_override is not None
+                    else validation.actual_value
+                )
+            ]
             deployment_names.append(oracle_data.name)
             calls.append((to, args))
 
