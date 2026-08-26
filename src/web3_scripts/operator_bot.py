@@ -320,6 +320,18 @@ def parse_deployments(config, deployments_raw):
     return valid_deployments
 
 
+def _with_stop(options, should_stop, on_stuck=None):
+    """Add the caller's hooks to a settings dict, which is how they reach sends."""
+    if should_stop is None and on_stuck is None:
+        return options
+    merged = dict(options or {})
+    if should_stop is not None:
+        merged["should_stop"] = should_stop
+    if on_stuck is not None:
+        merged["on_stuck"] = on_stuck
+    return merged
+
+
 def run_all(
     config,
     operator_pk: str = None,
@@ -328,6 +340,8 @@ def run_all(
     max_source_ratio_d3: int = None,
     force_withdrawal: bool = None,
     interactive: bool = True,
+    should_stop=None,
+    on_stuck=None,
 ) -> List[Tuple[str, Optional[str]]]:
     """Rebalance every configured deployment.
 
@@ -406,11 +420,19 @@ def run_all(
             source_ratio_d3=source_ratio_d3,
             max_source_ratio_d3=max_source_ratio_d3,
             force_withdrawal=force_withdrawal,
-            source_tx=source.tx.as_kwargs() if getattr(source, "tx", None) else None,
-            target_tx=(
-                config.target_tx.as_kwargs()
-                if getattr(config, "target_tx", None)
-                else None
+            source_tx=_with_stop(
+                source.tx.as_kwargs() if getattr(source, "tx", None) else None,
+                should_stop,
+                on_stuck,
+            ),
+            target_tx=_with_stop(
+                (
+                    config.target_tx.as_kwargs()
+                    if getattr(config, "target_tx", None)
+                    else None
+                ),
+                should_stop,
+                on_stuck,
             ),
         )
         skipped.append(("{}:{}".format(source.name, deployment.name), reason))

@@ -11,7 +11,6 @@ try:
     from .tx import (
         DEFAULT_FEE_BUMP_PERCENT,
         DEFAULT_FEE_CAP_GWEI,
-        DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RECEIPT_TIMEOUT,
         NonceAlreadyUsed,
         TxNotConfirmed,
@@ -31,7 +30,6 @@ except ImportError:
     from tx import (
         DEFAULT_FEE_BUMP_PERCENT,
         DEFAULT_FEE_CAP_GWEI,
-        DEFAULT_MAX_ATTEMPTS,
         DEFAULT_RECEIPT_TIMEOUT,
         NonceAlreadyUsed,
         TxNotConfirmed,
@@ -167,10 +165,11 @@ def execute(
     operator_pk: str,
     nonce: int = None,
     receipt_timeout: float = DEFAULT_RECEIPT_TIMEOUT,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     fee_bump_percent: int = DEFAULT_FEE_BUMP_PERCENT,
     fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
     label: str = "",
+    should_stop=None,
+    on_stuck=None,
 ) -> TxOutcome:
     return send_and_confirm(
         contractFunction,
@@ -178,10 +177,11 @@ def execute(
         operator_pk,
         nonce=nonce,
         receipt_timeout=receipt_timeout,
-        max_attempts=max_attempts,
         fee_bump_percent=fee_bump_percent,
         fee_cap_gwei=fee_cap_gwei,
         label=label,
+        should_stop=should_stop,
+        on_stuck=on_stuck,
     )
 
 

@@ -40,8 +40,57 @@ def validate_source(target_w3: Web3, source: SourceConfig):
     w3 = get_w3(source.rpc)
     validate_rpc_url(w3, source.name)
     validate_source_helper(w3, source)
+    # Before validate_deployments, and deliberately so. This exists to answer
+    # "was the role granted?" in one line before a deploy, and it only needs the
+    # source-core addresses from config -- not the cross-reference checks. Run
+    # after them, any unrelated failure in that pass (the symbol assertion is
+    # currently one) aborts the run before the question is ever asked, which is
+    # precisely when someone is relying on the answer.
+    validate_oracle_updater(w3, source)
     validate_deployments(w3, target_w3, source)
     validate_all_safe_globals(w3, source)
+
+
+# keccak256("ORACLE:SET_VALUE_ROLE"), the role Oracle.setValue checks against the
+# SourceCore's access control. Hard-coded rather than read from the Oracle so
+# that a wrong or unreachable oracle address cannot make this check pass by
+# accident.
+SET_VALUE_ROLE = Web3.keccak(text="ORACLE:SET_VALUE_ROLE")
+
+
+def validate_oracle_updater(w3: Web3, source: SourceConfig):
+    """Check the heartbeat key can actually write the oracle.
+
+    Granting the role is a separate, manual multisig step, and forgetting it
+    produces a bot that starts cleanly and then fails every eight hours with
+    "Oracle: forbidden". Checking it here turns that into one line at deploy
+    time.
+    """
+    config = getattr(source, "oracle_update", None)
+    if config is None:
+        print(f"No oracle-update section for {source.name}, skipping the role check...")
+        return
+    if not config.updater_private_key:
+        # Declared and unresolved, which is a missing environment variable
+        # rather than a source that does not write the oracle. Skipping it here
+        # is how a deploy that forgot ORACLE_UPDATER_PK got a clean bill of
+        # health and then failed every cycle.
+        raise Exception(
+            f"{source.name} declares oracle-update but its private key is "
+            f"empty; set ORACLE_UPDATER_PK"
+        )
+
+    updater = Account.from_key(config.updater_private_key).address
+    for deployment in source.deployments:
+        core = get_contract(w3, deployment.source_core, "SourceCore")
+        if not core.functions.hasRole(SET_VALUE_ROLE, updater).call():
+            raise Exception(
+                f"Oracle updater {updater} does not hold SET_VALUE_ROLE on "
+                f"{deployment.source_core} ({source.name}/{deployment.name}). "
+                f"Grant it from the Safe: "
+                f"grantRole({SET_VALUE_ROLE.to_0x_hex()}, {updater})"
+            )
+        print(f"Oracle updater {updater} can write {deployment.name}'s oracle")
 
 
 def validate_all_safe_globals(w3: Web3, source: SourceConfig):

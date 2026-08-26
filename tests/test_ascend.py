@@ -340,11 +340,11 @@ class TestTxSettings(AscendTestCase):
         self.prepare([1, 2, 3])
         self.expect_distribution_of(6)
 
-        self.run_ascend(tx={"receipt_timeout": 60, "max_attempts": 3})
+        self.run_ascend(tx={"receipt_timeout": 60, "fee_cap_gwei": 7})
 
         for sent in self.world.sent:
             self.assertEqual(sent["receipt_timeout"], 60)
-            self.assertEqual(sent["max_attempts"], 3)
+            self.assertEqual(sent["fee_cap_gwei"], 7)
 
 
 if __name__ == "__main__":

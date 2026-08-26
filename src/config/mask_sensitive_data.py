@@ -77,6 +77,14 @@ def mask_source_sensitive_data(message: str, source: "SourceConfig") -> str:
     if getattr(source, "executor_private_key", None):
         message = mask_sensitive_data(message, source.executor_private_key)
 
+    # Mask the oracle updater key. It is configured separately from the executor
+    # key -- whether or not the two currently hold the same value -- so masking
+    # one does not cover the other, and this is the key that can move the share
+    # price, which makes it the one least acceptable to leak into an alert.
+    oracle_update = getattr(source, "oracle_update", None)
+    if oracle_update and oracle_update.updater_private_key:
+        message = mask_sensitive_data(message, oracle_update.updater_private_key)
+
     # Mask safe global sensitive data, including any a deployment overrode. The
     # proposal path uses the merged per-deployment config, so an override's own
     # proposer key or API key is what would appear in an error from it.

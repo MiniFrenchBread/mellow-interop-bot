@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 # competition and routinely takes several minutes, which is why the previous
 # two-minute wait kept abandoning transactions that were merely slow.
 DEFAULT_RECEIPT_TIMEOUT_SECONDS = 180
-DEFAULT_TX_MAX_ATTEMPTS = 3
 DEFAULT_TX_FEE_BUMP_PERCENT = 115
 DEFAULT_TX_FEE_CAP_GWEI = 4
 
@@ -22,20 +21,45 @@ DEFAULT_ALERT_AFTER_FAILURES = 3
 # Every task runs on one of these unless the config names a different
 # interval. Omitting a task does not stop it; ascend and handle-epoch are
 # stopped by removing the source section each needs (`ascend`,
-# `withdrawal-queue`), and rebalance and oracle-report have no off switch.
+# `withdrawal-queue`), and rebalance and oracle-update have no off switch.
+#
+# ascend and oracle_update share an interval on purpose. The vault's assets
+# only move when ascend transfers rewards into it, so the oracle has nothing
+# new to write between ascend runs: refreshing it more often than ascend runs
+# would rewrite the same number, and refreshing it less often would leave the
+# share price stepping. Keeping ascend at least as frequent as the oracle is
+# what makes the share price accrue smoothly rather than in jumps.
 DEFAULT_TASK_INTERVALS = {
-    "ascend": 1209600,
+    "ascend": 28800,
     "rebalance": 7200,
-    "oracle_report": 86400,
+    "oracle_update": 28800,
     "handle_epoch": 300,
 }
 DEFAULT_HANDLE_EPOCH_MAX_ITERATIONS = 8
 
+# Refuse to write a value this far from the one on chain. Sized against the
+# share price's measured rate of change: at the yield seen so far an eight-hour
+# step is under a basis point, so 1% is two orders of magnitude of headroom,
+# while the failures this exists to catch -- a helper returning zero, a
+# decimals mismatch, half the position missing -- are thousands of basis
+# points out.
+DEFAULT_ORACLE_MAX_DEVIATION_BPS = 100
+# A decrease smaller than this is rounding, not a loss. Same magnitude as
+# base.ORACLE_VALUE_TOLERANCE, and four orders of magnitude below a normal
+# eight-hour increase, so it cannot swallow real movement in either direction.
+DEFAULT_ORACLE_DECREASE_TOLERANCE_WEI = 10**9
+# Warn while there is still runway. At roughly 0.0002 OG a write and three
+# writes a day, this is months of gas -- the point is to be told long before a
+# send starts failing for want of gas.
+DEFAULT_ORACLE_MIN_BALANCE_WEI = 10**17
+
 
 @dataclass(frozen=True)
 class TxConfig:
+    # How long to wait before raising the fee and re-signing, not a budget for
+    # the send: a send runs until the chain settles it. There is deliberately no
+    # attempt limit -- the fee cap is the only ceiling.
     receipt_timeout_seconds: float = DEFAULT_RECEIPT_TIMEOUT_SECONDS
-    max_attempts: int = DEFAULT_TX_MAX_ATTEMPTS
     fee_bump_percent: int = DEFAULT_TX_FEE_BUMP_PERCENT
     fee_cap_gwei: int = DEFAULT_TX_FEE_CAP_GWEI
 
@@ -44,7 +68,6 @@ class TxConfig:
         setting here cannot leave a call site silently using the default."""
         return {
             "receipt_timeout": self.receipt_timeout_seconds,
-            "max_attempts": self.max_attempts,
             "fee_bump_percent": self.fee_bump_percent,
             "fee_cap_gwei": self.fee_cap_gwei,
         }
@@ -64,6 +87,28 @@ class AscendConfig:
 class WithdrawalQueueConfig:
     address: str
     max_iterations: int = DEFAULT_HANDLE_EPOCH_MAX_ITERATIONS
+
+
+@dataclass(frozen=True)
+class OracleUpdateConfig:
+    """Settings for writing the oracle directly, without the multisig.
+
+    Configured separately from `executor_private_key` so the two roles can be
+    split: this is the only key that can move the share price, which is the one
+    number every deposit and withdrawal is priced against, and being able to
+    fund, rotate and revoke it without touching the account that claims rewards
+    and rebalances is worth the indirection.
+
+    Nothing requires them to differ, and pointing both at one account is a
+    supported way to start. It does give up the separation: one account means
+    one nonce sequence, so a send of either kind that times out will block the
+    other until it clears.
+    """
+
+    updater_private_key: str
+    max_deviation_bps: int = DEFAULT_ORACLE_MAX_DEVIATION_BPS
+    decrease_tolerance_wei: int = DEFAULT_ORACLE_DECREASE_TOLERANCE_WEI
+    min_balance_wei: int = DEFAULT_ORACLE_MIN_BALANCE_WEI
 
 
 @dataclass(frozen=True)
@@ -139,6 +184,7 @@ class SourceConfig:
     tx: TxConfig = field(default_factory=TxConfig)
     ascend: Optional[AscendConfig] = None
     withdrawal_queue: Optional[WithdrawalQueueConfig] = None
+    oracle_update: Optional[OracleUpdateConfig] = None
 
 
 @dataclass
@@ -401,9 +447,6 @@ def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
         receipt_timeout_seconds=float(
             tx_dict.get("receipt_timeout_seconds", DEFAULT_RECEIPT_TIMEOUT_SECONDS)
         ),
-        max_attempts=_at_least(
-            "max-attempts", tx_dict.get("max_attempts", DEFAULT_TX_MAX_ATTEMPTS), 1
-        ),
         # Above 100 or a replacement cannot clear the node's minimum premium
         # and every attempt after the first is refused.
         fee_bump_percent=_at_least(
@@ -411,7 +454,12 @@ def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
             tx_dict.get("fee_bump_percent", DEFAULT_TX_FEE_BUMP_PERCENT),
             101,
         ),
-        fee_cap_gwei=int(tx_dict.get("fee_cap_gwei", DEFAULT_TX_FEE_CAP_GWEI)),
+        # Floored like fee-bump-percent above, and for the same kind of reason:
+        # a cap of zero leaves no bid that clears it, so the very first attempt
+        # decides nothing further can be offered and the send waits forever.
+        fee_cap_gwei=_at_least(
+            "fee-cap-gwei", tx_dict.get("fee_cap_gwei", DEFAULT_TX_FEE_CAP_GWEI), 1
+        ),
     )
 
 
@@ -443,6 +491,48 @@ def _create_withdrawal_queue_config(
         address=queue_dict["address"],
         max_iterations=int(
             queue_dict.get("max_iterations", DEFAULT_HANDLE_EPOCH_MAX_ITERATIONS)
+        ),
+    )
+
+
+def _create_oracle_update_config(
+    oracle_dict: Optional[Dict[str, Any]],
+) -> Optional[OracleUpdateConfig]:
+    """Build the oracle-update settings, or None when the section is absent.
+
+    A missing section, or one whose key did not resolve, returns None and the
+    task refuses to run rather than silently doing nothing -- an oracle that
+    quietly stops being written looks exactly like one that does not need
+    writing.
+    """
+    if not oracle_dict:
+        return None
+    # A present section with an unresolved key is kept, not collapsed to None.
+    # The two states need telling apart: "no oracle-update section" is a source
+    # that does not do this, while "section declared, ORACLE_UPDATER_PK unset"
+    # is a misconfiguration -- and returning None for both let validate-config
+    # print a clean skip while every cycle raised. Loading still succeeds, so
+    # every other command keeps working; the check that exists to catch this
+    # is where it is caught.
+    return OracleUpdateConfig(
+        updater_private_key=oracle_dict["updater_private_key"],
+        # Both floors are 1, not 0. Zero would read as "no limit" to whoever set
+        # it and behave as "refuse everything", which is the wrong direction for
+        # a guard whose failure mode is a frozen oracle.
+        max_deviation_bps=_at_least(
+            "max-deviation-bps",
+            oracle_dict.get("max_deviation_bps", DEFAULT_ORACLE_MAX_DEVIATION_BPS),
+            1,
+        ),
+        decrease_tolerance_wei=_at_least(
+            "decrease-tolerance-wei",
+            oracle_dict.get(
+                "decrease_tolerance_wei", DEFAULT_ORACLE_DECREASE_TOLERANCE_WEI
+            ),
+            1,
+        ),
+        min_balance_wei=int(
+            oracle_dict.get("min_balance_wei", DEFAULT_ORACLE_MIN_BALANCE_WEI)
         ),
     )
 
@@ -540,6 +630,9 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
             ascend=_create_ascend_config(source_dict.get("ascend")),
             withdrawal_queue=_create_withdrawal_queue_config(
                 source_dict.get("withdrawal_queue")
+            ),
+            oracle_update=_create_oracle_update_config(
+                source_dict.get("oracle_update")
             ),
         )
 

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -7,8 +8,13 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config.read_config import Config, SchedulerConfig
-from scheduler import Scheduler, format_duration, is_due, next_due
-from web3_scripts.tx import NonceBlocked
+from scheduler import (
+    Scheduler,
+    TASK_ORDER,
+    format_duration,
+    is_due,
+    next_due,
+)
 import main as oracle_main_module
 
 DAY = 86400
@@ -16,12 +22,16 @@ HOUR = 3600
 
 
 def make_config(**scheduler_kwargs) -> Config:
+    # Deliberately not the production numbers: these exercise the bucket
+    # arithmetic, and spreading them across four magnitudes is what makes a
+    # due/not-due bug visible. The real intervals are asserted against
+    # config.json in test_oracle_expiry_window.
     intervals = scheduler_kwargs.pop(
         "task_intervals",
         {
-            "ascend": 1209600,
+            "ascend": DAY,
             "rebalance": 7200,
-            "oracle_report": DAY,
+            "oracle_update": DAY,
             "handle_epoch": 300,
         },
     )
@@ -52,6 +62,16 @@ def make_scheduler(config, now=None, sleep=None, state_path=None):
     if sleep is not None:
         kwargs["sleep"] = sleep
     return Scheduler(config, **kwargs)
+
+
+class _NullLock:
+    """Stands in for ProcessLock where the test is not about locking."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
 
 
 class FakeClock:
@@ -125,19 +145,19 @@ class TestRestartBehaviour(unittest.TestCase):
         restarted = make_scheduler(make_config(), now=lambda: started + 2 * HOUR)
 
         self.assertEqual(
-            next_due(first.last_run["oracle_report"], DAY),
-            next_due(restarted.last_run["oracle_report"], DAY),
+            next_due(first.last_run["oracle_update"], DAY),
+            next_due(restarted.last_run["oracle_update"], DAY),
         )
 
     def test_restart_does_not_replay_a_bucket_already_served(self):
         started = 10 * DAY + 5 * HOUR
         scheduler = make_scheduler(make_config(), now=lambda: started)
-        self.assertFalse(is_due(scheduler.last_run["oracle_report"], started, DAY))
+        self.assertFalse(is_due(scheduler.last_run["oracle_update"], started, DAY))
 
     def test_a_crossed_boundary_still_fires_after_a_restart(self):
         started = 10 * DAY + 5 * HOUR
         scheduler = make_scheduler(make_config(), now=lambda: started)
-        self.assertTrue(is_due(scheduler.last_run["oracle_report"], 11 * DAY + 1, DAY))
+        self.assertTrue(is_due(scheduler.last_run["oracle_update"], 11 * DAY + 1, DAY))
 
 
 class TestCycleIsolation(unittest.TestCase):
@@ -149,7 +169,7 @@ class TestCycleIsolation(unittest.TestCase):
             task_intervals={
                 "ascend": 1,
                 "rebalance": 1,
-                "oracle_report": 1,
+                "oracle_update": 1,
                 "handle_epoch": 1,
             },
             post_ascend_gap_seconds=0,
@@ -158,7 +178,7 @@ class TestCycleIsolation(unittest.TestCase):
             self.config, now=self.clock.time, sleep=self.clock.sleep
         )
         self.ran = []
-        for task in ("ascend", "rebalance", "oracle_report", "handle_epoch"):
+        for task in ("ascend", "rebalance", "oracle_update", "handle_epoch"):
             self._stub(task)
 
     def _stub(self, task, error=None):
@@ -176,10 +196,31 @@ class TestCycleIsolation(unittest.TestCase):
         self.scheduler.run_cycle()
 
         self.assertEqual(
-            self.ran, ["ascend", "rebalance", "oracle_report", "handle_epoch"]
+            self.ran, ["ascend", "oracle_update", "rebalance", "handle_epoch"]
         )
         self.assertEqual(self.scheduler.failures["rebalance"], 1)
         self.assertEqual(self.scheduler.failures["ascend"], 0)
+
+    def test_the_oracle_is_refreshed_before_rebalancing(self):
+        """Rebalancing refuses while the oracle disagrees with the computed
+        value, and ascend is what makes them disagree. Running rebalance first
+        therefore guaranteed a refusal on every pass that followed a reward
+        distribution -- the ordering is the fix, so it is worth binding.
+        """
+        self.clock.advance(10)
+
+        self.scheduler.run_cycle()
+
+        self.assertLess(
+            self.ran.index("oracle_update"),
+            self.ran.index("rebalance"),
+            "the oracle must be written before rebalancing reads it",
+        )
+        self.assertLess(
+            self.ran.index("ascend"),
+            self.ran.index("oracle_update"),
+            "ascend moves the value the oracle is about to record",
+        )
 
     def test_a_task_that_stays_broken_keeps_alerting(self):
         """One alert then silence is the failure mode the alerting exists to close."""
@@ -218,38 +259,38 @@ class TestCycleIsolation(unittest.TestCase):
 
         self.assertEqual(self.scheduler.failures["rebalance"], 0)
 
-    def test_a_blocked_nonce_is_not_counted_against_the_task(self):
-        """Another task left a live transaction on the nonce.
+    def test_a_failure_does_not_reset_the_skip_window(self):
+        """Failing and declining are both "did not act".
 
-        That is neither this task's fault nor an outage, and the task that owns
-        the stuck transaction is the one that will alert about it. Counting it
-        here would raise an alarm naming the wrong task and, with a long-enough
-        block, drown the real one.
+        Clearing one from the other let a task alternate between them forever
+        without either threshold ever arming -- and retrying every cycle makes
+        that a five-minute flip rather than an hours-long one. The window has to
+        measure how long the task has been unable to act, whatever the reason.
+        """
+        self.scheduler.record_skip("rebalance", "oracle value is incorrect")
+        started = self.scheduler.skipping_since["rebalance"]
+
+        self.scheduler.record_failure("rebalance", RuntimeError("boom"))
+
+        self.assertEqual(self.scheduler.skipping_since["rebalance"], started)
+        self.assertEqual(self.scheduler.skips["rebalance"], 1)
+
+    def test_repeated_skips_alert(self):
+        """Judged by how long the run has lasted, not how many attempts it took.
+
+        Rebalance's patience is unchanged: `alert_after_failures` of its own
+        scheduled runs, which at a two-hour interval is six hours.
         """
         sent = []
         self.scheduler.notify = sent.append
+        # Expressed in the task's own threshold rather than in hours: this
+        # fixture gives every task a one-second interval so that everything is
+        # due at once, which would make any wall-clock figure meaningless.
+        threshold = self.scheduler.skip_alert_after("rebalance")
 
-        for _ in range(5):
-            self.scheduler.record_failure(
-                "oracle_report", NonceBlocked(42, "handleEpoch 7", ["0xabc"])
-            )
-
-        self.assertEqual(self.scheduler.failures["oracle_report"], 0)
-        self.assertEqual(sent, [])
-
-    def test_a_failure_breaks_a_run_of_skips(self):
-        """ "Skipped three times in a row" has to mean in a row."""
-        self.scheduler.record_skip("rebalance", "oracle value is incorrect")
-        self.scheduler.record_failure("rebalance", RuntimeError("boom"))
-
-        self.assertEqual(self.scheduler.skips["rebalance"], 0)
-
-    def test_repeated_skips_alert(self):
-        sent = []
-        self.scheduler.notify = sent.append
-
-        for _ in range(3):
+        for _ in range(2):
             self.scheduler.record_skip("rebalance", "oracle value is incorrect")
+            self.clock.advance(threshold)
 
         self.assertEqual(len(sent), 1)
         self.assertIn("oracle value is incorrect", sent[0])
@@ -258,11 +299,13 @@ class TestCycleIsolation(unittest.TestCase):
         """Like failures: one alert then silence is what this exists to prevent."""
         sent = []
         self.scheduler.notify = sent.append
+        threshold = self.scheduler.skip_alert_after("rebalance")
 
-        for _ in range(6):
+        for _ in range(3):
             self.scheduler.record_skip("rebalance", "oracle value is incorrect")
+            self.clock.advance(threshold)
 
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), 2, "one per threshold, not one and then silence")
 
     def test_backticks_in_an_error_cannot_break_the_alert(self):
         sent = []
@@ -395,20 +438,25 @@ class TestPersistedSchedule(unittest.TestCase):
         interval = DAY
 
         before = make_scheduler(
-            make_config(task_intervals={"oracle_report": interval}),
+            make_config(task_intervals={"oracle_update": interval}),
             now=lambda: boundary - HOUR,
             state_path=self.path,
         )
+        # Recorded as having run, which is what run_cycle does on a completed
+        # task. Only tasks with a real record are persisted -- writing back a
+        # seeded "process start" time would make a task that has never run look
+        # like one that just did.
+        before._has_record.add("oracle_update")
         before._save_state()
 
         after = make_scheduler(
-            make_config(task_intervals={"oracle_report": interval}),
+            make_config(task_intervals={"oracle_update": interval}),
             now=lambda: boundary + 60,
             state_path=self.path,
         )
 
         self.assertTrue(
-            is_due(after.last_run["oracle_report"], boundary + 60, interval),
+            is_due(after.last_run["oracle_update"], boundary + 60, interval),
             "the slot was owed before the restart and is still owed after it",
         )
 
@@ -417,7 +465,7 @@ class TestPersistedSchedule(unittest.TestCase):
             make_config(), now=lambda: 100 * DAY + HOUR, state_path=self.path
         )
 
-        self.assertFalse(is_due(fresh.last_run["oracle_report"], 100 * DAY + HOUR, DAY))
+        self.assertFalse(is_due(fresh.last_run["oracle_update"], 100 * DAY + HOUR, DAY))
 
     def test_a_corrupt_state_file_falls_back_to_now(self):
         with open(self.path, "w") as handle:
@@ -483,8 +531,90 @@ class TestMissingExecutorKey(unittest.TestCase):
             self.scheduler_without_a_key().task_handle_epoch()
 
 
+class TestOracleSkipsAreTracked(unittest.TestCase):
+    """A run of skips means the oracle quietly stopped being written.
+
+    Skipping is the right call while a cross-chain transfer is in flight, and a
+    single skip is an ordinary few minutes of the day -- so it is not alerted
+    on. What must not happen is skipping forever while the task reports success
+    every time, which is indistinguishable from a healthy bot until the vault
+    freezes.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FakeClock(100 * DAY)
+        self.scheduler = make_scheduler(
+            make_config(),
+            now=self.clock.time,
+            sleep=self.clock.sleep,
+            state_path=os.path.join(self.directory.name, "state.json"),
+        )
+        self.alerts = []
+        self.scheduler.notify = self.alerts.append
+        self._original = oracle_main_module.run_oracle_update
+
+    def tearDown(self):
+        oracle_main_module.run_oracle_update = self._original
+        self.directory.cleanup()
+
+    def _returns(self, summary):
+        async def run(_config, **_kwargs):
+            return summary
+
+        oracle_main_module.run_oracle_update = run
+
+    def test_a_single_skip_does_not_alert(self):
+        self._returns(
+            oracle_main_module.OracleRunSummary(skip_reasons=["OG/OG: in flight"])
+        )
+
+        self.scheduler.task_oracle_update()
+
+        self.assertEqual(self.scheduler.skips["oracle_update"], 1)
+        self.assertEqual(self.alerts, [])
+
+    def test_a_run_of_skips_alerts(self):
+        self._returns(
+            oracle_main_module.OracleRunSummary(skip_reasons=["OG/OG: in flight"])
+        )
+
+        for _ in range(8):  # forty minutes of five-minute retries
+            self.scheduler.task_oracle_update()
+            self.clock.advance(300)
+
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("in flight", self.alerts[0])
+        self.assertIn("in flight", self.alerts[0])
+
+    def test_a_write_clears_the_run(self):
+        """Otherwise an occasional transfer accumulates into a false alarm."""
+        self._returns(
+            oracle_main_module.OracleRunSummary(skip_reasons=["OG/OG: in flight"])
+        )
+        self.scheduler.task_oracle_update()
+
+        self._returns(oracle_main_module.OracleRunSummary(written=1))
+        self.scheduler.task_oracle_update()
+
+        self.assertEqual(self.scheduler.skips["oracle_update"], 0)
+
+    def test_a_partial_run_is_not_a_skip(self):
+        """One deployment skipped while another was written is not the oracle
+        going unwritten, and counting it would alert on a healthy bot."""
+        self._returns(
+            oracle_main_module.OracleRunSummary(
+                skip_reasons=["OG/OG: in flight"], written=1
+            )
+        )
+
+        self.scheduler.task_oracle_update()
+
+        self.assertEqual(self.scheduler.skips["oracle_update"], 0)
+
+
 class TestOracleTaskFailuresAreVisible(unittest.TestCase):
-    """The oracle report is the 21-day heartbeat; its silence must be loud."""
+    """The oracle write is what keeps the vault open; its silence must be loud."""
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -492,29 +622,38 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
             make_config(),
             state_path=os.path.join(self.directory.name, "state.json"),
         )
-        self._original = oracle_main_module.run_oracle_report
+        self._original = oracle_main_module.run_oracle_update
 
     def tearDown(self):
-        oracle_main_module.run_oracle_report = self._original
+        oracle_main_module.run_oracle_update = self._original
         self.directory.cleanup()
 
-    def test_a_failing_oracle_report_reaches_the_scheduler(self):
-        async def boom(_config):
+    def test_a_failing_oracle_update_reaches_the_scheduler(self):
+        async def boom(_config, **_kwargs):
             raise RuntimeError("RPC down")
 
-        oracle_main_module.run_oracle_report = boom
+        oracle_main_module.run_oracle_update = boom
 
         with self.assertRaises(RuntimeError):
-            self.scheduler.task_oracle_report()
+            self.scheduler.task_oracle_update()
 
     def test_the_standalone_entry_point_still_swallows(self):
-        """main() is the standalone path and should exit cleanly, not traceback."""
+        """main() is the standalone path and should exit cleanly, not traceback.
+
+        The lock is stubbed out: main() takes the real configured path, and a
+        test that grabs it would contend with a scheduler running on the same
+        machine. Whether it takes the lock at all is covered separately.
+        """
         import asyncio
 
-        async def boom(_config):
+        original_lock = oracle_main_module.ProcessLock
+        oracle_main_module.ProcessLock = lambda _path: _NullLock()
+        self.addCleanup(setattr, oracle_main_module, "ProcessLock", original_lock)
+
+        async def boom(_config, **_kwargs):
             raise RuntimeError("RPC down")
 
-        oracle_main_module.run_oracle_report = boom
+        oracle_main_module.run_oracle_update = boom
 
         asyncio.run(oracle_main_module.main())
 
@@ -545,7 +684,7 @@ class TestRetryBackoff(unittest.TestCase):
             raise RuntimeError("RPC exploded")
 
         self.scheduler.task_ascend = failing
-        for task in ("rebalance", "oracle_report", "handle_epoch"):
+        for task in ("rebalance", "oracle_update", "handle_epoch"):
             setattr(self.scheduler, "task_" + task, lambda: None)
         self.scheduler.last_run["ascend"] = 0
 
@@ -599,6 +738,316 @@ class TestRetryBackoff(unittest.TestCase):
 
         self.assertEqual(delays, sorted(delays))
         self.assertLess(delays[0], delays[-1])
+
+
+class TestOracleFollowsAscend(unittest.TestCase):
+    """The oracle owes a write whenever ascend has run since it last did.
+
+    Distributing rewards is the only thing that moves the share price, so
+    between ascend and the write that follows it the oracle is knowingly wrong:
+    rebalance refuses against it, and deposits and withdrawals price against the
+    stale figure. Sharing an interval is not enough, because the two drift apart
+    exactly when it matters.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "state.json")
+        self.clock = FakeClock(100 * DAY)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _scheduler(self, saved=None):
+        if saved is not None:
+            with open(self.path, "w") as handle:
+                json.dump(saved, handle)
+        # sleep is the fake one: run_cycle waits out the post-ascend settling
+        # gap, and a real sleep here makes the suite take a minute per test.
+        return make_scheduler(
+            make_config(),
+            now=self.clock.time,
+            sleep=self.clock.sleep,
+            state_path=self.path,
+        )
+
+    def test_a_renamed_task_still_catches_up(self):
+        """The deployment case. The saved schedule knows `oracle_report`, which
+        no longer exists, so `oracle_update` is seeded to now and looks fresher
+        than an ascend that last ran days ago -- the task that most needs to
+        catch up is the one that looks newest."""
+        scheduler = self._scheduler(
+            {
+                "ascend": 100 * DAY - 3 * DAY,
+                "oracle_report": 100 * DAY - 2 * DAY,
+                "rebalance": 100 * DAY,
+                "handle_epoch": 100 * DAY,
+            }
+        )
+
+        self.assertFalse(
+            is_due(scheduler.last_run["oracle_update"], self.clock.time(), DAY),
+            "seeded to now, so the interval alone would not run it",
+        )
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+
+    def test_a_stale_oracle_after_ascend_runs_is_owed(self):
+        scheduler = self._scheduler(
+            {"ascend": 100 * DAY - DAY, "oracle_update": 100 * DAY - DAY}
+        )
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+        scheduler.last_run["ascend"] = self.clock.time()
+
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+
+    def test_an_oracle_newer_than_ascend_owes_nothing(self):
+        """Steady state. The rule must cost nothing when they are in step, or it
+        would force a write every cycle."""
+        scheduler = self._scheduler(
+            {"ascend": 100 * DAY - DAY, "oracle_update": 100 * DAY - DAY + 60}
+        )
+
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+    def test_a_first_ever_start_owes_nothing(self):
+        """No saved file at all: neither has run, so neither is behind."""
+        scheduler = self._scheduler()
+
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+    def test_a_task_with_no_dependency_is_unaffected(self):
+        scheduler = self._scheduler({"ascend": 100 * DAY - DAY})
+
+        for task in ("ascend", "rebalance", "handle_epoch"):
+            self.assertFalse(scheduler.owes_dependency(task))
+
+    def test_the_rule_runs_the_task_in_the_same_cycle(self):
+        """End to end through run_cycle, and before rebalance reads the value."""
+        scheduler = self._scheduler(
+            {
+                "ascend": 100 * DAY - 3 * DAY,
+                "oracle_report": 100 * DAY - 2 * DAY,
+                "rebalance": 100 * DAY - DAY,
+                "handle_epoch": 100 * DAY - DAY,
+            }
+        )
+        ran = []
+        for task in TASK_ORDER:
+            setattr(scheduler, "task_" + task, (lambda t: lambda: ran.append(t))(task))
+
+        scheduler.run_cycle()
+
+        self.assertIn("oracle_update", ran)
+        self.assertLess(ran.index("oracle_update"), ran.index("rebalance"))
+
+    def test_a_pending_retry_still_wins(self):
+        """A failing oracle must not be hammered once per cycle by the rule."""
+        scheduler = self._scheduler(
+            {"ascend": 100 * DAY - 3 * DAY, "oracle_report": 100 * DAY - 2 * DAY}
+        )
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+        scheduler.retry_after["oracle_update"] = self.clock.time() + HOUR
+
+        ran = []
+        for task in TASK_ORDER:
+            setattr(scheduler, "task_" + task, (lambda t: lambda: ran.append(t))(task))
+
+        scheduler.run_cycle()
+
+        self.assertNotIn("oracle_update", ran)
+
+
+class TestTheHeartbeatKeepsItsInterval(unittest.TestCase):
+    """Regression for a write every loop instead of every eight hours.
+
+    The set of tasks we have a run record for was seeded from the saved
+    schedule and never added to, so a task missing from that file was
+    permanently "owed" by the dependency rule and the interval never got a say.
+    Every one of these drives more than one cycle: the whole class of bug is
+    invisible to a test that runs a single cycle, and until this file none did.
+    """
+
+    #: What the pre-PR scheduler wrote. `oracle_report` no longer exists, so
+    #: loading it leaves oracle_update with no record while ascend has one --
+    #: the shape every real upgrade of this bot starts from.
+    PRE_RENAME = {
+        "ascend": 100 * DAY - 3 * DAY,
+        "rebalance": 100 * DAY - HOUR,
+        "oracle_report": 100 * DAY - 2 * DAY,
+        "handle_epoch": 100 * DAY - 300,
+    }
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "state.json")
+        self.clock = FakeClock(100 * DAY)
+        self.calls = []
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _scheduler(self, saved, acted=True):
+        with open(self.path, "w") as handle:
+            json.dump(saved, handle)
+        scheduler = make_scheduler(
+            make_config(
+                task_intervals={
+                    "ascend": DAY,
+                    "rebalance": 7200,
+                    "oracle_update": DAY,
+                    "handle_epoch": 300,
+                },
+                post_ascend_gap_seconds=0,
+                loop_sleep_seconds=300,
+            ),
+            now=self.clock.time,
+            sleep=self.clock.sleep,
+            state_path=self.path,
+        )
+        scheduler.notify = lambda _text: None
+        for task in ("ascend", "rebalance", "handle_epoch"):
+            setattr(scheduler, "task_" + task, lambda: None)
+
+        def oracle():
+            self.calls.append(self.clock.time())
+            return acted
+
+        scheduler.task_oracle_update = oracle
+        return scheduler
+
+    def _drive(self, scheduler, cycles):
+        for _ in range(cycles):
+            scheduler.run_cycle()
+            self.clock.advance(300)
+
+    def test_it_catches_up_once_and_then_holds_its_interval(self):
+        scheduler = self._scheduler(self.PRE_RENAME)
+
+        self._drive(scheduler, 12)  # an hour of loops
+
+        self.assertEqual(
+            len(self.calls),
+            1,
+            "caught up once, then every loop -- the interval never applied",
+        )
+
+    def test_a_completed_run_is_recorded_so_the_catch_up_is_one_shot(self):
+        scheduler = self._scheduler(self.PRE_RENAME)
+
+        self._drive(scheduler, 2)
+
+        self.assertIn("oracle_update", scheduler._has_record)
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+    def test_it_still_runs_again_when_the_interval_comes_round(self):
+        """The fix must not turn the catch-up into a task that never fires."""
+        scheduler = self._scheduler(self.PRE_RENAME)
+
+        self._drive(scheduler, 2)
+        self.clock.advance(DAY)
+        self._drive(scheduler, 1)
+
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_declined_run_is_not_recorded_and_retries(self):
+        """A skip must not be credited as a run.
+
+        Recording it moves last_run past ascend's, marks the dependency paid,
+        and leaves the distribution ascend just made unpriced until the next
+        boundary -- with rebalancing refusing throughout.
+        """
+        scheduler = self._scheduler(self.PRE_RENAME, acted=False)
+
+        self._drive(scheduler, 6)
+
+        self.assertEqual(len(self.calls), 6, "it must keep trying")
+        self.assertNotIn("oracle_update", scheduler._has_record)
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+
+    def test_it_writes_as_soon_as_the_blocker_clears(self):
+        scheduler = self._scheduler(self.PRE_RENAME, acted=False)
+        self._drive(scheduler, 3)
+
+        def oracle_now_acts():
+            self.calls.append(self.clock.time())
+            return True
+
+        scheduler.task_oracle_update = oracle_now_acts
+        self._drive(scheduler, 1)
+        before = len(self.calls)
+        self._drive(scheduler, 6)
+
+        self.assertEqual(len(self.calls), before, "and then goes quiet again")
+        self.assertIn("oracle_update", scheduler._has_record)
+
+
+class TestSkipAlertsMeasureTime(unittest.TestCase):
+    """Counting attempts made the threshold mean whatever loop_sleep was.
+
+    With a retry every loop, three attempts is fifteen minutes where the
+    threshold was meant to express a much longer patience.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = FakeClock(100 * DAY)
+        self.alerts = []
+        self.scheduler = make_scheduler(
+            make_config(loop_sleep_seconds=300),
+            now=self.clock.time,
+            sleep=self.clock.sleep,
+            state_path=os.path.join(self.directory.name, "state.json"),
+        )
+        self.scheduler.notify = self.alerts.append
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_frequent_retries_do_not_bring_the_alert_forward(self):
+        for _ in range(5):  # 25 minutes of five-minute retries
+            self.scheduler.record_skip("oracle_update", "transfer in flight")
+            self.clock.advance(300)
+
+        self.assertEqual(self.alerts, [], "under the half-hour fuse")
+
+    def test_it_alerts_once_the_run_has_lasted_long_enough(self):
+        for _ in range(8):  # 40 minutes
+            self.scheduler.record_skip("oracle_update", "transfer in flight")
+            self.clock.advance(300)
+
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("unable to act", self.alerts[0])
+
+    def test_it_repeats_rather_than_alerting_once(self):
+        for _ in range(24):  # two hours
+            self.scheduler.record_skip("oracle_update", "transfer in flight")
+            self.clock.advance(300)
+
+        self.assertEqual(
+            len(self.alerts), 3, "one per half hour, the fourth not yet due"
+        )
+
+    def test_acting_clears_the_run(self):
+        for _ in range(8):
+            self.scheduler.record_skip("oracle_update", "transfer in flight")
+            self.clock.advance(300)
+        self.scheduler.clear_skips("oracle_update")
+        self.alerts.clear()
+
+        for _ in range(5):
+            self.scheduler.record_skip("oracle_update", "transfer in flight")
+            self.clock.advance(300)
+
+        self.assertEqual(self.alerts, [], "the window restarts from zero")
+
+    def test_rebalance_keeps_its_original_patience(self):
+        """Its threshold was three scheduled runs; changing the oracle's fuse
+        must not shorten a task that legitimately declines for hours."""
+        self.assertEqual(
+            self.scheduler.skip_alert_after("rebalance"),
+            3 * 7200,
+        )
 
 
 if __name__ == "__main__":

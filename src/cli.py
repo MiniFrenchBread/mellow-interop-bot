@@ -101,15 +101,53 @@ def cmd_handle_epoch(config: Config, args) -> None:
 
 
 def cmd_oracle(config: Config, args) -> None:
-    from main import run_oracle_report
+    from main import run_oracle_update
 
     # The raising variant, so a failure leaves a non-zero exit status. Delivery
-    # failures do not raise -- they would make the scheduler retry and propose
-    # again -- so they are surfaced here instead, where a person is watching.
-    if not asyncio.run(run_oracle_report(config)):
+    # failures do not raise in the scheduler -- a retry would only repeat the
+    # announcement -- so they are surfaced here instead, where a person is
+    # watching.
+    summary = asyncio.run(
+        run_oracle_update(
+            config,
+            force=args.force,
+            dry_run=args.dry_run,
+            source_name=args.source,
+        )
+    )
+    if not args.dry_run and not summary.written:
+        # A person ran this and nothing reached the chain -- a guard refused, or
+        # a transfer was in flight. Exiting zero would report that as done.
         raise Exception(
-            "Oracle report ran but could not notify anyone; check the Telegram "
-            "token, the group id, and that the bot is still in the group"
+            "The oracle was not written; see the output above for which guard "
+            "refused or what blocked it"
+        )
+    if not summary.notified:
+        raise Exception(
+            "The oracle run needs attention but could not notify anyone; check "
+            "the Telegram token, the group id, and that the bot is still in the "
+            "group"
+        )
+
+
+def cmd_oracle_propose(config: Config, args) -> None:
+    from main import run_oracle_propose
+
+    # The recovery path for a guard that refused. It signs off chain and posts
+    # to the Safe service, so unlike every other write here it takes no nonce
+    # and needs no lock -- see LOCK_FREE below.
+    value = int(args.value) if args.value is not None else None
+    if not asyncio.run(
+        run_oracle_propose(
+            config,
+            value_override=value,
+            dry_run=args.dry_run,
+            source_name=args.source,
+        )
+    ):
+        raise Exception(
+            "The proposal is queued but nobody could be told; send the Safe link "
+            "to the signers by hand"
         )
 
 
@@ -127,13 +165,21 @@ COMMANDS = {
     "ascend": cmd_ascend,
     "handle-epoch": cmd_handle_epoch,
     "oracle": cmd_oracle,
+    "oracle-propose": cmd_oracle_propose,
     "rebalance": cmd_rebalance,
     "validate-config": cmd_validate_config,
 }
 
-# Read-only commands do not need the lock: they sign nothing, so they cannot
+# Commands that do not need the lock: they broadcast nothing, so they cannot
 # collide with the scheduler over a nonce.
-LOCK_FREE = {"validate-config"}
+#
+# oracle-propose belongs here and it matters that it does. It signs a Safe
+# transaction off chain and posts it to the Safe service; the only chain access
+# is reading the Safe's version and nonce. Requiring the lock would mean
+# stopping the scheduler to queue a proposal, and this is the path someone
+# reaches for when the heartbeat has refused to write and the oracle is heading
+# for expiry -- exactly when the rest of the bot should be left running.
+LOCK_FREE = {"validate-config", "oracle-propose"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -173,8 +219,41 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "handle-epoch", help="Advance matured withdrawal epochs", parents=[common]
     )
-    subparsers.add_parser(
-        "oracle", help="Report oracle status and propose updates", parents=[common]
+    oracle = subparsers.add_parser(
+        "oracle", help="Refresh the oracle directly", parents=[common]
+    )
+    oracle.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compute the value and run the guards without broadcasting",
+    )
+    oracle.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Write even if the deviation or decrease guard would refuse. Only "
+            "after checking the reading with --dry-run; prefer oracle-propose, "
+            "which puts the value in front of the Safe signers instead."
+        ),
+    )
+
+    propose = subparsers.add_parser(
+        "oracle-propose",
+        help="Queue an oracle update through the Safe for signers to approve",
+        parents=[common],
+    )
+    propose.add_argument(
+        "--value",
+        default=None,
+        help=(
+            "Value in wei to propose, instead of the computed one. For when a "
+            "guard refused precisely because the computed value looks wrong."
+        ),
+    )
+    propose.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be proposed without posting it to the Safe",
     )
 
     rebalance = subparsers.add_parser(

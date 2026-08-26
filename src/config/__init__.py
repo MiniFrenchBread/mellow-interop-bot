@@ -1,4 +1,11 @@
-from .read_config import read_config, Config, SourceConfig, Deployment, SafeGlobal
+from .read_config import (
+    read_config,
+    Config,
+    SourceConfig,
+    Deployment,
+    SafeGlobal,
+    OracleUpdateConfig,
+)
 from .validate_config import validate_config
 from .mask_sensitive_data import (
     mask_sensitive_data,

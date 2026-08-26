@@ -12,16 +12,15 @@
     "state-file": "${SCHEDULER_STATE_FILE:.scheduler-state.json}",
     "alert-after-failures": "${ALERT_AFTER_FAILURES:3}",
     "tasks": {
-      "ascend": { "interval-seconds": "${ASCEND_INTERVAL_SECONDS:1209600}" },
+      "ascend": { "interval-seconds": "${ASCEND_INTERVAL_SECONDS:28800}" },
       "rebalance": { "interval-seconds": "${REBALANCE_INTERVAL_SECONDS:7200}" },
-      "oracle-report": { "interval-seconds": "${ORACLE_REPORT_INTERVAL_SECONDS:86400}" },
+      "oracle-update": { "interval-seconds": "${ORACLE_UPDATE_INTERVAL_SECONDS:28800}" },
       "handle-epoch": { "interval-seconds": "${HANDLE_EPOCH_INTERVAL_SECONDS:300}" }
     }
   },
   "tx": {
     "target": {
       "receipt-timeout-seconds": "${TARGET_RECEIPT_TIMEOUT:600}",
-      "max-attempts": "${TARGET_TX_MAX_ATTEMPTS:4}",
       "fee-bump-percent": "${TX_FEE_BUMP_PERCENT:115}",
       "fee-cap-gwei": "${TARGET_FEE_CAP_GWEI:4}"
     }
@@ -36,9 +35,8 @@
       "executor-private-key": "${OG_EXECUTOR_PK:${OPERATOR_PK}}",
       "tx": {
         "receipt-timeout-seconds": "${OG_RECEIPT_TIMEOUT:60}",
-        "max-attempts": "${OG_TX_MAX_ATTEMPTS:3}",
         "fee-bump-percent": "${TX_FEE_BUMP_PERCENT:115}",
-        "fee-cap-gwei": "${OG_FEE_CAP_GWEI:4}"
+        "fee-cap-gwei": "${OG_FEE_CAP_GWEI:20}"
       },
       "ascend": {
         "router": "0x4af366C80Eb17F24923fE956Cc21A11A6864B33a",
@@ -52,6 +50,12 @@
         "address": "0x10A98a5344742308744Bd59829786584A12C1146",
         "max-iterations": "${HANDLE_EPOCH_MAX_ITERATIONS:8}"
       },
+      "oracle-update": {
+        "updater-private-key": "${ORACLE_UPDATER_PK}",
+        "max-deviation-bps": "${ORACLE_MAX_DEVIATION_BPS:100}",
+        "decrease-tolerance-wei": "${ORACLE_DECREASE_TOLERANCE_WEI:1000000000}",
+        "min-balance-wei": "${ORACLE_UPDATER_MIN_BALANCE_WEI:100000000000000000}"
+      },
       "deployments": [
         {
           "name": "OG",
@@ -62,6 +66,7 @@
       "safe-global": {
         "safe-address": "0xfc7350b0d7a358Db58875148faF3bDEAaFC82911",
         "proposer-private-key": "${SAFE_PROPOSER_PK:${SAFE_PROPOSER_PK}}",
+        "api-key": "${SAFE_API_KEY}",
         "api-url": "https://api.safe.global/tx-service/0g",
         "web-client-url": "https://app.safe.global"
       }

@@ -89,5 +89,44 @@ class TestSubstituteEnvVars(unittest.TestCase):
             self.assertEqual(self.rc._substitute_env_vars("prefix-${A"), "prefix-${A")
 
 
+class TestSafeApiKeyIsWired(unittest.TestCase):
+    """SAFE_API_KEY is documented as a working variable; it has to be one.
+
+    config.json had no `api-key` line, so the placeholder substitution had
+    nothing to act on and SafeGlobal.api_key was always None -- the variable was
+    loaded into the environment and then read by nothing. Unauthenticated
+    requests still work against this chain's Safe service, but on a tenth of the
+    quota, and that quota is counted per source IP rather than per key.
+    """
+
+    CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.json")
+
+    def setUp(self):
+        self.rc = load_read_config_module()
+        self._previous = os.environ.get("SAFE_API_KEY")
+
+    def tearDown(self):
+        if self._previous is None:
+            os.environ.pop("SAFE_API_KEY", None)
+        else:
+            os.environ["SAFE_API_KEY"] = self._previous
+
+    def test_the_env_var_reaches_the_safe_config(self):
+        os.environ["SAFE_API_KEY"] = "sentinel-key"
+
+        config = self.rc.read_config(self.CONFIG_PATH)
+
+        self.assertEqual(config.sources[0].safe_global.api_key, "sentinel-key")
+
+    def test_an_unset_key_stays_falsy(self):
+        """_headers() omits Authorization on anything falsy, so an empty string
+        has to behave the same as never having configured one."""
+        os.environ.pop("SAFE_API_KEY", None)
+
+        config = self.rc.read_config(self.CONFIG_PATH)
+
+        self.assertFalse(config.sources[0].safe_global.api_key)
+
+
 if __name__ == "__main__":
     unittest.main()
