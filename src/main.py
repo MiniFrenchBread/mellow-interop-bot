@@ -104,10 +104,10 @@ async def main() -> int:
     systemd, cron or any other supervisor as a success.
 
     Takes the same lock as the scheduler and the CLI, for the same reason: this
-    signs and sends. Without it a stray manual run alongside the scheduler has
-    two processes reading the same account's nonce independently, and
-    tx._unreconciled is per-process, so nothing stops them replacing each
-    other's transactions or writing values computed from different snapshots.
+    signs and sends. A send runs until the chain settles it, which keeps two
+    operations in one process off the same nonce -- but two processes read the
+    account's nonce independently, and nothing in either of them can see the
+    other. The lock is what covers that.
     """
     config = None
     try:
@@ -131,6 +131,7 @@ async def run_oracle_update(
     force: bool = False,
     dry_run: bool = False,
     source_name: Optional[str] = None,
+    should_stop=None,
 ) -> OracleRunSummary:
     """Refresh every oracle, and tell someone only when a person is needed.
 
@@ -164,7 +165,11 @@ async def run_oracle_update(
         )
 
     results, errors = update_oracles(
-        config, force=force, dry_run=dry_run, source_name=source_name
+        config,
+        force=force,
+        dry_run=dry_run,
+        source_name=source_name,
+        should_stop=should_stop,
     )
 
     if not results:
@@ -178,13 +183,10 @@ async def run_oracle_update(
         # counter and keep the alert from ever arming.
         #
         # The original exception is re-raised when there is only one, rather
-        # than a summary of it. Its type is load-bearing: the scheduler declines
-        # to count NonceBlocked against the task and declines to alert on it,
-        # because another operation holding the nonce is neither this task's
-        # fault nor an outage -- and a generic wrapper makes that branch
-        # unreachable. Its text is load-bearing too: "nonce held", "RPC
-        # unreachable" and "Oracle: forbidden" need different responses, and the
-        # alert is the only place an operator sees which one happened.
+        # than a summary of it. Its text is what an operator acts on: "RPC
+        # unreachable", "Oracle: forbidden" and "reverted on chain" call for
+        # different responses, and the alert is the only place they see which
+        # one happened -- stdout is exactly what they do not have.
         if len(errors) == 1:
             raise errors[0]
         raise Exception(
@@ -209,8 +211,12 @@ async def run_oracle_update(
         ),
     )
 
+    # A deployment that failed outright counts too. Only alerts were considered
+    # here while compose_oracle_update_message renders a line for both, so with
+    # Telegram unconfigured a run where one deployment failed and another wrote
+    # cleanly reported as a plain success.
     needs_attention_from = [
-        result for _, result in results if result is not None and result.alerts
+        result for _, result in results if result is None or result.alerts
     ]
 
     message = compose_oracle_update_message(config, results)
@@ -224,7 +230,11 @@ async def run_oracle_update(
             print_colored(
                 "The oracle needs attention and Telegram is not configured:\n"
                 + "\n".join(
-                    "- {}: {}".format(result.name, result.alert)
+                    (
+                        "- {}: {}".format(result.name, result.alert)
+                        if result is not None
+                        else "- a deployment could not be updated (see the logs)"
+                    )
                     for result in needs_attention_from
                 ),
                 "red",
@@ -241,6 +251,14 @@ async def run_oracle_update(
                 or "none written"
             )
         )
+        return summary
+
+    if dry_run:
+        # A dry run must broadcast nothing, and that includes to the group. The
+        # alert it would send names the guard refusal and @s the signers, and
+        # its own text tells the reader to run this very command -- so every
+        # check would re-page everyone.
+        print_colored("Would send:\n" + message, "yellow")
         return summary
 
     ok, _sent = await _best_effort(
@@ -266,6 +284,7 @@ def update_oracles(
     force: bool = False,
     dry_run: bool = False,
     source_name: Optional[str] = None,
+    should_stop=None,
 ) -> Tuple[List[Tuple[SourceConfig, Optional[OracleUpdateResult]]], List[Exception]]:
     """Run the heartbeat for every deployment, isolating per-deployment failures.
 
@@ -273,11 +292,10 @@ def update_oracles(
     It is kept in the list rather than dropped so the caller can tell "every one
     failed" -- an outage -- from "some succeeded".
 
-    The exceptions come back alongside, because their type and their text both
-    carry information the caller needs and a fresh generic exception destroys:
-    the scheduler treats NonceBlocked differently from an outage, and the alert
-    that reaches a phone is the only description of the failure an operator gets
-    -- stdout is exactly what they do not have.
+    The exceptions come back alongside, because their text is information a
+    fresh generic exception destroys: the alert that reaches a phone is the only
+    description of the failure an operator gets, and stdout is exactly what they
+    do not have.
     """
     results: List[Tuple[SourceConfig, Optional[OracleUpdateResult]]] = []
     errors: List[Exception] = []
@@ -293,6 +311,7 @@ def update_oracles(
                     oracle_expiry_threshold_seconds=config.oracle_expiry_threshold_seconds,
                     force=force,
                     dry_run=dry_run,
+                    tx=_tx_options(source, should_stop),
                 )
             except Exception as e:
                 errors.append(e)
@@ -886,6 +905,14 @@ def propose_tx_to_update_oracle(
         )
 
     return result
+
+
+def _tx_options(source: SourceConfig, should_stop) -> dict:
+    """Chain settings plus the shutdown hook, in the dict every send reads."""
+    options = source.tx.as_kwargs()
+    if should_stop is not None:
+        options["should_stop"] = should_stop
+    return options
 
 
 def selected_sources(config: Config, source_name: Optional[str]) -> List[SourceConfig]:

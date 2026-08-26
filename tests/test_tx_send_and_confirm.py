@@ -13,7 +13,6 @@ from web3.exceptions import TransactionNotFound
 from web3_scripts import tx as tx_module
 from web3_scripts.tx import (
     NonceAlreadyUsed,
-    NonceBlocked,
     TxNotConfirmed,
     TxReverted,
     is_already_known,
@@ -173,6 +172,22 @@ def only_the_replacement_lands(eth, tx_hash):
     return None
 
 
+def stop_after(attempts: int):
+    """Bound an otherwise unbounded send so a test can inspect N attempts.
+
+    send_and_confirm runs until the chain settles the transaction, so a test
+    whose fake never produces a receipt has to say when to stop -- which is the
+    same hook the scheduler uses for shutdown.
+    """
+    seen = {"n": 0}
+
+    def should_stop() -> bool:
+        seen["n"] += 1
+        return seen["n"] > attempts
+
+    return should_stop
+
+
 class TestErrorClassification(unittest.TestCase):
 
     def test_missing_receipts_is_treated_as_pending(self):
@@ -212,12 +227,6 @@ class TestFeeArithmetic(unittest.TestCase):
         with self.assertRaises(ValueError):
             _create_tx_config({"fee_bump_percent": 100})
 
-    def test_the_config_refuses_zero_attempts(self):
-        from config.read_config import _create_tx_config
-
-        with self.assertRaises(ValueError):
-            _create_tx_config({"max_attempts": 0})
-
 
 class TestPreflightGuards(unittest.TestCase):
     """Refuse before signing rather than after broadcasting."""
@@ -253,12 +262,6 @@ class TestPreflightGuards(unittest.TestCase):
 
 
 class TestSendAndConfirm(unittest.TestCase):
-
-    def setUp(self):
-        tx_module._unreconciled.clear()
-
-    def tearDown(self):
-        tx_module._unreconciled.clear()
 
     def test_survives_receipt_indexing_lag(self):
         """A null result and a missing-receipts error must not end the wait."""
@@ -304,86 +307,6 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(w3.eth.nonce_calls, ["latest"])
 
-    def test_an_rpc_outage_while_polling_keeps_the_hashes(self):
-        """A polling failure says nothing about the transaction.
-
-        Losing the hashes would leave the caller unable to tell a broadcast
-        transaction from one that was never sent.
-        """
-        w3, fn = make(receipt_script=[ConnectionError("All 2 RPC endpoint(s) failed")])
-
-        with self.assertRaises(TxNotConfirmed) as caught:
-            send_and_confirm(
-                fn, 0, TEST_KEY, w3=w3, receipt_timeout=5, poll_latency=0.001
-            )
-
-        self.assertEqual(len(caught.exception.tx_hashes), 1)
-        self.assertIsInstance(caught.exception.__cause__, ConnectionError)
-
-    def test_an_unexpected_send_error_keeps_the_hashes(self):
-        w3, fn = make(
-            receipt_script=[], send_script=[Exception("insufficient funds for gas")]
-        )
-
-        with self.assertRaises(TxNotConfirmed) as caught:
-            send_and_confirm(
-                fn, 0, TEST_KEY, w3=w3, receipt_timeout=1, poll_latency=0.001
-            )
-
-        self.assertEqual(len(caught.exception.tx_hashes), 1)
-
-    def test_the_opening_bid_leaves_room_to_be_replaced(self):
-        """A cap on the opening bid disables the replacement it is meant to bound.
-
-        The suggested tip on a busy chain is routinely a large fraction of the
-        cap, so a first send priced straight at the cap can never be replaced --
-        which is the mechanism that rescues a transaction the network outran.
-        """
-        w3, fn = make(resolver=only_after_replacement)
-        w3.eth.max_priority_fee = Web3.to_wei(2, "gwei")  # x3 exceeds the cap
-
-        outcome = send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=0.01,
-            max_attempts=4,
-            fee_cap_gwei=4,
-            poll_latency=0.001,
-        )
-
-        self.assertEqual(outcome.attempts, 2, "a replacement must be possible")
-        first, second = fn.built[0], fn.built[1]
-        self.assertGreater(
-            second["maxPriorityFeePerGas"], first["maxPriorityFeePerGas"]
-        )
-        self.assertLessEqual(
-            second["maxPriorityFeePerGas"], Web3.to_wei(4, "gwei"), "still capped"
-        )
-
-    def test_every_planned_bump_fits_under_the_cap(self):
-        """The headroom exists so the planned replacements can all be signed."""
-        w3, fn = make(receipt_script=[])
-        w3.eth.max_priority_fee = Web3.to_wei(1, "gwei") // 2
-
-        with self.assertRaises(TxNotConfirmed):
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.01,
-                max_attempts=4,
-                fee_cap_gwei=4,
-                poll_latency=0.001,
-            )
-
-        self.assertEqual(len(fn.built), 4, "all four attempts signed something new")
-        cap = Web3.to_wei(4, "gwei")
-        for transaction in fn.built:
-            self.assertLessEqual(transaction["maxPriorityFeePerGas"], cap)
-
     def test_bumping_stops_once_the_cap_is_reached(self):
         """With the tip already above the cap there is nowhere left to climb."""
         w3, fn = make(receipt_script=[])
@@ -396,7 +319,7 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                max_attempts=4,
+                should_stop=stop_after(4),
                 fee_cap_gwei=4,
                 poll_latency=0.001,
             )
@@ -423,7 +346,7 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                max_attempts=4,
+                should_stop=stop_after(4),
                 fee_cap_gwei=4,
                 poll_latency=0.001,
             )
@@ -443,7 +366,7 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                max_attempts=4,
+                should_stop=stop_after(4),
                 fee_cap_gwei=1,
                 poll_latency=0.001,
             )
@@ -451,30 +374,6 @@ class TestSendAndConfirm(unittest.TestCase):
         cap = Web3.to_wei(1, "gwei")
         for transaction in fn.built:
             self.assertLessEqual(transaction["maxPriorityFeePerGas"], cap)
-
-    def test_the_whole_call_shares_one_time_budget(self):
-        """Attempts that fail instantly must not each buy another full timeout."""
-        import time as _time
-
-        w3, fn = make(
-            receipt_script=[],
-            send_script=[None, Exception(UNDERPRICED), Exception(UNDERPRICED)],
-        )
-
-        started = _time.monotonic()
-        with self.assertRaises(TxNotConfirmed):
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.2,
-                max_attempts=3,
-                poll_latency=0.01,
-            )
-        elapsed = _time.monotonic() - started
-
-        self.assertLess(elapsed, 0.2 * 3 + 0.2)
 
     def test_timeout_replaces_same_nonce_with_a_higher_fee(self):
         w3, fn = make(resolver=only_after_replacement)
@@ -485,7 +384,7 @@ class TestSendAndConfirm(unittest.TestCase):
             TEST_KEY,
             w3=w3,
             receipt_timeout=0.01,
-            max_attempts=2,
+            should_stop=stop_after(2),
             poll_latency=0.001,
         )
 
@@ -513,7 +412,7 @@ class TestSendAndConfirm(unittest.TestCase):
             TEST_KEY,
             w3=w3,
             receipt_timeout=0.01,
-            max_attempts=2,
+            should_stop=stop_after(2),
             poll_latency=0.001,
         )
 
@@ -528,7 +427,7 @@ class TestSendAndConfirm(unittest.TestCase):
             TEST_KEY,
             w3=w3,
             receipt_timeout=0.01,
-            max_attempts=2,
+            should_stop=stop_after(2),
             poll_latency=0.001,
         )
 
@@ -553,33 +452,15 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=1,
-                max_attempts=3,
+                should_stop=stop_after(3),
                 fee_cap_gwei=4,
                 poll_latency=0.01,
             )
         elapsed = _time.monotonic() - started
 
         self.assertEqual(caught.exception.tx_hashes, [])
-        self.assertIn("refused", str(caught.exception))
-        self.assertIn("nothing is live", str(caught.exception).lower())
-        self.assertLess(elapsed, 1, "must not wait out a budget for nothing")
-
-    def test_gives_up_carrying_every_hash(self):
-        w3, fn = make(receipt_script=[])
-
-        with self.assertRaises(TxNotConfirmed) as caught:
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.01,
-                max_attempts=2,
-                poll_latency=0.001,
-            )
-
-        self.assertEqual(caught.exception.nonce, 42)
-        self.assertEqual(len(caught.exception.tx_hashes), 2)
+        self.assertIn("0 transaction(s) may still be in flight", str(caught.exception))
+        self.assertLess(elapsed, 1, "must not wait out a timeout for nothing")
 
     def test_revert_during_estimation_is_not_retried(self):
         w3, fn = make(estimate_error=Exception(REVERTED))
@@ -626,49 +507,6 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(outcome.receipt["status"], 1)
 
-    def test_the_final_sweep_finds_a_receipt_the_attempts_missed(self):
-        """A rejected replacement returns instantly and sends nothing new.
-
-        The attempts can therefore run out in milliseconds while the first
-        broadcast is still live, so the sweep after the loop is what actually
-        finds it. The receipt is withheld until every attempt has been made, so
-        this cannot pass on a receipt found inside the loop.
-        """
-
-        # The first send is accepted and stays live; the second is refused at
-        # the cap, which ends the loop instantly with most of the budget unspent.
-        # The receipt appears only after both sends, so nothing inside the loop
-        # can find it -- only the sweep afterwards.
-        def only_after_the_loop_has_ended(eth, tx_hash):
-            if len(eth.sent) < 2:
-                return None
-            return receipt(tx_hash=tx_hash)
-
-        w3, fn = make(
-            resolver=only_after_the_loop_has_ended,
-            send_script=[None, Exception(UNDERPRICED)],
-        )
-        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
-
-        outcome = send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=0.05,
-            max_attempts=2,
-            fee_cap_gwei=4,
-            poll_latency=0.001,
-        )
-
-        self.assertEqual(outcome.receipt["status"], 1)
-        self.assertEqual(len(w3.eth.sent), 2, "both sends must have been attempted")
-        self.assertEqual(
-            outcome.tx_hashes,
-            [outcome.tx_hash],
-            "the refused hash is dropped; the live one is what the sweep found",
-        )
-
     def test_the_underpriced_path_makes_no_network_call(self):
         """The node just refused a payload; do not go back to it for a fee.
 
@@ -685,7 +523,7 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                max_attempts=4,
+                should_stop=stop_after(4),
                 fee_cap_gwei=4,
                 poll_latency=0.001,
             )
@@ -715,7 +553,7 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                max_attempts=attempts,
+                should_stop=stop_after(attempts),
                 fee_cap_gwei=4,
                 poll_latency=0.001,
             )
@@ -738,134 +576,141 @@ class TestSendAndConfirm(unittest.TestCase):
         self.assertEqual(outcome.receipt["status"], 1)
 
 
-class TestNonceIsNotSharedAcrossOperations(unittest.TestCase):
-    """One account signs everything, so there is one nonce sequence per chain.
+class TestItRunsUntilTheChainDecides(unittest.TestCase):
+    """The rule the rest of the design rests on.
 
-    That is fine while each send waits for its receipt. It stops being fine when
-    a send times out: the transaction sits in the mempool unmined, the count has
-    not advanced, and the next operation would sign something entirely different
-    onto the same nonce -- only one of which can ever mine.
+    A send returns only when the chain has settled the transaction, so a caller
+    always finds the next nonce free and two operations can never contend for
+    one. An earlier version gave up after a fixed number of attempts and needed
+    a guard band to police the nonce it abandoned; these bind the property that
+    removed the need for it.
     """
 
-    def setUp(self):
-        tx_module._unreconciled.clear()
+    def test_it_keeps_replacing_far_past_any_old_attempt_limit(self):
+        """Twenty timeouts, then a receipt. The old bound was three."""
+        w3, fn = make(receipt_script=[None] * 20 + [receipt()])
 
-    def tearDown(self):
-        tx_module._unreconciled.clear()
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.001,
+            # High enough that the cap is not what ends the bumping; this is
+            # about the absence of an attempt limit, not about the ceiling.
+            fee_cap_gwei=10_000,
+            poll_latency=0.001,
+        )
 
-    def strand_a_transaction(self):
-        """Leave a live, unmined transaction on the nonce."""
-        w3, fn = make(receipt_script=[])
+        self.assertEqual(outcome.receipt["status"], 1)
+        self.assertGreater(
+            len(fn.built), 3, "gave up at what used to be the attempt limit"
+        )
+
+    def test_every_replacement_reuses_the_one_nonce(self):
+        """Queueing behind the stuck transaction would make the operation
+        happen twice if the stuck one later mined."""
+        w3, fn = make(receipt_script=[None] * 8 + [receipt()])
+
+        send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.001, poll_latency=0.001
+        )
+
+        self.assertEqual({built["nonce"] for built in fn.built}, {42})
+
+    def test_an_unreachable_node_is_waited_out_rather_than_raised(self):
+        """An RPC outage says nothing about the transaction, and this never
+        gives up, so turning it into an error would only lose track of it."""
+        w3, fn = make(
+            receipt_script=[Exception("connection refused")] * 6 + [receipt()],
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.001, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
+
+    def test_a_broadcast_failure_is_waited_out_too(self):
+        w3, fn = make(
+            send_script=[Exception("connection refused")] * 4,
+            receipt_script=[None] * 4 + [receipt()],
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.001, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
+
+    def test_a_revert_is_settled_and_stops_immediately(self):
+        """The chain decided. Retrying buys nothing and would never end."""
+        w3, fn = make(receipt_script=[receipt(status=0)])
+
+        with self.assertRaises(TxReverted):
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.001, poll_latency=0.001
+            )
+
+    def test_at_the_fee_cap_it_waits_without_resigning(self):
+        """Nothing higher can be offered -- the cap is ours, not the network's
+        -- so re-signing would only rebroadcast a payload the node has."""
+        w3, fn = make(receipt_script=[None] * 30 + [receipt()])
+        w3.eth.max_priority_fee = Web3.to_wei(4, "gwei")
+
+        send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.001,
+            fee_cap_gwei=4,
+            poll_latency=0.001,
+        )
+
+        fees = [built["maxPriorityFeePerGas"] for built in fn.built]
+        self.assertEqual(len(fees), len(set(fees)), "a payload was signed twice")
+        self.assertLessEqual(max(fees), Web3.to_wei(4, "gwei"))
+
+    def test_stopping_is_the_only_way_out_with_a_transaction_in_flight(self):
+        """And it carries every hash, so the next process can find them."""
+        w3, fn = make(receipt_script=[None] * 50)
+
+        with self.assertRaises(TxNotConfirmed) as caught:
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.001,
+                poll_latency=0.001,
+                should_stop=stop_after(3),
+            )
+
+        self.assertTrue(caught.exception.tx_hashes)
+        self.assertEqual(caught.exception.nonce, 42)
+
+    def test_it_stops_promptly_rather_than_finishing_the_wait(self):
+        stopped = {"now": False}
+        w3, fn = make(receipt_script=[None] * 50)
+
+        def should_stop():
+            if fn.built:
+                stopped["now"] = True
+            return stopped["now"]
+
         with self.assertRaises(TxNotConfirmed):
             send_and_confirm(
                 fn,
                 0,
                 TEST_KEY,
                 w3=w3,
-                receipt_timeout=0.01,
-                max_attempts=1,
+                receipt_timeout=0.001,
                 poll_latency=0.001,
-                label="handleEpoch 7",
-            )
-        return w3
-
-    def test_a_different_operation_will_not_sign_onto_it(self):
-        self.strand_a_transaction()
-        w3, fn = make(receipt_script=[receipt()])
-
-        with self.assertRaises(NonceBlocked) as caught:
-            send_and_confirm(
-                fn, 0, TEST_KEY, w3=w3, poll_latency=0.001, label="setValue"
+                should_stop=should_stop,
             )
 
-        self.assertEqual(caught.exception.nonce, 42)
-        self.assertIn("handleEpoch 7", caught.exception.holder)
-        self.assertEqual(w3.eth.sent, [], "and nothing is broadcast")
-
-    def test_the_same_operation_may_replace_its_own(self):
-        """That is what a retry is, and what the 'latest' read exists for."""
-        self.strand_a_transaction()
-        w3, fn = make(receipt_script=[receipt()])
-
-        send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=5,
-            poll_latency=0.001,
-            label="handleEpoch 7",
-        )
-
-        self.assertEqual(len(w3.eth.sent), 1)
-
-    def test_a_mined_transaction_frees_the_nonce(self):
-        self.strand_a_transaction()
-        w3, fn = make(receipt_script=[receipt()])
-        w3.eth.nonce = 43  # the account moved past it
-
-        send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=5,
-            poll_latency=0.001,
-            label="setValue",
-        )
-
-        self.assertEqual(len(w3.eth.sent), 1)
-
-    def test_a_dropped_transaction_frees_the_nonce(self):
-        self.strand_a_transaction()
-        w3, fn = make(receipt_script=[receipt()])
-        w3.eth.known = False  # the node no longer has it
-
-        send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=5,
-            poll_latency=0.001,
-            label="setValue",
-        )
-
-        self.assertEqual(len(w3.eth.sent), 1)
-
-    def test_an_unanswerable_node_does_not_free_the_nonce(self):
-        """A non-answer is not "dropped", and this is when it is likeliest.
-
-        The send that stranded the transaction probably timed out because the
-        RPC was struggling; asking the same endpoint moments later and reading
-        an error as proof of a drop would surrender the protection at exactly
-        the moment it is needed.
-        """
-        self.strand_a_transaction()
-        w3, fn = make(receipt_script=[receipt()])
-        w3.eth.lookup_error = ConnectionError("All 2 RPC endpoint(s) failed")
-
-        with self.assertRaises(NonceBlocked):
-            send_and_confirm(
-                fn, 0, TEST_KEY, w3=w3, poll_latency=0.001, label="setValue"
-            )
-
-        self.assertEqual(w3.eth.sent, [])
-
-    def test_a_confirmed_send_clears_the_record(self):
-        self.strand_a_transaction()
-        w3, fn = make(receipt_script=[receipt()])
-        send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=5,
-            poll_latency=0.001,
-            label="handleEpoch 7",
-        )
-
-        self.assertEqual(tx_module._unreconciled, {})
+        self.assertEqual(len(fn.built), 1, "stopped at the first check after a send")
 
 
 if __name__ == "__main__":

@@ -36,9 +36,8 @@
       "executor-private-key": "${OG_EXECUTOR_PK:${OPERATOR_PK}}",
       "tx": {
         "receipt-timeout-seconds": "${OG_RECEIPT_TIMEOUT:60}",
-        "max-attempts": "${OG_TX_MAX_ATTEMPTS:3}",
         "fee-bump-percent": "${TX_FEE_BUMP_PERCENT:115}",
-        "fee-cap-gwei": "${OG_FEE_CAP_GWEI:4}"
+        "fee-cap-gwei": "${OG_FEE_CAP_GWEI:20}"
       },
       "ascend": {
         "router": "0x4af366C80Eb17F24923fE956Cc21A11A6864B33a",

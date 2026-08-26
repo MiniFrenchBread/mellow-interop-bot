@@ -36,15 +36,11 @@ from eth_account import Account
 
 BPS_DENOMINATOR = 10000
 
-# Constant, and deliberately carrying no value in it. `tx.blocking_transaction`
-# treats a send with the same (chain, sender, label) as a replacement of the one
-# still sitting on that nonce, and a send with a different label as a separate
-# operation that must not reuse it. A heartbeat whose label named its value
-# would therefore look like a new operation every time: the first send that
-# timed out would hold the nonce, and every later tick would raise NonceBlocked
-# instead of replacing it -- the heartbeat would stop, quietly, after one slow
-# transaction. Holding the label constant makes each tick a replacement of the
-# last, carrying the newer value at a higher fee, which is what is wanted.
+# Names the operation in logs and in the fee-bump messages. It carries no
+# value, so a replacement of a slow send reads as the same operation rather
+# than a new one -- useful when reading a log, and nothing more than that: a
+# send now runs until the chain settles it, so no two operations can be
+# in flight on one nonce for a label to have to tell apart.
 SET_VALUE_LABEL = "oracle setValue"
 
 
@@ -145,6 +141,7 @@ def update_oracle(
     oracle_expiry_threshold_seconds: int,
     force: bool = False,
     dry_run: bool = False,
+    tx: dict = None,
 ) -> OracleUpdateResult:
     """Refresh one deployment's oracle, or say why it did not.
 
@@ -228,6 +225,7 @@ def update_oracle(
             _note_expiry(result, oracle_expiry_threshold_seconds)
             return result
 
+    tx_options = tx or source.tx.as_kwargs()
     source_w3 = get_w3(source.rpc)
     oracle = get_contract(source_w3, validation.oracle_address, "Oracle")
     sender = Account.from_key(config.updater_private_key).address
@@ -262,7 +260,7 @@ def update_oracle(
         config.updater_private_key,
         w3=source_w3,
         label=SET_VALUE_LABEL,
-        **source.tx.as_kwargs(),
+        **tx_options,
     )
     result.written = True
     result.tx_hash = outcome.tx_hash

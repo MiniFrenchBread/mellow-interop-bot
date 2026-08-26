@@ -46,7 +46,7 @@ def make_config(executor_key=SOURCE_KEY) -> Config:
             ),
         ),
         executor_private_key=executor_key,
-        tx=TxConfig(receipt_timeout_seconds=60, max_attempts=3, fee_cap_gwei=4),
+        tx=TxConfig(receipt_timeout_seconds=60, fee_cap_gwei=4),
     )
     return Config(
         telegram_bot_api_key="",
@@ -58,7 +58,7 @@ def make_config(executor_key=SOURCE_KEY) -> Config:
         target_rpc="https://target.invalid",
         target_core_helper="0x" + "44" * 20,
         sources=[source],
-        target_tx=TxConfig(receipt_timeout_seconds=600, max_attempts=4, fee_cap_gwei=9),
+        target_tx=TxConfig(receipt_timeout_seconds=600, fee_cap_gwei=9),
     )
 
 
@@ -106,7 +106,6 @@ class TestRebalanceWiring(unittest.TestCase):
         operator_bot.run_all(make_config(), operator_pk=GLOBAL_KEY, interactive=False)
 
         self.assertEqual(self.captured["target_tx"]["receipt_timeout"], 600)
-        self.assertEqual(self.captured["target_tx"]["max_attempts"], 4)
         self.assertEqual(self.captured["target_tx"]["fee_cap_gwei"], 9)
 
     def test_source_chain_settings_reach_the_rebalance(self):
@@ -173,13 +172,11 @@ class TestSettingsReachTheSend(unittest.TestCase):
             0,
             SOURCE_KEY,
             receipt_timeout=600,
-            max_attempts=4,
             fee_bump_percent=125,
             fee_cap_gwei=9,
         )
 
         self.assertEqual(self.captured["receipt_timeout"], 600)
-        self.assertEqual(self.captured["max_attempts"], 4)
         self.assertEqual(self.captured["fee_bump_percent"], 125)
         self.assertEqual(self.captured["fee_cap_gwei"], 9)
 

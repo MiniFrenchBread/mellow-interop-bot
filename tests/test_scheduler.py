@@ -15,7 +15,6 @@ from scheduler import (
     is_due,
     next_due,
 )
-from web3_scripts.tx import NonceBlocked
 import main as oracle_main_module
 
 DAY = 86400
@@ -260,31 +259,21 @@ class TestCycleIsolation(unittest.TestCase):
 
         self.assertEqual(self.scheduler.failures["rebalance"], 0)
 
-    def test_a_blocked_nonce_is_not_counted_against_the_task(self):
-        """Another task left a live transaction on the nonce.
+    def test_a_failure_does_not_reset_the_skip_window(self):
+        """Failing and declining are both "did not act".
 
-        That is neither this task's fault nor an outage, and the task that owns
-        the stuck transaction is the one that will alert about it. Counting it
-        here would raise an alarm naming the wrong task and, with a long-enough
-        block, drown the real one.
+        Clearing one from the other let a task alternate between them forever
+        without either threshold ever arming -- and retrying every cycle makes
+        that a five-minute flip rather than an hours-long one. The window has to
+        measure how long the task has been unable to act, whatever the reason.
         """
-        sent = []
-        self.scheduler.notify = sent.append
-
-        for _ in range(5):
-            self.scheduler.record_failure(
-                "oracle_update", NonceBlocked(42, "handleEpoch 7", ["0xabc"])
-            )
-
-        self.assertEqual(self.scheduler.failures["oracle_update"], 0)
-        self.assertEqual(sent, [])
-
-    def test_a_failure_breaks_a_run_of_skips(self):
-        """ "Skipped three times in a row" has to mean in a row."""
         self.scheduler.record_skip("rebalance", "oracle value is incorrect")
+        started = self.scheduler.skipping_since["rebalance"]
+
         self.scheduler.record_failure("rebalance", RuntimeError("boom"))
 
-        self.assertEqual(self.scheduler.skips["rebalance"], 0)
+        self.assertEqual(self.scheduler.skipping_since["rebalance"], started)
+        self.assertEqual(self.scheduler.skips["rebalance"], 1)
 
     def test_repeated_skips_alert(self):
         """Judged by how long the run has lasted, not how many attempts it took.
@@ -453,6 +442,11 @@ class TestPersistedSchedule(unittest.TestCase):
             now=lambda: boundary - HOUR,
             state_path=self.path,
         )
+        # Recorded as having run, which is what run_cycle does on a completed
+        # task. Only tasks with a real record are persisted -- writing back a
+        # seeded "process start" time would make a task that has never run look
+        # like one that just did.
+        before._has_record.add("oracle_update")
         before._save_state()
 
         after = make_scheduler(
@@ -565,7 +559,7 @@ class TestOracleSkipsAreTracked(unittest.TestCase):
         self.directory.cleanup()
 
     def _returns(self, summary):
-        async def run(_config):
+        async def run(_config, **_kwargs):
             return summary
 
         oracle_main_module.run_oracle_update = run
@@ -635,7 +629,7 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
         self.directory.cleanup()
 
     def test_a_failing_oracle_update_reaches_the_scheduler(self):
-        async def boom(_config):
+        async def boom(_config, **_kwargs):
             raise RuntimeError("RPC down")
 
         oracle_main_module.run_oracle_update = boom
@@ -656,7 +650,7 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
         oracle_main_module.ProcessLock = lambda _path: _NullLock()
         self.addCleanup(setattr, oracle_main_module, "ProcessLock", original_lock)
 
-        async def boom(_config):
+        async def boom(_config, **_kwargs):
             raise RuntimeError("RPC down")
 
         oracle_main_module.run_oracle_update = boom

@@ -24,7 +24,6 @@ from config.read_config import (
 )
 from web3_scripts import deviation_bps, signed_deviation_bps
 from web3_scripts.oracle_script import OracleValidationResult
-from web3_scripts.tx import NonceBlocked
 
 ONE = 10**18
 ORACLE = "0x" + "8f" * 20
@@ -95,11 +94,9 @@ def config(*sources) -> Config:
 class TestTheFailureAlertKeepsItsCause(unittest.TestCase):
     """A generic wrapper threw away both the type and the text.
 
-    The scheduler declines to count NonceBlocked against a task and declines to
-    alert on it, because another operation holding the nonce is neither this
-    task's fault nor an outage -- a wrapper makes that branch unreachable. And
-    the alert is the only description of a failure that reaches a phone; stdout
-    is exactly what an operator does not have.
+    The alert is the only description of a failure that reaches a phone, and
+    stdout is exactly what an operator does not have. "RPC unreachable",
+    "Oracle: forbidden" and "reverted on chain" call for different responses.
     """
 
     def setUp(self):
@@ -113,13 +110,14 @@ class TestTheFailureAlertKeepsItsCause(unittest.TestCase):
         main.update_oracles = lambda _c, **_k: (results, list(errors))
 
     def test_a_lone_failure_is_re_raised_unchanged(self):
-        blocked = NonceBlocked(42, "handleEpoch 7", ["0xabc"])
-        self._fails_with(blocked)
+        """The same object, not a copy: a caller may branch on its type."""
+        original = ValueError("execution reverted: Oracle: forbidden")
+        self._fails_with(original)
 
-        with self.assertRaises(NonceBlocked) as caught:
+        with self.assertRaises(ValueError) as caught:
             asyncio.run(main.run_oracle_update(config()))
 
-        self.assertIs(caught.exception, blocked, "the type is what the scheduler reads")
+        self.assertIs(caught.exception, original)
 
     def test_the_cause_survives_into_the_message(self):
         self._fails_with(Exception("execution reverted: Oracle: forbidden"))
@@ -349,6 +347,85 @@ class TestRefusalIsNotSilentWithoutTelegram(unittest.TestCase):
         summary = asyncio.run(main.run_oracle_update(config()))
 
         self.assertTrue(summary.notified)
+
+
+class TestDryRunBroadcastsNothing(unittest.TestCase):
+    """Including to Telegram.
+
+    A guard refusal returns before the dry-run check inside update_oracle, so
+    the alert was composed and really sent -- naming the refusal, @ing the
+    signers, and telling the reader to run the very command that re-sends it.
+    README promises this broadcasts nothing.
+    """
+
+    def setUp(self):
+        self._update = main.update_oracles
+        self._send = main.send_message
+        self.sent = []
+
+        async def send(_key, _chat, text, **_kwargs):
+            self.sent.append(text)
+            return SimpleNamespace(message_id=1)
+
+        main.send_message = send
+
+        refused = SimpleNamespace(
+            name="OG",
+            written=False,
+            alerts=["refused: would move the value by 10000.00 bps"],
+            alert="refused: would move the value by 10000.00 bps",
+            skip_reason="",
+            new_value=ONE,
+        )
+        main.update_oracles = lambda _c, **_k: ([(source(), refused)], [])
+
+    def tearDown(self):
+        main.update_oracles = self._update
+        main.send_message = self._send
+
+    def _config_with_telegram(self):
+        cfg = config()
+        cfg.telegram_bot_api_key = "token"
+        cfg.telegram_group_chat_id = "-100"
+        cfg.telegram_owner_nicknames = {"alice": "0x" + "aa" * 20}
+        return cfg
+
+    def test_a_dry_run_sends_nothing(self):
+        asyncio.run(main.run_oracle_update(self._config_with_telegram(), dry_run=True))
+
+        self.assertEqual(self.sent, [])
+
+    def test_a_real_run_still_sends(self):
+        asyncio.run(main.run_oracle_update(self._config_with_telegram()))
+
+        self.assertEqual(len(self.sent), 1)
+
+
+class TestAFailedDeploymentIsNotACleanRun(unittest.TestCase):
+    """With Telegram unconfigured, a failure used to report as success.
+
+    compose_oracle_update_message renders a line for a failed deployment, but
+    the check that decides whether anyone needs telling only looked at alerts.
+    """
+
+    def setUp(self):
+        self._update = main.update_oracles
+
+    def tearDown(self):
+        main.update_oracles = self._update
+
+    def test_a_failure_alongside_a_success_is_not_clean(self):
+        written = SimpleNamespace(
+            name="OG", written=True, alerts=[], alert="", skip_reason="", new_value=ONE
+        )
+        main.update_oracles = lambda _c, **_k: (
+            [(source(), None), (source(), written)],
+            [Exception("rpc down")],
+        )
+
+        summary = asyncio.run(main.run_oracle_update(config()))
+
+        self.assertFalse(summary.notified)
 
 
 if __name__ == "__main__":

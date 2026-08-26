@@ -34,7 +34,6 @@ from config.read_config import Config
 from process_lock import LockHeld, ProcessLock, resolve_lock_path
 from telegram_bot import send_message
 from web3_scripts import get_w3, print_colored
-from web3_scripts.tx import NonceBlocked
 from web3_scripts.ascend import run_ascend
 from web3_scripts.operator_bot import run_all as run_rebalance
 from web3_scripts.withdrawal_queue import handle_epochs
@@ -207,10 +206,24 @@ class Scheduler:
     def _save_state(self) -> None:
         # Written to a sibling and renamed: a partial file left by a crash mid
         # write would be read back as corrupt and forfeit the schedule.
+        # Only tasks we have an actual run record for. last_run also holds
+        # seeded "process start" times for tasks that have never run, and
+        # writing those back makes them indistinguishable from real records on
+        # the next start -- which is how _has_record gets a task it should not
+        # have, the dependency debt is silently cleared, and the write-every-loop
+        # bug this distinction exists to prevent comes back after a restart.
+        # handle_epoch runs every five minutes, so the file is rewritten almost
+        # immediately after any start; there is no window in which this is
+        # academic.
+        recorded = {
+            task: when
+            for task, when in self.last_run.items()
+            if task in self._has_record
+        }
         temporary = self.state_path + ".tmp"
         try:
             with open(temporary, "w") as handle:
-                json.dump(self.last_run, handle)
+                json.dump(recorded, handle)
             os.replace(temporary, self.state_path)
         except OSError as e:
             print_colored("Could not persist the schedule: {}".format(e), "yellow")
@@ -228,17 +241,12 @@ class Scheduler:
             print_colored("Could not send Telegram alert: {}".format(e), "yellow")
 
     def record_failure(self, task: str, error: Exception) -> None:
-        if isinstance(error, NonceBlocked):
-            # Not this task's fault and not an outage: another task left a live
-            # transaction on the nonce. Say so, because otherwise it reads
-            # exactly like the RPC being down, and back off without counting it
-            # against this task -- it will run as soon as the nonce frees.
-            print_colored("[{}] {}".format(task, error), "yellow")
-            return
         self.failures[task] += 1
-        # A failure breaks a run of skips: the elapsed-time window should
-        # measure one uninterrupted run of declining to act.
-        self.clear_skips(task)
+        # The skip window is deliberately left alone. Failing and declining are
+        # both "did not write", and clearing one from the other lets a task
+        # alternate between them forever without either threshold arming --
+        # which retrying every cycle makes a five-minute flip rather than an
+        # eight-hour one.
         message = mask_all_sensitive_config_data(str(error), self.config)
         # Backticks would close the code fence below and Telegram would reject
         # the message, dropping the alert precisely when the error is unusual.
@@ -337,7 +345,7 @@ class Scheduler:
                 rewarders=list(source.ascend.rewarders),
                 private_key=source.executor_private_key,
                 claim_account=source.ascend.resolved_claim_account(),
-                tx=source.tx.as_kwargs(),
+                tx=self.tx_options(source.tx),
             )
 
     def task_rebalance(self) -> None:
@@ -345,7 +353,13 @@ class Scheduler:
         # the environment cannot make an unattended run pull the entire target
         # position back every two hours.
         results = (
-            run_rebalance(self.config, interactive=False, force_withdrawal=False) or []
+            run_rebalance(
+                self.config,
+                interactive=False,
+                force_withdrawal=False,
+                should_stop=lambda: self.stopping,
+            )
+            or []
         )
         reasons = [reason for _, reason in results if reason]
         if reasons and len(reasons) == len(results):
@@ -364,7 +378,9 @@ class Scheduler:
 
         # The raising variant, not main(): main() swallows everything so the
         # scheduler could never see this task fail.
-        summary = asyncio.run(run_oracle_update(self.config))
+        summary = asyncio.run(
+            run_oracle_update(self.config, should_stop=lambda: self.stopping)
+        )
 
         if not summary.notified:
             # Not raised: the write already happened, so a retry would only
@@ -408,8 +424,22 @@ class Scheduler:
                 address=source.withdrawal_queue.address,
                 private_key=source.executor_private_key,
                 max_iterations=source.withdrawal_queue.max_iterations,
-                tx=source.tx.as_kwargs(),
+                tx=self.tx_options(source.tx),
             )
+
+    def tx_options(self, tx_config) -> dict:
+        """Transaction settings plus the shutdown hook, for every send.
+
+        Threaded through the same dict the settings already travel in, because
+        that dict is what reaches every call site. A send now runs until the
+        chain settles the transaction, so this hook is the only thing that can
+        interrupt one -- a send site that did not get it would make the process
+        unstoppable while a transaction is stuck, which is precisely the risk
+        that unbounded persistence introduces.
+        """
+        options = tx_config.as_kwargs()
+        options["should_stop"] = lambda: self.stopping
+        return options
 
     def owes_dependency(self, task: str) -> bool:
         """Whether the task this one depends on has run more recently than it.

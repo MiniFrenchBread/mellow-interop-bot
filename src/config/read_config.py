@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 # competition and routinely takes several minutes, which is why the previous
 # two-minute wait kept abandoning transactions that were merely slow.
 DEFAULT_RECEIPT_TIMEOUT_SECONDS = 180
-DEFAULT_TX_MAX_ATTEMPTS = 3
 DEFAULT_TX_FEE_BUMP_PERCENT = 115
 DEFAULT_TX_FEE_CAP_GWEI = 4
 
@@ -57,8 +56,10 @@ DEFAULT_ORACLE_MIN_BALANCE_WEI = 10**17
 
 @dataclass(frozen=True)
 class TxConfig:
+    # How long to wait before raising the fee and re-signing, not a budget for
+    # the send: a send runs until the chain settles it. There is deliberately no
+    # attempt limit -- the fee cap is the only ceiling.
     receipt_timeout_seconds: float = DEFAULT_RECEIPT_TIMEOUT_SECONDS
-    max_attempts: int = DEFAULT_TX_MAX_ATTEMPTS
     fee_bump_percent: int = DEFAULT_TX_FEE_BUMP_PERCENT
     fee_cap_gwei: int = DEFAULT_TX_FEE_CAP_GWEI
 
@@ -67,7 +68,6 @@ class TxConfig:
         setting here cannot leave a call site silently using the default."""
         return {
             "receipt_timeout": self.receipt_timeout_seconds,
-            "max_attempts": self.max_attempts,
             "fee_bump_percent": self.fee_bump_percent,
             "fee_cap_gwei": self.fee_cap_gwei,
         }
@@ -446,9 +446,6 @@ def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
     return TxConfig(
         receipt_timeout_seconds=float(
             tx_dict.get("receipt_timeout_seconds", DEFAULT_RECEIPT_TIMEOUT_SECONDS)
-        ),
-        max_attempts=_at_least(
-            "max-attempts", tx_dict.get("max_attempts", DEFAULT_TX_MAX_ATTEMPTS), 1
         ),
         # Above 100 or a replacement cannot clear the node's minimum premium
         # and every attempt after the first is refused.

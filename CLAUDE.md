@@ -150,7 +150,7 @@ so a default there would enter public history.
 | `DRY_RUN` | Skip Telegram messages | false |
 | `OPERATOR_PK` | Signs every transaction: rebalancing, ascend claims, epoch advances | (required) |
 | `OG_EXECUTOR_PK` | Overrides `OPERATOR_PK` for the OG source, signing **both** legs of its rebalance — the target-chain calls included | `OPERATOR_PK` |
-| `OG_RECEIPT_TIMEOUT` / `TARGET_RECEIPT_TIMEOUT` | Seconds to wait for a receipt before replacing the transaction at a higher fee | 60 / 600 |
+| `OG_RECEIPT_TIMEOUT` / `TARGET_RECEIPT_TIMEOUT` | Seconds to wait before raising the fee and re-signing. Not a budget: a send runs until the chain settles it | 60 / 600 |
 | `ASCEND_INTERVAL_SECONDS` / `REBALANCE_INTERVAL_SECONDS` / `ORACLE_UPDATE_INTERVAL_SECONDS` / `HANDLE_EPOCH_INTERVAL_SECONDS` | Task intervals. Keep ascend **≤** oracle-update, or most writes record a value nothing has changed | 28800 / 7200 / 28800 / 300 |
 | `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
@@ -215,5 +215,19 @@ proposers for one Safe.
   A receipt lookup can legitimately fail for a mined transaction while the node is still indexing the
   block; a broadcast can raise after the node accepted the payload. A timeout replaces the transaction
   at a higher fee under the same nonce, and every hash sent for that nonce stays in the poll set.
+- **A send does not return until the chain has decided** -- a receipt (mined, or mined and reverted)
+  or the nonce consumed by something else. There is no attempt limit and no time budget; the fee cap
+  is the only ceiling, and once it is reached the send stops signing and waits, because the cap is
+  ours rather than the network's so nothing higher can ever be offered. An unreachable node is a
+  reason to wait, not to stop.
+  Everything follows from that: a caller always finds the next nonce free, so two operations in one
+  process cannot contend for one, and there is no bookkeeping about abandoned nonces. An earlier
+  version gave up after a fixed number of attempts and needed a guard band (`NonceBlocked` and a
+  per-process record of transactions left in flight) to stop the next operation signing onto the
+  nonce; not abandoning it removed the problem rather than policing it, along with about 150 lines.
+- `should_stop` is the only way out with a transaction still in flight, and it exists so SIGTERM
+  still works. It travels in the same dict as the transaction settings, because that dict is what
+  reaches every send site -- a call site that missed it would make the process unstoppable while a
+  transaction is stuck.
 - Multi-send is used automatically when multiple oracle updates are needed for the same Safe address.
 - Error messages are sanitized to mask RPC URLs, private keys, and API keys before logging or sending to Telegram.

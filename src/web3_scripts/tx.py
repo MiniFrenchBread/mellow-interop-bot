@@ -6,6 +6,12 @@ call raised. Those two things diverge constantly in practice -- a broadcast can
 raise after the node accepted the transaction, and a broadcast can succeed for a
 transaction that is later dropped from the mempool -- and treating the broadcast
 result as the answer loses transactions in both directions.
+
+From that follows the second rule: a send does not return until the chain has
+decided. There is no attempt limit and no time budget -- only the fee cap
+bounds what can be offered. A caller therefore always finds the next nonce
+free, so two operations cannot contend for one, and none of the bookkeeping
+that used to police abandoned nonces needs to exist.
 """
 
 import time
@@ -17,17 +23,10 @@ from web3 import Web3
 from web3.exceptions import TransactionIndexingInProgress, TransactionNotFound
 
 DEFAULT_RECEIPT_TIMEOUT = 180
-DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_FEE_BUMP_PERCENT = 115
 DEFAULT_FEE_CAP_GWEI = 4
 DEFAULT_POLL_LATENCY = 0.5
 
-# What each chain's next free nonce is still owed, when a send ended without a
-# receipt. Module state rather than something threaded through every caller,
-# which is safe for the one reason that also makes the "latest" nonce read safe:
-# a single-holder lock and a strictly sequential task loop mean one sender at a
-# time in one process. If either ever changes, this has to change with it.
-_unreconciled = {}
 GAS_BUFFER_PERCENT = 105
 BASE_FEE_BUFFER_PERCENT = 105
 PRIORITY_FEE_MULTIPLIER = 3
@@ -85,34 +84,6 @@ class TxNotConfirmed(Exception):
         self.nonce = nonce
 
 
-class NonceBlocked(Exception):
-    """A different operation left a live transaction on the next free nonce.
-
-    One account signs everything this bot sends, so there is a single nonce
-    sequence per chain and every operation draws from it. That is fine while
-    each send waits for its receipt: the count advances before the next one
-    reads it. It stops being fine when a send times out -- the transaction is
-    still in the mempool, unmined, so the count has not advanced, and the next
-    operation would sign something entirely different onto the same nonce. Only
-    one of the two can ever mine, and the loser is evicted silently.
-
-    Reusing a nonce is right when it is the *same* operation trying again: that
-    is a replacement, and it is what the "latest" read exists for. It is wrong
-    across operations, and this is where the difference is enforced.
-    """
-
-    def __init__(self, nonce: int, holder: str, tx_hashes: List[str]):
-        super().__init__(
-            "Nonce {} still holds a live transaction from {}; not signing a "
-            "different operation onto it. Hashes: {}".format(
-                nonce, holder, ", ".join(tx_hashes)
-            )
-        )
-        self.nonce = nonce
-        self.holder = holder
-        self.tx_hashes = list(tx_hashes)
-
-
 class NonceAlreadyUsed(Exception):
     """The nonce is taken and no receipt for our own attempts turned up.
 
@@ -145,69 +116,6 @@ def _log(text: str, color: str = "yellow") -> None:
         from base import print_colored
 
     print_colored(text, color)
-
-
-def _still_in_flight(w3: Web3, tx_hash: str) -> bool:
-    """Whether the node still knows this transaction.
-
-    Only a node that answers "I do not have it" frees the nonce. Any other
-    error is no answer at all, and is treated as still in flight -- the safe
-    direction, because the alternative evicts a transaction that may well be
-    about to mine.
-
-    That distinction matters more than it looks: the send that left this hash
-    behind most likely timed out *because* the RPC was struggling, so asking the
-    same endpoint moments later is exactly when a non-answer is likeliest. A
-    blanket "no answer means dropped" would surrender the protection precisely
-    when it is needed. Nothing wedges as a result -- the nonce also frees once
-    the account moves past it, and while the RPC is down nothing can be sent
-    anyway.
-    """
-    try:
-        return w3.eth.get_transaction(tx_hash) is not None
-    except TransactionNotFound:
-        return False
-    except Exception as e:
-        _log("Could not tell whether {} is still pending: {}".format(tx_hash, e))
-        return True
-
-
-def record_unreconciled(w3: Web3, sender: str, nonce: int, label: str, tx_hashes):
-    _unreconciled[(w3.eth.chain_id, sender)] = {
-        "nonce": nonce,
-        "label": label,
-        "hashes": list(tx_hashes),
-    }
-
-
-def clear_unreconciled(w3: Web3, sender: str) -> None:
-    _unreconciled.pop((w3.eth.chain_id, sender), None)
-
-
-def blocking_transaction(w3: Web3, sender: str, label: str, nonce: int):
-    """The entry standing in this send's way, or None.
-
-    Resolved rather than assumed: the nonce is free once the account has moved
-    past it, or once every hash recorded for it has left the node.
-    """
-    key = (w3.eth.chain_id, sender)
-    entry = _unreconciled.get(key)
-    if entry is None:
-        return None
-    if entry["nonce"] != nonce:
-        # The account has moved past it, so whatever was recorded has settled
-        # one way or the other.
-        _unreconciled.pop(key, None)
-        return None
-    if entry["label"] == label:
-        # The same operation trying again. Reusing the nonce is the replacement
-        # this module is built around.
-        return None
-    if any(_still_in_flight(w3, tx_hash) for tx_hash in entry["hashes"]):
-        return entry
-    # Every hash has left the node, so the nonce is free again.
-    _unreconciled.pop(key, None)
-    return None
 
 
 def _to_hex(value) -> str:
@@ -297,22 +205,6 @@ def wait_any_receipt(
         if remaining <= 0:
             return None
         time.sleep(min(poll_latency, remaining))
-
-
-def priority_ceiling(w3: Web3, fee_cap_gwei: int, bumps: int, bump_percent: int) -> int:
-    """The most the first attempt may offer and still leave room to be replaced.
-
-    A cap applied directly to the opening bid is self-defeating: the suggested
-    tip on the target chain is routinely a third of the cap or more, so the first
-    send lands on the cap and every replacement is then refused for exceeding it
-    -- disabling, under ordinary conditions, the one mechanism that rescues a
-    transaction the network has priced out. Holding back enough for the planned
-    bumps keeps both the ceiling and the ability to climb to it.
-    """
-    cap = w3.to_wei(fee_cap_gwei, "gwei")
-    for _ in range(max(0, bumps)):
-        cap = cap * 100 // bump_percent
-    return max(1, cap)
 
 
 def compute_fees(
@@ -408,22 +300,45 @@ def send_and_confirm(
     nonce: Optional[int] = None,
     gas: Optional[int] = None,
     receipt_timeout: float = DEFAULT_RECEIPT_TIMEOUT,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     fee_bump_percent: int = DEFAULT_FEE_BUMP_PERCENT,
     fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
     poll_latency: float = DEFAULT_POLL_LATENCY,
     label: str = "",
+    should_stop=None,
 ) -> TxOutcome:
-    """Broadcast one call and return only once a receipt exists on chain.
+    """Broadcast one call and return only once the transaction is settled.
 
-    Each attempt re-signs the same nonce with a higher fee, so a transaction that
-    is merely slow gets replaced rather than abandoned. Every hash stays in the
-    poll set because any of them may be the one that lands.
+    Settled means the chain has decided: a receipt (mined, or mined and
+    reverted), or the nonce consumed by something else. Short of that this does
+    not return. It re-signs the same nonce at a rising fee for as long as it
+    takes, and treats an unreachable node as a reason to wait rather than a
+    reason to stop.
+
+    That is the whole design, and everything else follows from it. A caller can
+    only reach its next transaction once this one is settled, so the account's
+    next nonce is always free and two operations can never contend for one --
+    which is why there is no bookkeeping here about transactions left in flight.
+    An earlier version gave up after a fixed number of attempts, and needed a
+    guard band to stop the next operation signing onto the nonce the abandoned
+    one still held. Not abandoning it removes the problem rather than policing
+    it.
+
+    `receipt_timeout` is how long to wait before raising the fee and trying
+    again -- not a budget for the call. There is no attempt limit: the fee cap
+    is the only ceiling. Once it is reached nothing higher can be offered -- the
+    cap is our own limit, not the network's, so no change in conditions makes a
+    better bid possible -- and this stops signing and simply waits for the
+    transaction already out there.
+
+    `should_stop` lets a caller interrupt for shutdown. It is the one way out
+    that leaves a transaction in flight, and it raises TxNotConfirmed carrying
+    every hash broadcast, so the process that comes back can find them.
     """
     if w3 is None:
         w3 = contract_function.w3
     disable_send_retry(w3)
 
+    stopping = should_stop or (lambda: False)
     sender = Web3.to_checksum_address(Account.from_key(private_key).address)
     prefix = "{}: ".format(label) if label else ""
 
@@ -438,10 +353,10 @@ def send_and_confirm(
     if gas is None:
         gas = estimate_gas(contract_function, sender, value)
 
-    opening_ceiling = priority_ceiling(
-        w3, fee_cap_gwei, max_attempts - 1, fee_bump_percent
-    )
-    max_fee, max_priority_fee = compute_fees(w3, fee_cap_gwei, opening_ceiling)
+    # Opened at what the network is asking, clamped to the cap. No room has to
+    # be held back for a planned number of bumps, because the number is not
+    # planned: the fee climbs until it reaches the cap and then stops.
+    max_fee, max_priority_fee = compute_fees(w3, fee_cap_gwei)
 
     required = gas * max_fee + value
     if balance < required:
@@ -452,38 +367,41 @@ def send_and_confirm(
         )
 
     if nonce is None:
-        # "latest", deliberately, even though a transaction may still be sitting
-        # in the mempool at this nonce. Nothing here reconciles across calls, so
-        # when a caller retries an operation that previously timed out, counting
-        # the stuck transaction would sign the retry one slot further along --
-        # and if the stuck one later mines, the retry mines behind it and the
-        # operation happens twice. Reusing the nonce makes the retry a
-        # replacement instead, which is what a retry is meant to be. Within a
-        # single call this is safe because every send waits for its receipt, and
-        # batches that cannot wait pass their nonce in explicitly.
+        # "latest", so a replacement reuses the nonce of the transaction it is
+        # replacing rather than queueing behind it. Counting a pending one would
+        # mean that if the pending transaction later mined, the replacement
+        # mined behind it and the operation happened twice.
         nonce = w3.eth.get_transaction_count(sender, "latest")
 
-    blocked = blocking_transaction(w3, sender, label, nonce)
-    if blocked is not None:
-        raise NonceBlocked(
-            nonce, blocked["label"] or "an earlier send", blocked["hashes"]
-        )
-
     sent_hashes: List[str] = []
-    # Carried out of the loop so the sweep below reports the attempt actually
-    # reached rather than the budget. Diagnostic only -- nothing branches on it,
-    # and pinning it in a test would take a timing assumption not worth having.
     attempt = 0
-    # The whole call gets one budget. Attempts that fail without waiting -- a
-    # rejected replacement returns instantly -- must not each buy another full
-    # timeout, or one send could hold the scheduler for the better part of an
-    # hour while the tasks behind it never run.
-    deadline = time.monotonic() + receipt_timeout * max_attempts
+    at_cap = False
+    # Set when the node itself refused the last payload as underpriced. It has
+    # just told us what it thinks; going back to it for a fee suggestion is a
+    # round trip that can only repeat the answer.
+    refused = False
 
-    def remaining_budget() -> float:
-        return max(0.0, deadline - time.monotonic())
+    while True:
+        if stopping():
+            raise TxNotConfirmed(
+                "Stopped while waiting for nonce {} after {} attempt(s); "
+                "{} transaction(s) may still be in flight".format(
+                    nonce, attempt, len(sent_hashes)
+                ),
+                sent_hashes,
+                nonce,
+            )
 
-    for attempt in range(1, max_attempts + 1):
+        if at_cap:
+            # Nothing higher can be offered, so re-signing would rebroadcast a
+            # payload the node already has. Just wait for it.
+            receipt = _poll(w3, sent_hashes, receipt_timeout, poll_latency)
+            if receipt is not None:
+                return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
+            continue
+
+        attempt += 1
+
         try:
             signed = _sign(
                 contract_function,
@@ -496,23 +414,15 @@ def send_and_confirm(
                 max_fee,
                 max_priority_fee,
             )
-        except Exception as e:
-            # Building a replacement still talks to the node. On the first
-            # attempt nothing is out yet and this is an ordinary error; on later
-            # ones a transaction is already live and must not be forgotten.
-            raise _with_hashes(e, sent_hashes, nonce)
-        tx_hash = _to_hex(signed.hash)
-
-        # Recorded before the broadcast: if the call raises after the node
-        # accepted the payload, this hash is the only way to find it again.
-        if tx_hash not in sent_hashes:
-            sent_hashes.append(tx_hash)
-
-        try:
+            tx_hash = _to_hex(signed.hash)
+            # Recorded before the broadcast: if the call raises after the node
+            # accepted the payload, this hash is the only way to find it again.
+            if tx_hash not in sent_hashes:
+                sent_hashes.append(tx_hash)
             w3.eth.send_raw_transaction(signed.raw_transaction)
             print(
-                "{}Transaction sent: {} (nonce {}, attempt {}/{})".format(
-                    prefix, tx_hash, nonce, attempt, max_attempts
+                "{}Transaction sent: {} (nonce {}, attempt {})".format(
+                    prefix, tx_hash, nonce, attempt
                 )
             )
         except Exception as e:
@@ -523,25 +433,13 @@ def send_and_confirm(
                     )
                 )
             elif is_nonce_too_low(e):
-                # Every hash stays in the poll set, unlike the underpriced branch
-                # below. There the node rejected this exact payload, so it cannot
-                # be live; here it only says the nonce is spent -- and the likely
-                # spender is one of ours, possibly this very payload, since an
-                # unchanged operation re-signs to the same hash and an earlier
-                # run may already have mined it.
-                try:
-                    receipt = wait_any_receipt(
-                        w3,
-                        sent_hashes,
-                        min(receipt_timeout, remaining_budget()),
-                        poll_latency,
-                    )
-                except Exception as lookup_error:
-                    raise _with_hashes(lookup_error, sent_hashes, nonce)
+                # The nonce is spent. Either by one of ours -- an unchanged
+                # operation re-signs to the same hash, so an earlier broadcast
+                # may already have mined -- or by something else entirely.
+                # Either way the chain has decided, so this is settled.
+                receipt = _poll(w3, sent_hashes, receipt_timeout, poll_latency)
                 if receipt is not None:
-                    clear_unreconciled(w3, sender)
                     return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
-                record_unreconciled(w3, sender, nonce, label, sent_hashes)
                 raise NonceAlreadyUsed(
                     "Nonce {} is already taken and none of this run's {} "
                     "transaction(s) has a receipt: {}".format(
@@ -551,115 +449,98 @@ def send_and_confirm(
                     nonce,
                 )
             elif is_underpriced(e):
+                # The node refused this exact payload, so it is not live and
+                # must not be polled for.
+                if tx_hash in sent_hashes:
+                    sent_hashes.remove(tx_hash)
+                refused = True
                 _log(
                     "{}Replacement underpriced at attempt {}, raising the fee".format(
                         prefix, attempt
                     )
                 )
-                # The node refused this exact payload. Every attempt signs a
-                # strictly higher fee than the last -- the loop stops rather than
-                # repeating one -- so this hash was broadcast for the first time
-                # just now, and a refusal of a first broadcast is the one error
-                # here that proves the transaction is not live. Polling for it
-                # would spend the remaining budget on a hash that cannot appear,
-                # and name it in the failure as though it might.
-                sent_hashes.remove(tx_hash)
-                try:
-                    raised = next_fees(
-                        w3, max_fee, max_priority_fee, fee_bump_percent, fee_cap_gwei
-                    )
-                except Exception as fee_error:
-                    # Reachable only if this ever starts consulting the network,
-                    # which is one keyword away. Guarded like the other call site
-                    # so the hashes cannot be lost if it does.
-                    raise _with_hashes(fee_error, sent_hashes, nonce)
-                if raised is None:
-                    _log(
-                        "{}Replacement underpriced but the {} gwei cap is "
-                        "reached; nothing further can outbid the incumbent".format(
-                            prefix, fee_cap_gwei
-                        )
-                    )
-                    break
-                max_fee, max_priority_fee = raised
-                continue  # nothing new was broadcast; the final sweep still polls
+            elif is_revert(e):
+                # The call cannot succeed against current state. Retrying buys
+                # nothing and this is as settled as it gets.
+                raise TxReverted("{}Transaction cannot succeed: {}".format(prefix, e))
             else:
-                raise _with_hashes(e, sent_hashes, nonce)
-
-        try:
-            receipt = wait_any_receipt(
-                w3,
-                sent_hashes,
-                min(receipt_timeout, remaining_budget()),
-                poll_latency,
-            )
-        except Exception as e:
-            # An RPC outage during polling says nothing about the transaction.
-            # Reporting it as a bare error would drop the hashes and leave the
-            # caller unable to tell a broadcast transaction from an unsent one.
-            raise _with_hashes(e, sent_hashes, nonce)
-        if receipt is not None:
-            clear_unreconciled(w3, sender)
-            return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
-
-        if attempt < max_attempts:
-            try:
-                raised = next_fees(
-                    w3,
-                    max_fee,
-                    max_priority_fee,
-                    fee_bump_percent,
-                    fee_cap_gwei,
-                    consider_network=True,
-                )
-            except Exception as e:
-                # Reads the latest block over the connection that just failed to
-                # serve a receipt, so it is a likely place to lose the hashes.
-                raise _with_hashes(e, sent_hashes, nonce)
-            if raised is None:
+                # Anything else -- an unreachable node, a refused connection --
+                # says nothing about the transaction. Waiting is the only answer
+                # that cannot lose it.
                 _log(
-                    "{}Fee cap of {} gwei reached; waiting on the broadcast "
-                    "transaction rather than replacing it".format(prefix, fee_cap_gwei)
+                    "{}Could not broadcast at attempt {}: {}".format(prefix, attempt, e)
                 )
-                break
-            max_fee, max_priority_fee = raised
+
+        if not refused:
+            # A refused payload is in no pool and cannot appear, so there is
+            # nothing to wait for -- and waiting would spend the timeout on it.
+            receipt = _poll(w3, sent_hashes, receipt_timeout, poll_latency)
+            if receipt is not None:
+                return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
+
+        raised = _next_fees_or_wait(
+            w3,
+            max_fee,
+            max_priority_fee,
+            fee_bump_percent,
+            fee_cap_gwei,
+            consider_network=not refused,
+        )
+        refused = False
+        if raised is None:
             _log(
-                "{}No receipt after {}s, replacing nonce {} at {} gwei".format(
-                    prefix, receipt_timeout, nonce, max_fee / 1e9
-                )
+                "{}Fee cap of {} gwei reached; nothing further can outbid the "
+                "incumbent, so waiting for it".format(prefix, fee_cap_gwei)
             )
-
-    # A rejected replacement returns instantly, so the attempts can run out with
-    # most of the time budget unspent while an earlier broadcast is still live in
-    # the mempool. Spend what is left before declaring the transaction lost.
-    try:
-        receipt = wait_any_receipt(w3, sent_hashes, remaining_budget(), poll_latency)
-    except Exception as e:
-        raise _with_hashes(e, sent_hashes, nonce)
-    if receipt is not None:
-        clear_unreconciled(w3, sender)
-        return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
-
-    # Left without a receipt: whatever is still out there owns this nonce until
-    # it mines or is dropped, and a different operation must not sign onto it.
-    record_unreconciled(w3, sender, nonce, label, sent_hashes)
-
-    if not sent_hashes:
-        raise TxNotConfirmed(
-            "Nothing is live for nonce {} after {} attempt(s): every payload was "
-            "refused, so the nonce is held by something this run could not "
-            "outbid within the {} gwei cap".format(nonce, attempt, fee_cap_gwei),
-            sent_hashes,
-            nonce,
+            at_cap = True
+            continue
+        max_fee, max_priority_fee = raised
+        _log(
+            "{}No receipt after {}s, replacing nonce {} at {} gwei".format(
+                prefix, receipt_timeout, nonce, max_fee / 1e9
+            )
         )
 
-    raise TxNotConfirmed(
-        "No receipt for nonce {} after {} attempt(s). Broadcast hashes: {}".format(
-            nonce, attempt, ", ".join(sent_hashes)
-        ),
-        sent_hashes,
-        nonce,
-    )
+
+def _poll(w3: Web3, sent_hashes, timeout: float, poll_latency: float):
+    """Wait for any of these hashes, treating an unreachable node as "not yet".
+
+    An RPC outage during polling says nothing about the transaction, and this
+    never gives up, so there is nothing to be gained by turning it into an
+    error.
+    """
+    if not sent_hashes:
+        return None
+    try:
+        return wait_any_receipt(w3, sent_hashes, timeout, poll_latency)
+    except Exception as e:
+        _log("Could not check for a receipt: {}".format(e))
+        return None
+
+
+def _next_fees_or_wait(
+    w3: Web3,
+    max_fee: int,
+    max_priority_fee: int,
+    bump_percent: int,
+    cap_gwei: int,
+    consider_network: bool = True,
+):
+    """The next fee to offer, or None when the cap leaves nothing higher."""
+    try:
+        return next_fees(
+            w3,
+            max_fee,
+            max_priority_fee,
+            bump_percent,
+            cap_gwei,
+            consider_network=consider_network,
+        )
+    except Exception as e:
+        # Reads the latest block over a connection that may be the reason there
+        # was no receipt. Keep the current fee and try again next round.
+        _log("Could not work out a replacement fee: {}".format(e))
+        return None
 
 
 def _with_hashes(error: Exception, sent_hashes: List[str], nonce: int) -> Exception:
