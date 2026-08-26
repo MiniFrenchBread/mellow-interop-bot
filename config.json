@@ -68,6 +68,7 @@
       "safe-global": {
         "safe-address": "0xfc7350b0d7a358Db58875148faF3bDEAaFC82911",
         "proposer-private-key": "${SAFE_PROPOSER_PK:${SAFE_PROPOSER_PK}}",
+        "api-key": "${SAFE_API_KEY}",
         "api-url": "https://api.safe.global/tx-service/0g",
         "web-client-url": "https://app.safe.global"
       }

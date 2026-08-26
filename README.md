@@ -76,6 +76,10 @@ There are some chain-specific variables, like: `BSC_SAFE_API_KEY`, `FRAX_SAFE_PR
 
     > `DRY_RUN` only suppresses Telegram. It does not stop the oracle write.
 
+    It takes the same lock as the scheduler, so it will refuse to run while the
+    scheduler is up rather than sign a second transaction from the same
+    account. It exits non-zero if the run failed, so a supervisor can tell.
+
     `src/scheduler.py` is the production loop. It **signs and broadcasts real
     transactions on both chains** — advancing the withdrawal queue within
     minutes and rebalancing within hours — so run it only where that is

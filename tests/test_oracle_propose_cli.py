@@ -269,3 +269,107 @@ class TestProposeDryRun(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDryRunMatchesTheRealRun(unittest.TestCase):
+    """A preview that only tells the truth when nothing is wrong is worse than none.
+
+    The dry run used to print a line for every deployment it had validated --
+    including ones with no Safe, no proposer key, or a transfer in flight -- and
+    exit zero, while the same command without --dry-run skipped all of them and
+    failed. Both now go through the same planning.
+    """
+
+    def setUp(self):
+        self._validate = main.validate_oracles
+        self._propose = main.propose_tx_if_needed
+        self.posted = []
+
+        def propose(*_args):
+            self.posted.append(1)
+            return (queued(), True, [])
+
+        main.propose_tx_if_needed = propose
+
+    def tearDown(self):
+        main.validate_oracles = self._validate
+        main.propose_tx_if_needed = self._propose
+
+    def _results(self, source, deployment, **overrides):
+        main.validate_oracles = lambda _config: [
+            (
+                source,
+                OracleData(
+                    name="OG", deployment=deployment, validation=validation(**overrides)
+                ),
+            )
+        ]
+
+    def _plan_and_real_agree(self, expect_proposable):
+        """Whether the dry run succeeds must match whether the real run does."""
+        dry_ok = True
+        try:
+            asyncio.run(main.run_oracle_propose(config(), dry_run=True))
+        except Exception:
+            dry_ok = False
+
+        real_ok = True
+        try:
+            asyncio.run(main.run_oracle_propose(config()))
+        except Exception:
+            real_ok = False
+
+        self.assertEqual(dry_ok, real_ok, "the preview disagreed with the real run")
+        self.assertEqual(dry_ok, expect_proposable)
+
+    def test_no_safe_configured_fails_both(self):
+        no_safe = Deployment(
+            name="OG",
+            source_core="0x" + "22" * 20,
+            target_core="0x" + "33" * 20,
+            safe_global=None,
+        )
+        self._results(SOURCE, no_safe)
+
+        self._plan_and_real_agree(expect_proposable=False)
+        self.assertEqual(self.posted, [], "nothing may be posted either way")
+
+    def test_no_proposer_key_fails_both(self):
+        keyless = SafeGlobal(
+            safe_address=SAFE.safe_address,
+            proposer_private_key="",
+            api_url=SAFE.api_url,
+            web_client_url=SAFE.web_client_url,
+            eip_3770=SAFE.eip_3770,
+        )
+        deployment = Deployment(
+            name="OG",
+            source_core="0x" + "22" * 20,
+            target_core="0x" + "33" * 20,
+            safe_global=keyless,
+        )
+        self._results(SOURCE, deployment)
+
+        self._plan_and_real_agree(expect_proposable=False)
+        self.assertEqual(self.posted, [])
+
+    def test_a_transfer_in_flight_fails_both(self):
+        self._results(SOURCE, DEPLOYMENT, transfer_in_progress=True)
+
+        self._plan_and_real_agree(expect_proposable=False)
+        self.assertEqual(self.posted, [])
+
+    def test_a_proposable_deployment_succeeds_in_both(self):
+        self._results(SOURCE, DEPLOYMENT)
+
+        self._plan_and_real_agree(expect_proposable=True)
+        self.assertEqual(self.posted, [1], "only the real run posts")
+
+    def test_the_dry_run_previews_the_value_the_real_run_would_send(self):
+        self._results(SOURCE, DEPLOYMENT)
+
+        plans = main.plan_oracle_proposals(
+            main.validate_oracles(config()), force=True, value_override=4242
+        )
+
+        self.assertEqual([p.calls for p in plans], [[(ORACLE, [4242])]])

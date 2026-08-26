@@ -65,6 +65,16 @@ def make_scheduler(config, now=None, sleep=None, state_path=None):
     return Scheduler(config, **kwargs)
 
 
+class _NullLock:
+    """Stands in for ProcessLock where the test is not about locking."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
 class FakeClock:
     def __init__(self, start):
         self.now = start
@@ -617,8 +627,17 @@ class TestOracleTaskFailuresAreVisible(unittest.TestCase):
             self.scheduler.task_oracle_update()
 
     def test_the_standalone_entry_point_still_swallows(self):
-        """main() is the standalone path and should exit cleanly, not traceback."""
+        """main() is the standalone path and should exit cleanly, not traceback.
+
+        The lock is stubbed out: main() takes the real configured path, and a
+        test that grabs it would contend with a scheduler running on the same
+        machine. Whether it takes the lock at all is covered separately.
+        """
         import asyncio
+
+        original_lock = oracle_main_module.ProcessLock
+        oracle_main_module.ProcessLock = lambda _path: _NullLock()
+        self.addCleanup(setattr, oracle_main_module, "ProcessLock", original_lock)
 
         async def boom(_config):
             raise RuntimeError("RPC down")

@@ -1,5 +1,6 @@
 import dotenv
 import asyncio
+import sys
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Optional, Tuple, Dict
@@ -23,6 +24,7 @@ from web3_scripts import (
     update_oracle,
 )
 from safe_global import PendingTransactionInfo, ProposalPosted, propose_tx_if_needed
+from process_lock import LockHeld, ProcessLock
 from dataclasses import dataclass, field
 
 from web3_scripts.base import print_colored
@@ -31,6 +33,11 @@ from web3_scripts.base import print_colored
 # main() in-process, so a scheduler started from anywhere but the repo root would
 # otherwise fail this task alone while every other task kept working.
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+
+# What a Safe proposal calls. Named once so the planning and the proposing
+# cannot describe different calls.
+ORACLE_CONTRACT = "Oracle"
+SET_VALUE_METHOD = "setValue"
 
 
 @dataclass
@@ -56,6 +63,19 @@ class OracleRunSummary:
 
 
 @dataclass
+class ProposalPlan:
+    """One Safe's worth of calls, decided but not yet sent.
+
+    Exists so that previewing a proposal and making one are the same decision.
+    """
+
+    source: SourceConfig
+    safe_global: SafeGlobal
+    deployment_names: List[str]
+    calls: List[Tuple[str, List[int]]]
+
+
+@dataclass
 class SafeProposal:
     method: str  # e.g. "setValue"
     deployment_names: list[str]  # e.g. ["BSC", "FRAXTAL", ...]
@@ -75,18 +95,35 @@ class SafeProposal:
     posted_reference: str = ""
 
 
-async def main():
-    """Standalone entry point: report a failure and exit rather than traceback."""
+async def main() -> int:
+    """Standalone entry point: report a failure and exit rather than traceback.
+
+    Returns a process exit status. Printing the error and exiting zero was
+    survivable while this only queued Safe proposals for people to look at; now
+    that it broadcasts, a run that wrote nothing at all would be reported to
+    systemd, cron or any other supervisor as a success.
+
+    Takes the same lock as the scheduler and the CLI, for the same reason: this
+    signs and sends. Without it a stray manual run alongside the scheduler has
+    two processes reading the same account's nonce independently, and
+    tx._unreconciled is per-process, so nothing stops them replacing each
+    other's transactions or writing values computed from different snapshots.
+    """
     config = None
     try:
         dotenv.load_dotenv()
         config = read_config(str(CONFIG_PATH))
-        await run_oracle_update(config)
+        with ProcessLock(config.scheduler.lock_file):
+            await run_oracle_update(config)
+        return 0
     except FileNotFoundError:
         print(f"Error: config.json not found")
+    except LockHeld as e:
+        print_colored(str(e), "red")
     except Exception as e:
         error_message = mask_all_sensitive_config_data(str(e), config)
         print(f"Unexpected error: {error_message}")
+    return 1
 
 
 async def run_oracle_update(
@@ -289,27 +326,29 @@ async def run_oracle_propose(
         )
 
     if dry_run:
-        for source, oracle_data in oracle_validation_results:
-            validation = oracle_data.validation
-            if validation is None:
-                print("{}/{}: validation failed".format(source.name, oracle_data.name))
-                continue
-            safe = oracle_data.deployment.safe_global
-            value = (
-                value_override
-                if value_override is not None
-                else validation.actual_value
+        # The same planning the real run does, stopping short of the one step
+        # that has an effect. Anything the real run would skip is skipped here
+        # too, and an empty plan fails here exactly as it would there.
+        plans = plan_oracle_proposals(
+            oracle_validation_results, force=True, value_override=value_override
+        )
+        if not plans:
+            raise Exception(
+                "Nothing would be proposed; no deployment has a Safe with a "
+                "proposer key configured"
             )
-            print(
-                "{}/{}: would propose setValue({}) on {} via Safe {} (on chain: {})".format(
-                    source.name,
-                    oracle_data.name,
-                    value,
-                    validation.oracle_address,
-                    safe.safe_address if safe else "<none configured>",
-                    validation.oracle_value,
+        for plan in plans:
+            for name, (oracle_address, args) in zip(plan.deployment_names, plan.calls):
+                print(
+                    "{}/{}: would propose {}({}) on {} via Safe {}".format(
+                        plan.source.name,
+                        name,
+                        SET_VALUE_METHOD,
+                        args[0],
+                        oracle_address,
+                        plan.safe_global.safe_address,
+                    )
                 )
-            )
         return True
 
     safe_proposals = propose_tx_to_update_oracle(
@@ -577,6 +616,115 @@ def compose_safe_tx_confirmations(proposal: SafeProposal) -> tuple[str, bool]:
     )
 
 
+def plan_oracle_proposals(
+    oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
+    force: bool = False,
+    value_override: Optional[int] = None,
+) -> List[ProposalPlan]:
+    """Work out what would be proposed, without proposing anything.
+
+    Split out from the proposing so a dry run and a real run cannot disagree
+    about what is proposable. They did: the dry run printed a line for every
+    deployment it had validated -- including ones with no Safe configured, no
+    proposer key, or a transfer in flight -- and exited zero, while the same
+    command without --dry-run skipped all of them and failed. A preview that
+    only tells the truth when nothing is wrong is worse than none.
+
+    Returns one plan per Safe, each with at least one call. A Safe with nothing
+    to propose is left out entirely rather than returned empty.
+    """
+    # Group by effective Safe identity (chain prefix + address), so several
+    # deployments sharing one Safe become a single multi-send.
+    grouped_data: defaultdict[Tuple[str, str], List[OracleData]] = defaultdict(list)
+    safe_global_map: Dict[Tuple[str, str], SafeGlobal] = {}
+    source_map: Dict[Tuple[str, str], SourceConfig] = {}
+
+    for source, oracle_data in oracle_validation_results:
+        # The deployment override if there is one, else the chain-level config.
+        effective_safe = oracle_data.deployment.safe_global
+        if effective_safe is None:
+            print(
+                "Skipping {}/{}: no Safe is configured for it".format(
+                    source.name, oracle_data.name
+                )
+            )
+            continue
+
+        key = (effective_safe.eip_3770, effective_safe.safe_address)
+        grouped_data[key].append(oracle_data)
+        safe_global_map[key] = effective_safe
+        source_map.setdefault(key, source)
+
+    plans: List[ProposalPlan] = []
+    for (safe_eip_3770, safe_address), oracle_data_list in grouped_data.items():
+        safe_global = safe_global_map[(safe_eip_3770, safe_address)]
+        source = source_map[(safe_eip_3770, safe_address)]
+
+        if not safe_global.proposer_private_key:
+            print(
+                f"Skipping proposal for {source.name} (safe: {safe_address}) because proposer pk is not set"
+            )
+            continue
+
+        deployment_names: List[str] = []
+        calls: List[Tuple[str, List[int]]] = []
+
+        for oracle_data in oracle_data_list:
+            validation = oracle_data.validation
+            if validation is None:
+                continue
+
+            # Skip if transfer is in progress. An explicit value is exempt: it
+            # was not derived from the two sides that a transfer in flight puts
+            # out of step, so the reason to wait does not apply to it.
+            if validation.transfer_in_progress and value_override is None:
+                print(
+                    "Skipping {}/{}: an OFT transfer is in flight".format(
+                        source.name, oracle_data.name
+                    )
+                )
+                continue
+
+            # Skip if oracle is not expired or incorrect
+            if (
+                not force
+                and not validation.almost_expired
+                and not validation.incorrect_value
+            ):
+                continue
+
+            deployment_names.append(oracle_data.name)
+            calls.append(
+                (
+                    validation.oracle_address,
+                    [
+                        (
+                            value_override
+                            if value_override is not None
+                            else validation.actual_value
+                        )
+                    ],
+                )
+            )
+
+        if not calls:
+            print(
+                f"No oracle updates required for source {source.name} (safe: {safe_address})"
+            )
+            continue
+
+        plans.append(
+            ProposalPlan(
+                source=source,
+                safe_global=safe_global,
+                deployment_names=deployment_names,
+                calls=calls,
+            )
+        )
+
+    return plans
+
+
 def propose_tx_to_update_oracle(
     oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
     force: bool = False,
@@ -597,77 +745,12 @@ def propose_tx_to_update_oracle(
     """
     result: List[Tuple[SourceConfig, SafeGlobal, SafeProposal]] = []
 
-    # Group validation results by effective Safe identity (chain prefix + address)
-    # Key: (eip_3770, safe_address) -> List of oracle data that share the same Safe
-    grouped_data: defaultdict[Tuple[str, str], List[OracleData]] = defaultdict(list)
-    safe_global_map: Dict[Tuple[str, str], SafeGlobal] = {}
-    source_map: Dict[Tuple[str, str], SourceConfig] = {}
-
-    for source, oracle_data in oracle_validation_results:
-        # Get the effective safe_global for this deployment (deployment override or chain-level)
-        effective_safe = oracle_data.deployment.safe_global
-        if effective_safe is None:
-            continue
-
-        key = (effective_safe.eip_3770, effective_safe.safe_address)
-        grouped_data[key].append(oracle_data)
-        safe_global_map[key] = effective_safe
-        source_map.setdefault(key, source)
-
-    # Process each Safe group
-    for (safe_eip_3770, safe_address), oracle_data_list in grouped_data.items():
-        safe_global = safe_global_map[(safe_eip_3770, safe_address)]
-        source = source_map[(safe_eip_3770, safe_address)]
-
-        if not safe_global.proposer_private_key:
-            print(
-                f"Skipping proposal for {source.name} (safe: {safe_address}) because proposer pk is not set"
-            )
-            continue
-
-        contract_abi = "Oracle"
-        method = "setValue"
-        deployment_names = []
-        calls: list[tuple[str, list[int]]] = []
-
-        # Process each oracle data
-        for oracle_data in oracle_data_list:
-            # Skip if oracle validation failed
-            validation = oracle_data.validation
-            if validation is None:
-                continue
-
-            # Skip if transfer is in progress. An explicit value is exempt: it
-            # was not derived from the two sides that a transfer in flight puts
-            # out of step, so the reason to wait does not apply to it.
-            if validation.transfer_in_progress and value_override is None:
-                continue
-
-            # Skip if oracle is not expired or incorrect
-            if (
-                not force
-                and not validation.almost_expired
-                and not validation.incorrect_value
-            ):
-                continue
-
-            # Update is required, add oracle data to calls
-            to = validation.oracle_address
-            args = [
-                (
-                    value_override
-                    if value_override is not None
-                    else validation.actual_value
-                )
-            ]
-            deployment_names.append(oracle_data.name)
-            calls.append((to, args))
-
-        if len(calls) == 0:
-            print(
-                f"No oracle updates required for source {source.name} (safe: {safe_address})"
-            )
-            continue
+    for plan in plan_oracle_proposals(
+        oracle_validation_results, force=force, value_override=value_override
+    ):
+        source = plan.source
+        safe_global = plan.safe_global
+        safe_address = safe_global.safe_address
 
         transaction = None
         is_newly_created = False
@@ -676,7 +759,7 @@ def propose_tx_to_update_oracle(
         posted_reference = ""
         try:
             transaction, is_newly_created, superseded = propose_tx_if_needed(
-                contract_abi, method, calls, source, safe_global
+                ORACLE_CONTRACT, SET_VALUE_METHOD, plan.calls, source, safe_global
             )
         except ProposalPosted as e:
             # Queued and signable; only the read-back failed. Retrying would add
@@ -696,17 +779,22 @@ def propose_tx_to_update_oracle(
                 "red",
             )
 
-        proposal = SafeProposal(
-            method=method,
-            deployment_names=deployment_names,
-            calls=calls,
-            transaction=transaction,
-            is_newly_created=is_newly_created,
-            superseded=superseded,
-            posted=posted,
-            posted_reference=posted_reference,
+        result.append(
+            (
+                source,
+                safe_global,
+                SafeProposal(
+                    method=SET_VALUE_METHOD,
+                    deployment_names=plan.deployment_names,
+                    calls=plan.calls,
+                    transaction=transaction,
+                    is_newly_created=is_newly_created,
+                    superseded=superseded,
+                    posted=posted,
+                    posted_reference=posted_reference,
+                ),
+            )
         )
-        result.append((source, safe_global, proposal))
 
     return result
 
@@ -748,4 +836,4 @@ def validate_oracles(
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))

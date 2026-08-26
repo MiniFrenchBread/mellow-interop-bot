@@ -62,8 +62,9 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
 - **`src/cli.py`** -- One-shot entry points for the same code paths: `ascend` (with `--dry-run`),
   `handle-epoch`, `oracle` (with `--dry-run` / `--force`), `oracle-propose` (with `--value` /
   `--dry-run`), `rebalance`, `validate-config`.
-- **`src/process_lock.py`** -- Single-holder lock shared by the scheduler and the CLI. One account
-  signs every broadcast transaction, so two processes running at once would collide over its nonce.
+- **`src/process_lock.py`** -- Single-holder lock shared by the scheduler, the CLI and the
+  standalone `main.py`. One account signs every broadcast transaction, so two processes running at
+  once would collide over its nonce.
   `validate-config` and `oracle-propose` are exempt (`LOCK_FREE`): neither broadcasts anything.
   That exemption matters for `oracle-propose` in particular — it is the recovery path used while
   the oracle is going unwritten, and requiring the lock would mean stopping the rest of the bot
