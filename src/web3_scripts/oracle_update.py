@@ -76,6 +76,34 @@ class OracleUpdateResult:
     def deviation_bps(self) -> float:
         return deviation_bps(self.old_value, self.new_value)
 
+    @property
+    def signed_deviation_bps(self) -> float:
+        return signed_deviation_bps(self.old_value, self.new_value)
+
+    @property
+    def forced_note(self) -> str:
+        """Marks a write that went past the guards, wherever it is reported.
+
+        A forced write is the one an operator most needs to be able to find
+        afterwards, and it was previously indistinguishable from a routine one
+        in every log line and message.
+        """
+        return " [forced past the guards]" if self.forced else ""
+
+
+def signed_deviation_bps(old_value: int, new_value: int) -> float:
+    """Movement in basis points, keeping its direction.
+
+    Separate from deviation_bps because the guards want a magnitude and the
+    messages want a direction. Rendering the magnitude with a sign format made
+    every forced write read as a rise -- including the decrease that had to be
+    forced past the guard in the first place, on the one line an operator reads
+    back after overriding it.
+    """
+    if old_value == 0:
+        return float("inf")
+    return (new_value - old_value) * BPS_DENOMINATOR / old_value
+
 
 def deviation_bps(old_value: int, new_value: int) -> float:
     """How far the new value sits from the old one, in basis points.
@@ -222,8 +250,8 @@ def update_oracle(
                 new_value,
                 validation.oracle_address,
                 old_value,
-                result.deviation_bps if old_value else 0.0,
-                " [forced]" if force else "",
+                result.signed_deviation_bps if old_value else 0.0,
+                result.forced_note,
             )
         )
         return result
@@ -239,12 +267,13 @@ def update_oracle(
     result.written = True
     result.tx_hash = outcome.tx_hash
     print_colored(
-        "{}: setValue({}) confirmed in {} (was {}, {:+.2f} bps)".format(
+        "{}: setValue({}) confirmed in {} (was {}, {:+.2f} bps){}".format(
             deployment.name,
             new_value,
             outcome.tx_hash,
             old_value,
-            result.deviation_bps if old_value else 0.0,
+            result.signed_deviation_bps if old_value else 0.0,
+            result.forced_note,
         ),
         "green",
     )

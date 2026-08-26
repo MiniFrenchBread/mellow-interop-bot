@@ -127,7 +127,10 @@ async def main() -> int:
 
 
 async def run_oracle_update(
-    config: Config, force: bool = False, dry_run: bool = False
+    config: Config,
+    force: bool = False,
+    dry_run: bool = False,
+    source_name: Optional[str] = None,
 ) -> OracleRunSummary:
     """Refresh every oracle, and tell someone only when a person is needed.
 
@@ -160,7 +163,9 @@ async def run_oracle_update(
             ),
         )
 
-    results = update_oracles(config, force=force, dry_run=dry_run)
+    results, errors = update_oracles(
+        config, force=force, dry_run=dry_run, source_name=source_name
+    )
 
     if not results:
         print("No deployments configured; nothing to update")
@@ -171,8 +176,26 @@ async def run_oracle_update(
         # suppress the others, but every one failing is an outage rather than a
         # run. Returning normally here would reset the scheduler's failure
         # counter and keep the alert from ever arming.
+        #
+        # The original exception is re-raised when there is only one, rather
+        # than a summary of it. Its type is load-bearing: the scheduler declines
+        # to count NonceBlocked against the task and declines to alert on it,
+        # because another operation holding the nonce is neither this task's
+        # fault nor an outage -- and a generic wrapper makes that branch
+        # unreachable. Its text is load-bearing too: "nonce held", "RPC
+        # unreachable" and "Oracle: forbidden" need different responses, and the
+        # alert is the only place an operator sees which one happened.
+        if len(errors) == 1:
+            raise errors[0]
         raise Exception(
-            "Could not update any of {} oracle deployment(s)".format(len(results))
+            "Could not update any of {} oracle deployment(s): {}".format(
+                len(results),
+                "; ".join(
+                    mask_all_sensitive_config_data(str(error), config)
+                    for error in errors
+                )
+                or "no exception was recorded",
+            )
         )
 
     summary = OracleRunSummary(
@@ -186,8 +209,28 @@ async def run_oracle_update(
         ),
     )
 
+    needs_attention_from = [
+        result for _, result in results if result is not None and result.alerts
+    ]
+
     message = compose_oracle_update_message(config, results)
     if not message:
+        if needs_attention_from:
+            # compose_oracle_update_message renders nothing when Telegram is
+            # unconfigured, which would otherwise turn a run where every
+            # deployment refused into "refreshed: none written" -- and the
+            # scheduler would record it as a success and reset the failure
+            # counter. The alerts still have to be said somewhere.
+            print_colored(
+                "The oracle needs attention and Telegram is not configured:\n"
+                + "\n".join(
+                    "- {}: {}".format(result.name, result.alert)
+                    for result in needs_attention_from
+                ),
+                "red",
+            )
+            summary.notified = False
+            return summary
         print(
             "Oracle(s) refreshed: {}".format(
                 ", ".join(
@@ -219,16 +262,26 @@ async def run_oracle_update(
 
 
 def update_oracles(
-    config: Config, force: bool = False, dry_run: bool = False
-) -> List[Tuple[SourceConfig, Optional[OracleUpdateResult]]]:
+    config: Config,
+    force: bool = False,
+    dry_run: bool = False,
+    source_name: Optional[str] = None,
+) -> Tuple[List[Tuple[SourceConfig, Optional[OracleUpdateResult]]], List[Exception]]:
     """Run the heartbeat for every deployment, isolating per-deployment failures.
 
     A None result means this deployment could not be reached or its send failed.
     It is kept in the list rather than dropped so the caller can tell "every one
     failed" -- an outage -- from "some succeeded".
+
+    The exceptions come back alongside, because their type and their text both
+    carry information the caller needs and a fresh generic exception destroys:
+    the scheduler treats NonceBlocked differently from an outage, and the alert
+    that reaches a phone is the only description of the failure an operator gets
+    -- stdout is exactly what they do not have.
     """
     results: List[Tuple[SourceConfig, Optional[OracleUpdateResult]]] = []
-    for source in config.sources:
+    errors: List[Exception] = []
+    for source in selected_sources(config, source_name):
         for deployment in source.deployments:
             result: Optional[OracleUpdateResult] = None
             try:
@@ -242,6 +295,7 @@ def update_oracles(
                     dry_run=dry_run,
                 )
             except Exception as e:
+                errors.append(e)
                 masked_error = mask_source_sensitive_data(str(e), source)
                 masked_error = mask_url_credentials(masked_error, config.target_rpc)
                 print_colored(
@@ -251,7 +305,7 @@ def update_oracles(
                     "red",
                 )
             results.append((source, result))
-    return results
+    return results, errors
 
 
 def compose_oracle_update_message(
@@ -306,7 +360,10 @@ def compose_oracle_update_message(
 
 
 async def run_oracle_propose(
-    config: Config, value_override: Optional[int] = None, dry_run: bool = False
+    config: Config,
+    value_override: Optional[int] = None,
+    dry_run: bool = False,
+    source_name: Optional[str] = None,
 ) -> bool:
     """Queue an oracle update through the Safe and tell the signers.
 
@@ -315,7 +372,7 @@ async def run_oracle_propose(
     can run while the scheduler is up, and why it stays usable once the heartbeat
     key lives somewhere a person cannot reach.
     """
-    oracle_validation_results = validate_oracles(config)
+    oracle_validation_results = validate_oracles(config, source_name=source_name)
 
     if not oracle_validation_results or all(
         oracle_data.validation is None for _, oracle_data in oracle_validation_results
@@ -329,14 +386,15 @@ async def run_oracle_propose(
         # The same planning the real run does, stopping short of the one step
         # that has an effect. Anything the real run would skip is skipped here
         # too, and an empty plan fails here exactly as it would there.
+        skipped: List[str] = []
         plans = plan_oracle_proposals(
-            oracle_validation_results, force=True, value_override=value_override
+            oracle_validation_results,
+            force=True,
+            value_override=value_override,
+            skipped=skipped,
         )
         if not plans:
-            raise Exception(
-                "Nothing would be proposed; no deployment has a Safe with a "
-                "proposer key configured"
-            )
+            raise Exception(_nothing_proposed("Nothing would be proposed", skipped))
         for plan in plans:
             for name, (oracle_address, args) in zip(plan.deployment_names, plan.calls):
                 print(
@@ -351,15 +409,16 @@ async def run_oracle_propose(
                 )
         return True
 
+    skipped: List[str] = []
     safe_proposals = propose_tx_to_update_oracle(
-        oracle_validation_results, force=True, value_override=value_override
+        oracle_validation_results,
+        force=True,
+        value_override=value_override,
+        skipped=skipped,
     )
 
     if not safe_proposals:
-        raise Exception(
-            "Nothing was proposed; no deployment has a Safe with a proposer key "
-            "configured"
-        )
+        raise Exception(_nothing_proposed("Nothing was proposed", skipped))
 
     attempted = 0
     delivered = 0
@@ -616,12 +675,24 @@ def compose_safe_tx_confirmations(proposal: SafeProposal) -> tuple[str, bool]:
     )
 
 
+def _note_skip(collected: Optional[List[str]], reason: str) -> None:
+    print("Skipping {}".format(reason))
+    if collected is not None:
+        collected.append(reason)
+
+
 def plan_oracle_proposals(
     oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
     force: bool = False,
     value_override: Optional[int] = None,
+    skipped: Optional[List[str]] = None,
 ) -> List[ProposalPlan]:
     """Work out what would be proposed, without proposing anything.
+
+    `skipped` collects why each deployment was left out, so a caller that ends
+    up with nothing can say which reason applied. The likeliest one on the
+    recovery path is a transfer in flight, whose remedy is `--value` -- not the
+    Safe configuration the fixed message used to blame.
 
     Split out from the proposing so a dry run and a real run cannot disagree
     about what is proposable. They did: the dry run printed a line for every
@@ -643,10 +714,11 @@ def plan_oracle_proposals(
         # The deployment override if there is one, else the chain-level config.
         effective_safe = oracle_data.deployment.safe_global
         if effective_safe is None:
-            print(
-                "Skipping {}/{}: no Safe is configured for it".format(
+            _note_skip(
+                skipped,
+                "{}/{}: no Safe is configured for it".format(
                     source.name, oracle_data.name
-                )
+                ),
             )
             continue
 
@@ -661,8 +733,11 @@ def plan_oracle_proposals(
         source = source_map[(safe_eip_3770, safe_address)]
 
         if not safe_global.proposer_private_key:
-            print(
-                f"Skipping proposal for {source.name} (safe: {safe_address}) because proposer pk is not set"
+            _note_skip(
+                skipped,
+                "{} (safe {}): no proposer key is configured".format(
+                    source.name, safe_address
+                ),
             )
             continue
 
@@ -678,10 +753,12 @@ def plan_oracle_proposals(
             # was not derived from the two sides that a transfer in flight puts
             # out of step, so the reason to wait does not apply to it.
             if validation.transfer_in_progress and value_override is None:
-                print(
-                    "Skipping {}/{}: an OFT transfer is in flight".format(
+                _note_skip(
+                    skipped,
+                    "{}/{}: an OFT transfer is in flight (pass --value to "
+                    "propose a hand-computed figure anyway)".format(
                         source.name, oracle_data.name
-                    )
+                    ),
                 )
                 continue
 
@@ -708,8 +785,9 @@ def plan_oracle_proposals(
             )
 
         if not calls:
-            print(
-                f"No oracle updates required for source {source.name} (safe: {safe_address})"
+            _note_skip(
+                skipped,
+                "{} (safe {}): nothing to update".format(source.name, safe_address),
             )
             continue
 
@@ -725,10 +803,18 @@ def plan_oracle_proposals(
     return plans
 
 
+def _nothing_proposed(prefix: str, skipped: List[str]) -> str:
+    """Say which reason applied, rather than guessing at the commonest one."""
+    if not skipped:
+        return "{}; there were no deployments to consider".format(prefix)
+    return "{}: {}".format(prefix, "; ".join(skipped))
+
+
 def propose_tx_to_update_oracle(
     oracle_validation_results: List[Tuple[SourceConfig, OracleData]],
     force: bool = False,
     value_override: Optional[int] = None,
+    skipped: Optional[List[str]] = None,
 ) -> List[Tuple[SourceConfig, SafeGlobal, SafeProposal]]:
     """Queue a Safe transaction setting the oracle, for the operator to sign.
 
@@ -746,7 +832,10 @@ def propose_tx_to_update_oracle(
     result: List[Tuple[SourceConfig, SafeGlobal, SafeProposal]] = []
 
     for plan in plan_oracle_proposals(
-        oracle_validation_results, force=force, value_override=value_override
+        oracle_validation_results,
+        force=force,
+        value_override=value_override,
+        skipped=skipped,
     ):
         source = plan.source
         safe_global = plan.safe_global
@@ -799,11 +888,32 @@ def propose_tx_to_update_oracle(
     return result
 
 
+def selected_sources(config: Config, source_name: Optional[str]) -> List[SourceConfig]:
+    """The sources a command should act on.
+
+    `--source` is accepted by every subcommand through the shared parent parser,
+    so a command that iterates every source regardless silently widens what the
+    operator asked for. That is tolerable for a read; it is not for `--force`,
+    which writes past both guards, or for `--value`, which would put one
+    hand-computed figure into every deployment's setValue.
+    """
+    if not source_name:
+        return list(config.sources)
+    chosen = [s for s in config.sources if s.name.lower() == source_name.lower()]
+    if not chosen:
+        raise Exception(
+            "Unknown source '{}'. Available: {}".format(
+                source_name, ", ".join(s.name for s in config.sources)
+            )
+        )
+    return chosen
+
+
 def validate_oracles(
-    config: Config,
+    config: Config, source_name: Optional[str] = None
 ) -> List[Tuple[SourceConfig, OracleData]]:
     result: List[Tuple[SourceConfig, OracleData]] = []
-    for source in config.sources:
+    for source in selected_sources(config, source_name):
         for deployment in source.deployments:
             validation_result: Optional[OracleValidationResult] = None
             try:

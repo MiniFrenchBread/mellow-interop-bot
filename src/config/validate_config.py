@@ -79,7 +79,7 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
                 f"Oracle updater {updater} does not hold SET_VALUE_ROLE on "
                 f"{deployment.source_core} ({source.name}/{deployment.name}). "
                 f"Grant it from the Safe: "
-                f"grantRole({SET_VALUE_ROLE.hex()}, {updater})"
+                f"grantRole({SET_VALUE_ROLE.to_0x_hex()}, {updater})"
             )
         print(f"Oracle updater {updater} can write {deployment.name}'s oracle")
 

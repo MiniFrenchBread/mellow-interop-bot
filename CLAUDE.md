@@ -91,9 +91,11 @@ python ./src/cli.py handle-epoch
 python ./src/cli.py oracle
 python ./src/cli.py rebalance -y
 
-# Run main bot (oracle monitoring + alerts)
+# Run one oracle pass standalone. This WRITES the oracle; DRY_RUN only
+# suppresses Telegram. Takes the shared lock, so it refuses while the
+# scheduler is up, and exits non-zero if the run failed.
 python ./src/main.py
-DRY_RUN=true python ./src/main.py    # without sending Telegram messages
+python ./src/cli.py oracle --dry-run  # what it would do, broadcasting nothing
 
 # Run standalone scripts
 python ./src/web3_scripts/oracle_script.py

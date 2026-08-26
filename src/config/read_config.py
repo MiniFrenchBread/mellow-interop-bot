@@ -93,11 +93,16 @@ class WithdrawalQueueConfig:
 class OracleUpdateConfig:
     """Settings for writing the oracle directly, without the multisig.
 
-    The key here is deliberately separate from `executor_private_key`. It is the
-    only key that can move the share price, which is the one number every
-    deposit and withdrawal is priced against, so it is worth being able to fund,
-    rotate and revoke it without touching the account that claims rewards and
-    rebalances.
+    Configured separately from `executor_private_key` so the two roles can be
+    split: this is the only key that can move the share price, which is the one
+    number every deposit and withdrawal is priced against, and being able to
+    fund, rotate and revoke it without touching the account that claims rewards
+    and rebalances is worth the indirection.
+
+    Nothing requires them to differ, and pointing both at one account is a
+    supported way to start. It does give up the separation: one account means
+    one nonce sequence, so a send of either kind that times out will block the
+    other until it clears.
     """
 
     updater_private_key: str

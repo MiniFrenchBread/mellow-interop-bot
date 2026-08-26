@@ -56,11 +56,13 @@ class TestOracleExitStatus(unittest.TestCase):
     def run_oracle(self, delivered: bool):
         from main import OracleRunSummary
 
-        async def update(_config, force=False, dry_run=False):
+        async def update(_config, force=False, dry_run=False, source_name=None):
             return OracleRunSummary(notified=delivered)
 
         self.main.run_oracle_update = update
-        return cli.cmd_oracle(config(), SimpleNamespace(force=False, dry_run=False))
+        return cli.cmd_oracle(
+            config(), SimpleNamespace(force=False, dry_run=False, source=None)
+        )
 
     def test_full_delivery_is_not_an_error(self):
         self.run_oracle(delivered=True)

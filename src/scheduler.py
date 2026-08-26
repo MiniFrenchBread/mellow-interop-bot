@@ -68,6 +68,22 @@ TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 # come due together anyway.
 TASK_DEPENDENCIES = {"oracle_update": "ascend"}
 
+# How long a run of skips may last before it stops being routine, per task.
+#
+# Measured in time rather than in attempts. A task that retries every loop until
+# its blocker clears racks up attempts at a rate set by loop_sleep_seconds, not
+# by how wrong anything is, so counting them makes the alert threshold mean
+# whatever the loop interval happens to be -- three attempts became fifteen
+# minutes where it was meant to be a day.
+#
+# The default preserves the original intent: as long as `alert_after_failures`
+# of the task's own scheduled runs. oracle_update is given a shorter fuse
+# because a transfer settles in one to five minutes and operator_bot stops
+# waiting for one at thirty, so past half an hour it is stuck rather than
+# settling -- and this is the task whose silence leaves the share price
+# unpriced and rebalancing refusing.
+SKIP_ALERT_AFTER_SECONDS = {"oracle_update": 1800}
+
 
 def is_due(last_run: float, now: float, interval: int) -> bool:
     """True when now has crossed into a later interval bucket than last_run.
@@ -134,15 +150,28 @@ class Scheduler:
         self.last_run = {task: started for task in TASK_ORDER}
         restored = self._load_state()
         self.last_run.update(restored)
-        # Which tasks the file actually knew about. Seeding the rest to "now" is
-        # right for the interval -- it stops a first start replaying a bucket
-        # that has already passed -- but wrong for a dependency, where having no
-        # record means the task has never run rather than having just run. The
-        # difference is not academic: renaming a task orphans its saved entry, so
-        # the task that most needs to catch up is the one that looks freshest.
-        self._restored = set(restored)
+        # Which tasks we have an actual record of having run -- seeded from the
+        # file and added to as tasks complete. Seeding the rest of last_run to
+        # "now" is right for the interval, since it stops a first start
+        # replaying a bucket that has already passed, but wrong for a
+        # dependency, where having no record means the task has never run rather
+        # than having just run. Renaming a task orphans its saved entry, so the
+        # task that most needs to catch up is the one that looks freshest.
+        #
+        # It has to grow as tasks run. Left as "what the file contained", the
+        # short-circuit in owes_dependency never stops firing: the task is
+        # forever absent from the set, so it is forever owed, and the interval
+        # never gets a say. That is a write every loop instead of every eight
+        # hours -- silently, because between ascend runs the value is unchanged
+        # and neither guard has anything to object to.
+        self._has_record = set(restored)
         self.failures = {task: 0 for task in TASK_ORDER}
         self.skips = {task: 0 for task in TASK_ORDER}
+        # When the current run of skips began, and how many alerts it has
+        # already produced. Both are what make the alert depend on elapsed time
+        # rather than on how often the task retried.
+        self.skipping_since = {task: 0.0 for task in TASK_ORDER}
+        self.skip_alerts = {task: 0 for task in TASK_ORDER}
         # A task that failed is retried on a backoff rather than at its next
         # scheduled slot. Treating a failure as a completed run would mean one
         # transient RPC error costs a fortnightly task a fortnight, and would put
@@ -207,9 +236,9 @@ class Scheduler:
             print_colored("[{}] {}".format(task, error), "yellow")
             return
         self.failures[task] += 1
-        # A failure breaks a run of skips: "skipped 3 times in a row" should mean
-        # three in a row.
-        self.skips[task] = 0
+        # A failure breaks a run of skips: the elapsed-time window should
+        # measure one uninterrupted run of declining to act.
+        self.clear_skips(task)
         message = mask_all_sensitive_config_data(str(error), self.config)
         # Backticks would close the code fence below and Telegram would reject
         # the message, dropping the alert precisely when the error is unusual.
@@ -246,23 +275,51 @@ class Scheduler:
             )
         self.failures[task] = 0
 
+    def skip_alert_after(self, task: str) -> float:
+        """How long this task may keep declining to act before anyone is told."""
+        configured = SKIP_ALERT_AFTER_SECONDS.get(task)
+        if configured is not None:
+            return configured
+        return (
+            self.config.scheduler.alert_after_failures
+            * self.config.scheduler.interval(task)
+        )
+
     def record_skip(self, task: str, reason: str) -> None:
         """Track a task that ran but declined to act.
 
         Rebalancing refuses whenever the oracle is stale or a cross-chain
-        transfer is in flight. One refusal is routine. A run of them means the
-        bot has stopped rebalancing entirely, which is invisible otherwise.
+        transfer is in flight, and the oracle refuses while a transfer is in
+        flight. One refusal is routine. A run of them means the bot has quietly
+        stopped doing that job, which is invisible otherwise.
+
+        Judged by how long the run has lasted, not how many attempts it took --
+        see SKIP_ALERT_AFTER_SECONDS.
         """
+        now = self._now()
         self.skips[task] += 1
-        threshold = self.config.scheduler.alert_after_failures
+        if not self.skipping_since[task]:
+            self.skipping_since[task] = now
+
+        threshold = self.skip_alert_after(task)
+        if not threshold:
+            return
+        elapsed = now - self.skipping_since[task]
         # Repeats like record_failure does; a task stuck refusing to act has to
-        # keep saying so.
-        if threshold and self.skips[task] % threshold == 0:
+        # keep saying so, at the same cadence rather than once.
+        due_alerts = int(elapsed // threshold)
+        if due_alerts > self.skip_alerts[task]:
+            self.skip_alerts[task] = due_alerts
             self.notify(
-                "⚠️ `{}` has been skipped {} times in a row: {}".format(
-                    task, self.skips[task], reason
+                "⚠️ `{}` has been unable to act for {} ({} attempt(s)): {}".format(
+                    task, format_duration(elapsed), self.skips[task], reason
                 )
             )
+
+    def clear_skips(self, task: str) -> None:
+        self.skips[task] = 0
+        self.skipping_since[task] = 0.0
+        self.skip_alerts[task] = 0
 
     # -- tasks -------------------------------------------------------------
 
@@ -294,14 +351,29 @@ class Scheduler:
         if reasons and len(reasons) == len(results):
             self.record_skip("rebalance", "; ".join(sorted(set(reasons))))
         else:
-            self.skips["rebalance"] = 0
+            self.clear_skips("rebalance")
 
-    def task_oracle_update(self) -> None:
+    def task_oracle_update(self) -> bool:
+        """Refresh the oracle. Returns whether it actually wrote anything.
+
+        The return value is what tells run_cycle a skip is not a run, so the
+        task stays due and tries again next cycle instead of waiting out its
+        interval.
+        """
         from main import run_oracle_update
 
         # The raising variant, not main(): main() swallows everything so the
         # scheduler could never see this task fail.
         summary = asyncio.run(run_oracle_update(self.config))
+
+        if not summary.notified:
+            # Not raised: the write already happened, so a retry would only
+            # repeat the announcement, and it would repeat it over the channel
+            # that is down anyway.
+            print_colored(
+                "[oracle_update] the oracle needs attention and no one was notified",
+                "red",
+            )
 
         if summary.skip_reasons and not summary.written:
             # Nothing was written and every deployment had a reason. One is
@@ -312,17 +384,19 @@ class Scheduler:
             self.record_skip(
                 "oracle_update", "; ".join(sorted(set(summary.skip_reasons)))
             )
-        else:
-            self.skips["oracle_update"] = 0
+            # Declining to act is not acting. Saying so keeps the task due, so
+            # it tries again next cycle and writes as soon as the transfer
+            # settles -- minutes, normally.
+            #
+            # Recorded as a run instead, it would move last_run ahead of
+            # ascend's, mark the dependency it owes as paid, and leave the
+            # reward distribution ascend just made unpriced until the next
+            # boundary: eight hours in which rebalancing also refuses, which is
+            # the gap the dependency rule exists to close.
+            return False
 
-        if not summary.notified:
-            # Not raised: the write already happened, so a retry would only
-            # repeat the announcement, and it would repeat it over the channel
-            # that is down anyway.
-            print_colored(
-                "[oracle_update] the oracle needs attention and no one was notified",
-                "red",
-            )
+        self.clear_skips("oracle_update")
+        return True
 
     def task_handle_epoch(self) -> None:
         for source in self.config.sources:
@@ -348,7 +422,7 @@ class Scheduler:
         depends_on = TASK_DEPENDENCIES.get(task)
         if depends_on is None:
             return False
-        if task not in self._restored and depends_on in self._restored:
+        if task not in self._has_record and depends_on in self._has_record:
             # No record of this one ever running, while the one it follows has a
             # history. Comparing the seeded timestamps would make it look newer
             # than a dependency that ran days ago, which is backwards.
@@ -404,9 +478,17 @@ class Scheduler:
 
             print("[{}] running...".format(task))
             try:
-                self.handler(task)()
+                acted = self.handler(task)()
                 self.record_success(task)
+                if acted is False:
+                    # It ran and declined. Leaving last_run where it is keeps the
+                    # task due, which is what makes it retry rather than wait out
+                    # its interval -- and keeps it out of _has_record, so a task
+                    # that has never actually run is not credited with one.
+                    print("[{}] declined to act; still due next cycle".format(task))
+                    continue
                 self.last_run[task] = now
+                self._has_record.add(task)
                 self._save_state()
             except Exception as e:
                 # Isolated per task: the shell scheduler got this from running

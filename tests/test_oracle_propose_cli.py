@@ -157,7 +157,7 @@ class TestValueOverride(unittest.TestCase):
         self._propose = main.propose_tx_if_needed
         self.proposed = []
 
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (
                 SOURCE,
                 OracleData(name="OG", deployment=DEPLOYMENT, validation=validation()),
@@ -188,7 +188,7 @@ class TestValueOverride(unittest.TestCase):
         """On a schedule this was filtered out as "nothing to do". Invoked by
         hand the request itself is the reason to act -- and the value the
         operator wants to restore may well look healthy to the heuristics."""
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (
                 SOURCE,
                 OracleData(
@@ -206,7 +206,7 @@ class TestValueOverride(unittest.TestCase):
     def test_an_explicit_value_is_proposed_even_mid_transfer(self):
         """The reason to wait is that the computed sum is wrong while a message
         is in flight. A hand-supplied number was not derived from it."""
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (
                 SOURCE,
                 OracleData(
@@ -222,7 +222,7 @@ class TestValueOverride(unittest.TestCase):
         self.assertEqual(self.proposed, [[(ORACLE, [999])]])
 
     def test_a_computed_value_is_not_proposed_mid_transfer(self):
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (
                 SOURCE,
                 OracleData(
@@ -244,7 +244,7 @@ class TestProposeDryRun(unittest.TestCase):
         self._validate = main.validate_oracles
         self._propose = main.propose_tx_if_needed
         self.proposed = []
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (
                 SOURCE,
                 OracleData(name="OG", deployment=DEPLOYMENT, validation=validation()),
@@ -265,10 +265,6 @@ class TestProposeDryRun(unittest.TestCase):
         self.assertTrue(asyncio.run(main.run_oracle_propose(config(), dry_run=True)))
 
         self.assertEqual(self.proposed, [])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestDryRunMatchesTheRealRun(unittest.TestCase):
@@ -296,7 +292,7 @@ class TestDryRunMatchesTheRealRun(unittest.TestCase):
         main.propose_tx_if_needed = self._propose
 
     def _results(self, source, deployment, **overrides):
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (
                 source,
                 OracleData(
@@ -373,3 +369,7 @@ class TestDryRunMatchesTheRealRun(unittest.TestCase):
         )
 
         self.assertEqual([p.calls for p in plans], [[(ORACLE, [4242])]])
+
+
+if __name__ == "__main__":
+    unittest.main()

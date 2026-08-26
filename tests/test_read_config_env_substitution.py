@@ -89,10 +89,6 @@ class TestSubstituteEnvVars(unittest.TestCase):
             self.assertEqual(self.rc._substitute_env_vars("prefix-${A"), "prefix-${A")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestSafeApiKeyIsWired(unittest.TestCase):
     """SAFE_API_KEY is documented as a working variable; it has to be one.
 
@@ -130,3 +126,7 @@ class TestSafeApiKeyIsWired(unittest.TestCase):
         config = self.rc.read_config(self.CONFIG_PATH)
 
         self.assertFalse(config.sources[0].safe_global.api_key)
+
+
+if __name__ == "__main__":
+    unittest.main()

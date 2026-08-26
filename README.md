@@ -13,7 +13,7 @@ A cross-chain oracle monitoring and validation bot that tracks oracle states acr
 
 All environment variables can be optional.
 
-- `ORACLE_UPDATER_PK` - Private key that writes `Oracle.setValue`. Must hold `SET_VALUE_ROLE` on the SourceCore (granted from the Safe; see "Oracle updates"). Deliberately separate from `OPERATOR_PK` — it is the only key that can move the share price.
+- `ORACLE_UPDATER_PK` - Private key that writes `Oracle.setValue`. Must hold `SET_VALUE_ROLE` on the SourceCore (granted from the Safe; see "Oracle updates"). Configured separately from `OPERATOR_PK` so the roles can be split — it is the only key that can move the share price. Pointing both at one account works and is a fine way to start; it just means one nonce sequence shared between the oracle write and everything else.
 - `ORACLE_MAX_DEVIATION_BPS` - Refuse to write a value more than this far from the one on chain (default: `100`, i.e. 1%).
 - `ORACLE_DECREASE_TOLERANCE_WEI` - Refuse to write a value that fell by more than this. Below it, a dip is rounding noise (default: `1000000000`).
 - `ORACLE_UPDATER_MIN_BALANCE_WEI` - Warn when the updater's gas balance drops below this. It still writes; the point is warning while there is runway (default: `100000000000000000`).

@@ -108,7 +108,12 @@ def cmd_oracle(config: Config, args) -> None:
     # announcement -- so they are surfaced here instead, where a person is
     # watching.
     summary = asyncio.run(
-        run_oracle_update(config, force=args.force, dry_run=args.dry_run)
+        run_oracle_update(
+            config,
+            force=args.force,
+            dry_run=args.dry_run,
+            source_name=args.source,
+        )
     )
     if not summary.notified:
         raise Exception(
@@ -126,7 +131,12 @@ def cmd_oracle_propose(config: Config, args) -> None:
     # and needs no lock -- see LOCK_FREE below.
     value = int(args.value) if args.value is not None else None
     if not asyncio.run(
-        run_oracle_propose(config, value_override=value, dry_run=args.dry_run)
+        run_oracle_propose(
+            config,
+            value_override=value,
+            dry_run=args.dry_run,
+            source_name=args.source,
+        )
     ):
         raise Exception(
             "The proposal is queued but nobody could be told; send the Safe link "

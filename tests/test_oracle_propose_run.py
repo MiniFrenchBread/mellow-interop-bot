@@ -139,7 +139,7 @@ class TestTotalValidationOutage(unittest.TestCase):
         main.print_telegram_info = self._info
 
     def test_all_validations_failing_raises(self):
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (SOURCE, OracleData(name="OG", deployment=None, validation=None)),
             (SOURCE, OracleData(name="OG2", deployment=None, validation=None)),
         ]
@@ -151,7 +151,7 @@ class TestTotalValidationOutage(unittest.TestCase):
 
     def test_one_validation_failing_does_not_raise(self):
         """One broken chain must not suppress the others."""
-        main.validate_oracles = lambda _config: [
+        main.validate_oracles = lambda _config, **_kw: [
             (SOURCE, OracleData(name="OG", deployment=None, validation=None)),
             (
                 SOURCE,
@@ -180,7 +180,7 @@ class TestTelegramCannotCancelTheProposal(unittest.TestCase):
         self._info = main.print_telegram_info
         self._send = main.send_message
 
-        main.validate_oracles = lambda _config: result(incorrect_value=True)
+        main.validate_oracles = lambda _config, **_kw: result(incorrect_value=True)
 
         def propose(results, **_kwargs):
             self.proposed.append(results)
