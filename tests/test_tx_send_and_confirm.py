@@ -463,33 +463,6 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(outcome.receipt["status"], 1)
 
-    def test_the_underpriced_path_does_not_ask_the_node_for_a_tip(self):
-        """The node just refused a payload; its own suggestion adds nothing.
-
-        The opening bid asks for one, and the base fee is read every round
-        regardless -- maxFeePerGas is bounded by it, and reusing a stale one is
-        what let a base-fee rise strand a transaction. What must not happen is
-        going back for a tip after each refusal, when the node has just said
-        what it thinks.
-        """
-        w3, fn = make(receipt_script=[], send_script=[Exception(UNDERPRICED)] * 4)
-
-        with self.assertRaises(TxNotConfirmed):
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.01,
-                should_stop=stop_after(fn, 4),
-                fee_cap_gwei=4,
-                poll_latency=0.001,
-            )
-
-        self.assertEqual(
-            w3.eth.tip_reads, 1, "asked the node for a tip after a refusal"
-        )
-
     def test_nonce_too_low_after_our_tx_landed_is_success(self):
         w3, fn = make(
             receipt_script=[receipt()], send_script=[Exception(NONCE_TOO_LOW)]

@@ -449,7 +449,16 @@ def send_and_confirm(
 
         if attempt > 0:
             raised = next_fees(
-                w3, max_fee, max_priority_fee, fee_bump_percent, fee_cap_gwei
+                w3,
+                max_fee,
+                max_priority_fee,
+                fee_bump_percent,
+                fee_cap_gwei,
+                # The node's current suggestion counts as well as the fixed
+                # step. A tip that jumps because the network got busy leaves a
+                # ladder climbing 15% a round far behind it, and the cap would
+                # be reached without the bid ever having been competitive.
+                consider_network=True,
             )
             if raised is not None:
                 max_fee, max_priority_fee = raised

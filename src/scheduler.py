@@ -380,7 +380,11 @@ class Scheduler:
         # The raising variant, not main(): main() swallows everything so the
         # scheduler could never see this task fail.
         summary = asyncio.run(
-            run_oracle_update(self.config, should_stop=lambda: self.stopping)
+            run_oracle_update(
+                self.config,
+                should_stop=lambda: self.stopping,
+                on_stuck=lambda text: self.notify("⚠️ " + text),
+            )
         )
 
         if not summary.notified:

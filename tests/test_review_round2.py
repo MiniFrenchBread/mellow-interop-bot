@@ -428,5 +428,123 @@ class TestAFailedDeploymentIsNotACleanRun(unittest.TestCase):
         self.assertFalse(summary.notified)
 
 
+class TestEverySendSiteGetsTheHooks(unittest.TestCase):
+    """A send runs until the chain settles it, so both hooks are load-bearing.
+
+    A path missing `should_stop` cannot be stopped while a transaction is
+    stuck; a path missing `on_stuck` is silent about it. Checked per task
+    rather than per call site, because the one that was missed was the one
+    reached through its own helper instead of the shared `tx_options` -- and it
+    was the oracle, the task the alert exists for.
+    """
+
+    def _scheduler(self):
+        import os
+        import tempfile
+
+        from config.read_config import SchedulerConfig
+        from scheduler import Scheduler
+
+        cfg = config()
+        cfg.scheduler = SchedulerConfig()
+        return Scheduler(
+            cfg,
+            now=lambda: 0.0,
+            sleep=lambda _s: None,
+            state_path=os.path.join(tempfile.mkdtemp(), "state.json"),
+        )
+
+    def test_the_shared_options_carry_both(self):
+        from config.read_config import TxConfig
+
+        options = self._scheduler().tx_options(TxConfig())
+
+        self.assertIn("should_stop", options)
+        self.assertIn("on_stuck", options)
+
+    def test_the_oracle_path_carries_both(self):
+        """It reaches send_and_confirm through its own helper, not tx_options."""
+        options = main._tx_options(source(), lambda: False, lambda _t: None)
+
+        self.assertIn("should_stop", options)
+        self.assertIn("on_stuck", options)
+
+    def test_the_oracle_task_passes_them_on(self):
+        import inspect
+
+        from scheduler import Scheduler
+
+        body = inspect.getsource(Scheduler.task_oracle_update)
+
+        self.assertIn("should_stop", body)
+        self.assertIn("on_stuck", body)
+
+    def test_update_oracles_threads_them_to_the_send(self):
+        captured = {}
+
+        def update(source, deployment, **kwargs):
+            captured.update(kwargs.get("tx") or {})
+            return SimpleNamespace(
+                name="OG", written=True, alerts=[], skip_reason="", new_value=ONE
+            )
+
+        original = main.update_oracle
+        main.update_oracle = update
+        try:
+            main.update_oracles(
+                config(), should_stop=lambda: False, on_stuck=lambda _t: None
+            )
+        finally:
+            main.update_oracle = original
+
+        self.assertIn("should_stop", captured)
+        self.assertIn("on_stuck", captured)
+
+
+class TestReplacementsFollowTheNetwork(unittest.TestCase):
+    def test_a_bump_takes_the_current_suggestion_into_account(self):
+        """A fixed step alone leaves a ladder far behind a tip that jumped
+        because the network got busy, and the cap would be reached without the
+        bid ever having been competitive."""
+        import inspect
+
+        from web3_scripts import tx
+
+        body = inspect.getsource(tx.send_and_confirm)
+
+        self.assertIn("consider_network=True", body)
+
+    def test_the_suggestion_wins_when_it_is_higher_than_the_step(self):
+        from types import SimpleNamespace as NS
+
+        from web3 import Web3
+
+        from web3_scripts.tx import next_fees
+
+        class Busy:
+            class eth:
+                max_priority_fee = Web3.to_wei(3, "gwei")
+
+                @staticmethod
+                def get_block(_which):
+                    return NS(baseFeePerGas=0)
+
+            @staticmethod
+            def to_wei(value, unit):
+                return Web3.to_wei(value, unit)
+
+        # A 15% step off 1 gwei is 1.15; the network is asking 3.
+        _max_fee, tip = next_fees(
+            Busy,
+            Web3.to_wei(1, "gwei"),
+            Web3.to_wei(1, "gwei"),
+            115,
+            20,
+            consider_network=True,
+        )
+
+        self.assertEqual(tip, Web3.to_wei(3, "gwei"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -150,6 +150,7 @@ async def run_oracle_update(
     dry_run: bool = False,
     source_name: Optional[str] = None,
     should_stop=None,
+    on_stuck=None,
 ) -> OracleRunSummary:
     """Refresh every oracle, and tell someone only when a person is needed.
 
@@ -188,6 +189,7 @@ async def run_oracle_update(
         dry_run=dry_run,
         source_name=source_name,
         should_stop=should_stop,
+        on_stuck=on_stuck,
     )
 
     if not results:
@@ -311,6 +313,7 @@ def update_oracles(
     dry_run: bool = False,
     source_name: Optional[str] = None,
     should_stop=None,
+    on_stuck=None,
 ) -> Tuple[List[Tuple[SourceConfig, Optional[OracleUpdateResult]]], List[Exception]]:
     """Run the heartbeat for every deployment, isolating per-deployment failures.
 
@@ -337,7 +340,7 @@ def update_oracles(
                     oracle_expiry_threshold_seconds=config.oracle_expiry_threshold_seconds,
                     force=force,
                     dry_run=dry_run,
-                    tx=_tx_options(source, should_stop),
+                    tx=_tx_options(source, should_stop, on_stuck),
                 )
             except Exception as e:
                 errors.append(e)
