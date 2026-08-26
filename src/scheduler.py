@@ -51,6 +51,23 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 # refuse. Refreshing the oracle in between removes that.
 TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 
+# A task that owes a run whenever the task it depends on has run more recently
+# than it has, regardless of where the interval boundaries fall.
+#
+# Distributing rewards is the only thing that moves the share price, so between
+# ascend and the write that follows it the oracle is knowingly wrong: rebalance
+# refuses against it, and deposits and withdrawals price against the stale
+# figure. Sharing an interval is not enough to prevent that, because the two
+# drift apart exactly when it matters -- on a first start, where the oracle is
+# seeded to now while ascend is already overdue, and after the oracle has failed
+# onto a retry backoff while ascend keeps to its schedule.
+#
+# Expressed as a rule over the recorded times rather than one task marking
+# another: nothing has to remember to set a flag, and it stays true however the
+# two came to be out of step. It costs nothing in the steady state, where they
+# come due together anyway.
+TASK_DEPENDENCIES = {"oracle_update": "ascend"}
+
 
 def is_due(last_run: float, now: float, interval: int) -> bool:
     """True when now has crossed into a later interval bucket than last_run.
@@ -115,7 +132,15 @@ class Scheduler:
         # bucket entirely and say nothing -- for a fortnightly task that is
         # twenty-eight days between reward distributions, invisibly.
         self.last_run = {task: started for task in TASK_ORDER}
-        self.last_run.update(self._load_state())
+        restored = self._load_state()
+        self.last_run.update(restored)
+        # Which tasks the file actually knew about. Seeding the rest to "now" is
+        # right for the interval -- it stops a first start replaying a bucket
+        # that has already passed -- but wrong for a dependency, where having no
+        # record means the task has never run rather than having just run. The
+        # difference is not academic: renaming a task orphans its saved entry, so
+        # the task that most needs to catch up is the one that looks freshest.
+        self._restored = set(restored)
         self.failures = {task: 0 for task in TASK_ORDER}
         self.skips = {task: 0 for task in TASK_ORDER}
         # A task that failed is retried on a backoff rather than at its next
@@ -312,6 +337,24 @@ class Scheduler:
                 tx=source.tx.as_kwargs(),
             )
 
+    def owes_dependency(self, task: str) -> bool:
+        """Whether the task this one depends on has run more recently than it.
+
+        Compared against the recorded times, so it is true however the two came
+        to be out of step -- a rename that orphaned one task's saved entry, a
+        retry backoff, a first start -- and needs nothing to have remembered to
+        mark it.
+        """
+        depends_on = TASK_DEPENDENCIES.get(task)
+        if depends_on is None:
+            return False
+        if task not in self._restored and depends_on in self._restored:
+            # No record of this one ever running, while the one it follows has a
+            # history. Comparing the seeded timestamps would make it look newer
+            # than a dependency that ran days ago, which is backwards.
+            return True
+        return self.last_run[depends_on] > self.last_run[task]
+
     def handler(self, task: str):
         return getattr(self, "task_" + task)
 
@@ -344,6 +387,12 @@ class Scheduler:
                         )
                     )
                     continue
+            elif self.owes_dependency(task):
+                print(
+                    "[{}] due: {} has run since it last did".format(
+                        task, TASK_DEPENDENCIES[task]
+                    )
+                )
             elif not is_due(self.last_run[task], now, interval):
                 remaining = next_due(self.last_run[task], interval) - now
                 print(

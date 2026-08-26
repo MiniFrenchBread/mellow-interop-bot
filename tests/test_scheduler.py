@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -7,7 +8,13 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config.read_config import Config, SchedulerConfig
-from scheduler import Scheduler, format_duration, is_due, next_due
+from scheduler import (
+    Scheduler,
+    TASK_ORDER,
+    format_duration,
+    is_due,
+    next_due,
+)
 from web3_scripts.tx import NonceBlocked
 import main as oracle_main_module
 
@@ -705,3 +712,121 @@ class TestRetryBackoff(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOracleFollowsAscend(unittest.TestCase):
+    """The oracle owes a write whenever ascend has run since it last did.
+
+    Distributing rewards is the only thing that moves the share price, so
+    between ascend and the write that follows it the oracle is knowingly wrong:
+    rebalance refuses against it, and deposits and withdrawals price against the
+    stale figure. Sharing an interval is not enough, because the two drift apart
+    exactly when it matters.
+    """
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.directory.name, "state.json")
+        self.clock = FakeClock(100 * DAY)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def _scheduler(self, saved=None):
+        if saved is not None:
+            with open(self.path, "w") as handle:
+                json.dump(saved, handle)
+        # sleep is the fake one: run_cycle waits out the post-ascend settling
+        # gap, and a real sleep here makes the suite take a minute per test.
+        return make_scheduler(
+            make_config(),
+            now=self.clock.time,
+            sleep=self.clock.sleep,
+            state_path=self.path,
+        )
+
+    def test_a_renamed_task_still_catches_up(self):
+        """The deployment case. The saved schedule knows `oracle_report`, which
+        no longer exists, so `oracle_update` is seeded to now and looks fresher
+        than an ascend that last ran days ago -- the task that most needs to
+        catch up is the one that looks newest."""
+        scheduler = self._scheduler(
+            {
+                "ascend": 100 * DAY - 3 * DAY,
+                "oracle_report": 100 * DAY - 2 * DAY,
+                "rebalance": 100 * DAY,
+                "handle_epoch": 100 * DAY,
+            }
+        )
+
+        self.assertFalse(
+            is_due(scheduler.last_run["oracle_update"], self.clock.time(), DAY),
+            "seeded to now, so the interval alone would not run it",
+        )
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+
+    def test_a_stale_oracle_after_ascend_runs_is_owed(self):
+        scheduler = self._scheduler(
+            {"ascend": 100 * DAY - DAY, "oracle_update": 100 * DAY - DAY}
+        )
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+        scheduler.last_run["ascend"] = self.clock.time()
+
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+
+    def test_an_oracle_newer_than_ascend_owes_nothing(self):
+        """Steady state. The rule must cost nothing when they are in step, or it
+        would force a write every cycle."""
+        scheduler = self._scheduler(
+            {"ascend": 100 * DAY - DAY, "oracle_update": 100 * DAY - DAY + 60}
+        )
+
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+    def test_a_first_ever_start_owes_nothing(self):
+        """No saved file at all: neither has run, so neither is behind."""
+        scheduler = self._scheduler()
+
+        self.assertFalse(scheduler.owes_dependency("oracle_update"))
+
+    def test_a_task_with_no_dependency_is_unaffected(self):
+        scheduler = self._scheduler({"ascend": 100 * DAY - DAY})
+
+        for task in ("ascend", "rebalance", "handle_epoch"):
+            self.assertFalse(scheduler.owes_dependency(task))
+
+    def test_the_rule_runs_the_task_in_the_same_cycle(self):
+        """End to end through run_cycle, and before rebalance reads the value."""
+        scheduler = self._scheduler(
+            {
+                "ascend": 100 * DAY - 3 * DAY,
+                "oracle_report": 100 * DAY - 2 * DAY,
+                "rebalance": 100 * DAY - DAY,
+                "handle_epoch": 100 * DAY - DAY,
+            }
+        )
+        ran = []
+        for task in TASK_ORDER:
+            setattr(scheduler, "task_" + task, (lambda t: lambda: ran.append(t))(task))
+
+        scheduler.run_cycle()
+
+        self.assertIn("oracle_update", ran)
+        self.assertLess(ran.index("oracle_update"), ran.index("rebalance"))
+
+    def test_a_pending_retry_still_wins(self):
+        """A failing oracle must not be hammered once per cycle by the rule."""
+        scheduler = self._scheduler(
+            {"ascend": 100 * DAY - 3 * DAY, "oracle_report": 100 * DAY - 2 * DAY}
+        )
+        self.assertTrue(scheduler.owes_dependency("oracle_update"))
+        scheduler.retry_after["oracle_update"] = self.clock.time() + HOUR
+
+        ran = []
+        for task in TASK_ORDER:
+            setattr(scheduler, "task_" + task, (lambda t: lambda: ran.append(t))(task))
+
+        scheduler.run_cycle()
+
+        self.assertNotIn("oracle_update", ran)
