@@ -57,7 +57,7 @@ class TestOracleExitStatus(unittest.TestCase):
         from main import OracleRunSummary
 
         async def update(_config, force=False, dry_run=False, source_name=None):
-            return OracleRunSummary(notified=delivered)
+            return OracleRunSummary(notified=delivered, written=1)
 
         self.main.run_oracle_update = update
         return cli.cmd_oracle(

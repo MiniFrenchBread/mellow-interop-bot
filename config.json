@@ -21,7 +21,6 @@
   "tx": {
     "target": {
       "receipt-timeout-seconds": "${TARGET_RECEIPT_TIMEOUT:600}",
-      "max-attempts": "${TARGET_TX_MAX_ATTEMPTS:4}",
       "fee-bump-percent": "${TX_FEE_BUMP_PERCENT:115}",
       "fee-cap-gwei": "${TARGET_FEE_CAP_GWEI:4}"
     }

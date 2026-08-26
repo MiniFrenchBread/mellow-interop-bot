@@ -454,7 +454,12 @@ def _create_tx_config(tx_dict: Optional[Dict[str, Any]]) -> TxConfig:
             tx_dict.get("fee_bump_percent", DEFAULT_TX_FEE_BUMP_PERCENT),
             101,
         ),
-        fee_cap_gwei=int(tx_dict.get("fee_cap_gwei", DEFAULT_TX_FEE_CAP_GWEI)),
+        # Floored like fee-bump-percent above, and for the same kind of reason:
+        # a cap of zero leaves no bid that clears it, so the very first attempt
+        # decides nothing further can be offered and the send waits forever.
+        fee_cap_gwei=_at_least(
+            "fee-cap-gwei", tx_dict.get("fee_cap_gwei", DEFAULT_TX_FEE_CAP_GWEI), 1
+        ),
     )
 
 

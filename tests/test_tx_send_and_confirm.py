@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -536,7 +537,7 @@ class TestSendAndConfirm(unittest.TestCase):
         This is what lets a refusal be read as proof the payload is not live,
         which is what justifies dropping its hash from the poll set. The count
         of attempts is deliberately not asserted: `priority_ceiling` derives the
-        opening bid from `max_attempts`, so the ladder has exactly that many
+        opening bid at what the network asks, and the ladder climbs from there
         rungs and the loop ends on the last one either way. The property that
         carries weight is that no two of them are the same.
         """
@@ -711,6 +712,165 @@ class TestItRunsUntilTheChainDecides(unittest.TestCase):
             )
 
         self.assertEqual(len(fn.built), 1, "stopped at the first check after a send")
+
+
+class TestTheLoopAlwaysPaces(unittest.TestCase):
+    """The wait is the only delay in the send loop, so it must always happen.
+
+    Both ways the poll could return instantly are reachable in ordinary
+    operation -- an empty poll set after a refused replacement, and a node that
+    will not answer -- and either one turned an unbounded wait into an
+    unbounded spin: a pinned core, no broadcasts, no return, and the scheduler
+    task never coming back so every other task stopped too, with nothing having
+    failed to alert on.
+    """
+
+    def test_an_empty_poll_set_still_consumes_the_wait(self):
+        started = time.monotonic()
+
+        tx_module._poll(None, [], 0.2, 0.01)
+
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
+
+    def test_an_unreachable_node_still_consumes_the_wait(self):
+        class Unreachable:
+            class eth:
+                @staticmethod
+                def get_transaction_receipt(_hash):
+                    raise Exception("connection refused")
+
+        started = time.monotonic()
+
+        tx_module._poll(Unreachable, ["0xabc"], 0.2, 0.01)
+
+        self.assertGreaterEqual(time.monotonic() - started, 0.15)
+
+    def test_an_unreachable_node_is_retried_within_the_window(self):
+        """Rather than ending it: the node being down says nothing about the
+        transaction, and there is no deadline left to protect."""
+        calls = {"n": 0}
+
+        class FlakyThenFine:
+            class eth:
+                @staticmethod
+                def get_transaction_receipt(tx_hash):
+                    calls["n"] += 1
+                    if calls["n"] < 3:
+                        raise Exception("connection refused")
+                    return receipt(tx_hash=tx_hash)
+
+        found = tx_module._poll(FlakyThenFine, ["0xabc"], 1.0, 0.01)
+
+        self.assertIsNotNone(found)
+        self.assertGreaterEqual(calls["n"], 3)
+
+    def test_at_the_cap_the_loop_does_not_spin(self):
+        """End to end: a send that can offer nothing more must still be paced.
+
+        Bounded by should_stop because it would otherwise wait for a receipt
+        that never comes -- which is the point: the question is whether those
+        rounds take any time at all.
+        """
+        w3, fn = make()
+        w3.eth.max_priority_fee = Web3.to_wei(4, "gwei")
+
+        started = time.monotonic()
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.05,
+                fee_cap_gwei=4,
+                poll_latency=0.01,
+                should_stop=stop_after(4),
+            )
+
+        self.assertGreaterEqual(
+            time.monotonic() - started, 0.15, "the rounds took no time at all"
+        )
+
+
+class TestATransientErrorDoesNotLatchTheCap(unittest.TestCase):
+    def test_an_unreachable_node_is_not_the_cap(self):
+        """Reaching the cap is permanent; failing to ask is not. Conflating
+        them latched the send into waiting forever at a fee far below the
+        ceiling, while logging that the ceiling had been reached."""
+
+        class NoNetwork:
+            class eth:
+                @staticmethod
+                def get_block(_which):
+                    raise Exception("connection refused")
+
+            @staticmethod
+            def to_wei(value, _unit):
+                return int(value * 1e9)
+
+        fees, capped = tx_module._next_fees(
+            NoNetwork, 10**9, 10**9, 115, 4, consider_network=True
+        )
+
+        self.assertIsNone(fees)
+        self.assertFalse(capped, "a transient failure must not latch at_cap")
+
+    def test_the_real_cap_is_reported_as_capped(self):
+        class Quiet:
+            class eth:
+                max_priority_fee = Web3.to_wei(4, "gwei")
+
+                @staticmethod
+                def get_block(_which):
+                    return {"baseFeePerGas": 0}
+
+            @staticmethod
+            def to_wei(value, unit):
+                return Web3.to_wei(value, unit)
+
+        fees, capped = tx_module._next_fees(
+            Quiet,
+            Web3.to_wei(4, "gwei"),
+            Web3.to_wei(4, "gwei"),
+            115,
+            4,
+            consider_network=False,
+        )
+
+        self.assertIsNone(fees)
+        self.assertTrue(capped)
+
+
+class TestARevertDoesNotAbandonALiveTransaction(unittest.TestCase):
+    def test_a_revert_with_nothing_out_there_is_settled(self):
+        w3, fn = make(send_script=[Exception("execution reverted")])
+
+        with self.assertRaises(TxReverted):
+            send_and_confirm(
+                fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.01, poll_latency=0.001
+            )
+
+    def test_a_revert_after_a_broadcast_waits_for_the_live_one(self):
+        """That transaction owns the nonce and will settle it -- reverting on
+        chain gives a receipt with status 0, the same answer with a hash on it.
+        Raising here would abandon it, which is the one thing this promises not
+        to do."""
+
+        def once_two_have_been_sent(eth, tx_hash):
+            if len(eth.sent) < 2:
+                return None
+            return receipt(tx_hash=tx_hash)
+
+        w3, fn = make(
+            send_script=[None, None, Exception("execution reverted")],
+            resolver=once_two_have_been_sent,
+        )
+
+        outcome = send_and_confirm(
+            fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.05, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
 
 
 if __name__ == "__main__":

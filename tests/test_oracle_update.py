@@ -159,11 +159,9 @@ class TestHeartbeatWrites(unittest.TestCase):
     def test_the_label_does_not_change_with_the_value(self):
         """A label carrying the value would break the heartbeat after one slow send.
 
-        tx.blocking_transaction treats a differing label as a different
-        operation and refuses to reuse the nonce, so a setValue still stuck in
-        the mempool would make every later tick raise NonceBlocked instead of
-        replacing it. A constant label makes each tick a replacement carrying
-        the newer value.
+        The label names the operation in logs and in the fee-bump messages,
+        and a heartbeat whose label changed with its value would make every
+        replacement of a slow send read as a different operation.
         """
         first = Harness(self, validation(actual_value=ONE + 10**13))
         self._run(first)

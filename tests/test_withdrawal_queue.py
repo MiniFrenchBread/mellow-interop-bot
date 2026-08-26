@@ -212,11 +212,11 @@ class TestTxSettingsReachTheSend(unittest.TestCase):
             QUEUE,
             KEY,
             max_iterations=1,
-            tx={"receipt_timeout": 60, "max_attempts": 3},
+            tx={"receipt_timeout": 60, "fee_cap_gwei": 7},
         )
 
         self.assertEqual(self.captured[0]["receipt_timeout"], 60)
-        self.assertEqual(self.captured[0]["max_attempts"], 3)
+        self.assertEqual(self.captured[0]["fee_cap_gwei"], 7)
 
 
 if __name__ == "__main__":

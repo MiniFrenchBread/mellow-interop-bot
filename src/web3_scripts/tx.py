@@ -376,6 +376,9 @@ def send_and_confirm(
     sent_hashes: List[str] = []
     attempt = 0
     at_cap = False
+    # The last payload actually signed, kept so it can be rebroadcast at the
+    # cap without signing a new one.
+    last_raw = None
     # Set when the node itself refused the last payload as underpriced. It has
     # just told us what it thinks; going back to it for a fee suggestion is a
     # round trip that can only repeat the answer.
@@ -393,14 +396,30 @@ def send_and_confirm(
             )
 
         if at_cap:
-            # Nothing higher can be offered, so re-signing would rebroadcast a
-            # payload the node already has. Just wait for it.
+            # Nothing higher can be offered, so there is no new payload to
+            # sign. The one already signed is rebroadcast each round anyway:
+            # "the node already has it" stops being true the moment the
+            # mempool evicts it or the node restarts, and waiting on a hash
+            # nothing holds any more would poll until the oracle expired --
+            # while holding the process lock. A node that does still have it
+            # answers "already known", which costs nothing.
+            if last_raw is not None:
+                try:
+                    w3.eth.send_raw_transaction(last_raw)
+                except Exception as e:
+                    if not is_already_known(e):
+                        _log("{}Could not rebroadcast at the cap: {}".format(prefix, e))
             receipt = _poll(w3, sent_hashes, receipt_timeout, poll_latency)
             if receipt is not None:
                 return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
             continue
 
         attempt += 1
+        # Cleared each round: assigned inside the try below, after _sign has
+        # talked to the node, so without this the handler either sees nothing
+        # bound at all or -- worse -- the previous round's hash, and the
+        # underpriced branch would drop a hash that is genuinely live.
+        tx_hash = None
 
         try:
             signed = _sign(
@@ -419,7 +438,8 @@ def send_and_confirm(
             # accepted the payload, this hash is the only way to find it again.
             if tx_hash not in sent_hashes:
                 sent_hashes.append(tx_hash)
-            w3.eth.send_raw_transaction(signed.raw_transaction)
+            last_raw = signed.raw_transaction
+            w3.eth.send_raw_transaction(last_raw)
             print(
                 "{}Transaction sent: {} (nonce {}, attempt {})".format(
                     prefix, tx_hash, nonce, attempt
@@ -429,7 +449,7 @@ def send_and_confirm(
             if is_already_known(e):
                 _log(
                     "{}Transaction {} already in the node's pool, waiting for it".format(
-                        prefix, tx_hash
+                        prefix, tx_hash or "just signed"
                     )
                 )
             elif is_nonce_too_low(e):
@@ -460,9 +480,27 @@ def send_and_confirm(
                     )
                 )
             elif is_revert(e):
-                # The call cannot succeed against current state. Retrying buys
-                # nothing and this is as settled as it gets.
-                raise TxReverted("{}Transaction cannot succeed: {}".format(prefix, e))
+                # A refused payload is not live, so it comes out of the poll set
+                # first -- the hash goes in before the broadcast precisely
+                # because a call can raise after the node accepted it, which is
+                # not what happened here.
+                if tx_hash in sent_hashes:
+                    sent_hashes.remove(tx_hash)
+                if not sent_hashes:
+                    # Nothing is out there and the call cannot succeed, so this
+                    # is settled.
+                    raise TxReverted(
+                        "{}Transaction cannot succeed: {}".format(prefix, e)
+                    )
+                # An earlier attempt is still live. It owns the nonce and will
+                # settle it either way -- reverting on chain gives a receipt
+                # with status 0, the same answer with a hash attached. Raising
+                # now would abandon it, which is the one thing this promises not
+                # to do.
+                _log(
+                    "{}Broadcast refused as a revert, but an earlier attempt is "
+                    "still live; waiting for it".format(prefix)
+                )
             else:
                 # Anything else -- an unreachable node, a refused connection --
                 # says nothing about the transaction. Waiting is the only answer
@@ -478,7 +516,7 @@ def send_and_confirm(
             if receipt is not None:
                 return _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix)
 
-        raised = _next_fees_or_wait(
+        raised, capped = _next_fees(
             w3,
             max_fee,
             max_priority_fee,
@@ -488,11 +526,12 @@ def send_and_confirm(
         )
         refused = False
         if raised is None:
-            _log(
-                "{}Fee cap of {} gwei reached; nothing further can outbid the "
-                "incumbent, so waiting for it".format(prefix, fee_cap_gwei)
-            )
-            at_cap = True
+            if capped:
+                _log(
+                    "{}Fee cap of {} gwei reached; nothing further can outbid "
+                    "the incumbent, so waiting for it".format(prefix, fee_cap_gwei)
+                )
+                at_cap = True
             continue
         max_fee, max_priority_fee = raised
         _log(
@@ -503,22 +542,38 @@ def send_and_confirm(
 
 
 def _poll(w3: Web3, sent_hashes, timeout: float, poll_latency: float):
-    """Wait for any of these hashes, treating an unreachable node as "not yet".
+    """Wait up to `timeout` for any of these hashes, or None.
 
-    An RPC outage during polling says nothing about the transaction, and this
-    never gives up, so there is nothing to be gained by turning it into an
-    error.
+    Always consumes the time it was given -- whether or not there is anything
+    to poll, and whether or not the node answers. That is not politeness: this
+    is the only delay in the caller's loop, so a poll that can return instantly
+    turns an unbounded wait into an unbounded spin. Both of the ways it used to
+    return early are reachable in ordinary operation -- an empty poll set after
+    a refused replacement, and an unreachable node -- and either one pinned a
+    core while broadcasting nothing.
+
+    An RPC error is retried within the window rather than ending it. The node
+    being unreachable says nothing about the transaction, and there is no
+    deadline left to protect.
     """
-    if not sent_hashes:
-        return None
-    try:
-        return wait_any_receipt(w3, sent_hashes, timeout, poll_latency)
-    except Exception as e:
-        _log("Could not check for a receipt: {}".format(e))
-        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        if sent_hashes:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    receipt = wait_any_receipt(w3, sent_hashes, remaining, poll_latency)
+                    if receipt is not None:
+                        return receipt
+                except Exception as e:
+                    _log("Could not check for a receipt: {}".format(e))
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return None
+        time.sleep(min(poll_latency, left))
 
 
-def _next_fees_or_wait(
+def _next_fees(
     w3: Web3,
     max_fee: int,
     max_priority_fee: int,
@@ -526,9 +581,17 @@ def _next_fees_or_wait(
     cap_gwei: int,
     consider_network: bool = True,
 ):
-    """The next fee to offer, or None when the cap leaves nothing higher."""
+    """(fees, capped) -- what to offer next, and why there is nothing.
+
+    The two reasons to have no higher offer are not the same and must not be
+    conflated. Reaching the cap is permanent: bumping is monotonic, so nothing
+    later makes a better bid possible, and the caller is right to stop signing.
+    Failing to reach the node is transient, and treating it as the cap latched
+    the send into waiting forever at a fee far below the ceiling -- while
+    logging that the cap had been reached.
+    """
     try:
-        return next_fees(
+        raised = next_fees(
             w3,
             max_fee,
             max_priority_fee,
@@ -540,26 +603,8 @@ def _next_fees_or_wait(
         # Reads the latest block over a connection that may be the reason there
         # was no receipt. Keep the current fee and try again next round.
         _log("Could not work out a replacement fee: {}".format(e))
-        return None
-
-
-def _with_hashes(error: Exception, sent_hashes: List[str], nonce: int) -> Exception:
-    """Re-shape an error raised after a broadcast so it carries the hashes.
-
-    Whatever went wrong, the transactions named here may still be on chain, and
-    losing track of them is the one outcome this module must never produce.
-    """
-    if not sent_hashes:
-        return error
-    wrapped = TxNotConfirmed(
-        "Interrupted while confirming nonce {}: {}. Broadcast hashes: {}".format(
-            nonce, error, ", ".join(sent_hashes)
-        ),
-        sent_hashes,
-        nonce,
-    )
-    wrapped.__cause__ = error
-    return wrapped
+        return None, False
+    return raised, raised is None
 
 
 def _confirmed(w3, receipt, nonce, attempt, sent_hashes, prefix) -> TxOutcome:

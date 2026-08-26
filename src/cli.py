@@ -115,6 +115,13 @@ def cmd_oracle(config: Config, args) -> None:
             source_name=args.source,
         )
     )
+    if not args.dry_run and not summary.written:
+        # A person ran this and nothing reached the chain -- a guard refused, or
+        # a transfer was in flight. Exiting zero would report that as done.
+        raise Exception(
+            "The oracle was not written; see the output above for which guard "
+            "refused or what blocked it"
+        )
     if not summary.notified:
         raise Exception(
             "The oracle run needs attention but could not notify anyone; check "

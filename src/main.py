@@ -114,7 +114,16 @@ async def main() -> int:
         dotenv.load_dotenv()
         config = read_config(str(CONFIG_PATH))
         with ProcessLock(config.scheduler.lock_file):
-            await run_oracle_update(config)
+            summary = await run_oracle_update(config)
+        # The summary is the point of the exit status. With one deployment a
+        # refusal or a skip means nothing was written at all, which is exactly
+        # the outcome a supervisor must not read as success -- and it is what
+        # this function's own docstring promises to report.
+        if not summary.written:
+            print_colored("Nothing was written", "red")
+            return 1
+        if not summary.notified:
+            return 1
         return 0
     except FileNotFoundError:
         print(f"Error: config.json not found")

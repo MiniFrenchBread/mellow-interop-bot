@@ -45,7 +45,7 @@ class TestStandaloneEntryPoint(unittest.TestCase):
 
     def _succeeds(self):
         async def run(_config):
-            return main.OracleRunSummary()
+            return main.OracleRunSummary(written=1)
 
         main.run_oracle_update = run
 
@@ -57,7 +57,9 @@ class TestStandaloneEntryPoint(unittest.TestCase):
 
     def test_it_takes_the_lock_before_writing(self):
         """Two processes reading the same account's nonce independently is what
-        the lock exists to prevent, and tx._unreconciled is per-process."""
+        the lock exists to prevent. A send runs until the chain settles it,
+        which keeps two operations in one process off the same nonce, but
+        neither process can see the other's."""
         self._succeeds()
 
         asyncio.run(main.main())
@@ -96,13 +98,57 @@ class TestStandaloneEntryPoint(unittest.TestCase):
 
         async def run(_config):
             held.append(list(self.taken))
-            return main.OracleRunSummary()
+            return main.OracleRunSummary(written=1)
 
         main.run_oracle_update = run
 
         asyncio.run(main.main())
 
         self.assertEqual(held, [[1]])
+
+
+class TestNothingWrittenIsAFailure(unittest.TestCase):
+    """With one deployment, a refusal means nothing reached the chain.
+
+    Exiting zero there tells systemd or cron that a run which wrote nothing
+    succeeded -- the outcome the exit status was added to report.
+    """
+
+    def setUp(self):
+        self.taken = []
+        self._lock = main.ProcessLock
+        self._run = main.run_oracle_update
+        main.ProcessLock = lambda _path: RecordingLock(self.taken)
+
+    def tearDown(self):
+        main.ProcessLock = self._lock
+        main.run_oracle_update = self._run
+
+    def _summary(self, **fields):
+        async def run(_config):
+            return main.OracleRunSummary(**fields)
+
+        main.run_oracle_update = run
+
+    def test_a_guard_refusal_exits_non_zero(self):
+        self._summary(written=0, notified=True)
+
+        self.assertEqual(asyncio.run(main.main()), 1)
+
+    def test_a_skip_exits_non_zero(self):
+        self._summary(written=0, notified=True, skip_reasons=["OFT in flight"])
+
+        self.assertEqual(asyncio.run(main.main()), 1)
+
+    def test_a_write_that_could_not_be_announced_exits_non_zero(self):
+        self._summary(written=1, notified=False)
+
+        self.assertEqual(asyncio.run(main.main()), 1)
+
+    def test_a_clean_run_exits_zero(self):
+        self._summary(written=1, notified=True)
+
+        self.assertEqual(asyncio.run(main.main()), 0)
 
 
 if __name__ == "__main__":

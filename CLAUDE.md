@@ -190,13 +190,9 @@ proposers for one Safe.
   SourceCore, so the share price is a step function whose stride is the **ascend** interval, not
   the oracle interval. Writing the oracle more often than ascend runs just rewrites the same
   number; a test binds `ascend <= oracle_update`.
-- `send_and_confirm`'s label for the oracle write is the constant `SET_VALUE_LABEL`, deliberately
-  carrying no value in it. `tx.blocking_transaction` treats a differing label as a *different*
-  operation and refuses to reuse the nonce, so a label naming the value would make every tick
-  after one slow send raise `NonceBlocked` instead of replacing it — the heartbeat would stop
-  silently after a single timeout.
-- The oracle updater and the executor are separate accounts, so their nonce sequences do not
-  interact: `tx._unreconciled` is keyed by `(chain_id, sender)`.
+- `send_and_confirm`'s label for the oracle write is the constant `SET_VALUE_LABEL`. It names the
+  operation in logs and in the fee-bump messages; it carries no nonce semantics, because a send now
+  runs until the chain settles it and no two operations can be in flight on one nonce.
 - The guards refuse rather than write, and a refusal **does not self-heal** — ascend keeps adding
   rewards, so the gap widens daily, and rebalance starts refusing too. `maxAge` is the deadline.
 - Safe transaction proposals: the bot first checks for an existing queued transaction with matching calldata before proposing a new one, to avoid duplicates.
