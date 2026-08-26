@@ -40,8 +40,14 @@ def validate_source(target_w3: Web3, source: SourceConfig):
     w3 = get_w3(source.rpc)
     validate_rpc_url(w3, source.name)
     validate_source_helper(w3, source)
-    validate_deployments(w3, target_w3, source)
+    # Before validate_deployments, and deliberately so. This exists to answer
+    # "was the role granted?" in one line before a deploy, and it only needs the
+    # source-core addresses from config -- not the cross-reference checks. Run
+    # after them, any unrelated failure in that pass (the symbol assertion is
+    # currently one) aborts the run before the question is ever asked, which is
+    # precisely when someone is relying on the answer.
     validate_oracle_updater(w3, source)
+    validate_deployments(w3, target_w3, source)
     validate_all_safe_globals(w3, source)
 
 
