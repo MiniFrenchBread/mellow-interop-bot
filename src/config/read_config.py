@@ -507,8 +507,13 @@ def _create_oracle_update_config(
     """
     if not oracle_dict:
         return None
-    if not oracle_dict.get("updater_private_key"):
-        return None
+    # A present section with an unresolved key is kept, not collapsed to None.
+    # The two states need telling apart: "no oracle-update section" is a source
+    # that does not do this, while "section declared, ORACLE_UPDATER_PK unset"
+    # is a misconfiguration -- and returning None for both let validate-config
+    # print a clean skip while every cycle raised. Loading still succeeds, so
+    # every other command keeps working; the check that exists to catch this
+    # is where it is caught.
     return OracleUpdateConfig(
         updater_private_key=oracle_dict["updater_private_key"],
         # Both floors are 1, not 0. Zero would read as "no limit" to whoever set

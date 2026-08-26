@@ -169,6 +169,7 @@ def execute(
     fee_cap_gwei: int = DEFAULT_FEE_CAP_GWEI,
     label: str = "",
     should_stop=None,
+    on_stuck=None,
 ) -> TxOutcome:
     return send_and_confirm(
         contractFunction,
@@ -180,6 +181,7 @@ def execute(
         fee_cap_gwei=fee_cap_gwei,
         label=label,
         should_stop=should_stop,
+        on_stuck=on_stuck,
     )
 
 

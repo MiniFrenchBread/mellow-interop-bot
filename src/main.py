@@ -115,13 +115,22 @@ async def main() -> int:
         config = read_config(str(CONFIG_PATH))
         with ProcessLock(config.scheduler.lock_file):
             summary = await run_oracle_update(config)
-        # The summary is the point of the exit status. With one deployment a
-        # refusal or a skip means nothing was written at all, which is exactly
-        # the outcome a supervisor must not read as success -- and it is what
-        # this function's own docstring promises to report.
-        if not summary.written:
+        # The summary is the point of the exit status. A refusal or a failure
+        # means nothing was written and will not be without a person, which a
+        # supervisor must not read as success.
+        #
+        # A skip is different and deliberately not a failure: a cross-chain
+        # transfer settles in minutes and the next run writes. Collapsing that
+        # into a process failure would have cron reporting one whenever a
+        # transfer happened to be crossing.
+        if not summary.written and not summary.skip_reasons:
             print_colored("Nothing was written", "red")
             return 1
+        if not summary.written:
+            print_colored(
+                "Nothing written this run: {}".format("; ".join(summary.skip_reasons)),
+                "yellow",
+            )
         if not summary.notified:
             return 1
         return 0
@@ -248,7 +257,11 @@ async def run_oracle_update(
                 ),
                 "red",
             )
-            summary.notified = False
+            # Not on a dry run: nothing was meant to be sent, so nothing failed
+            # to send. Reporting otherwise made `cli.py oracle --dry-run` --
+            # the first diagnostic the runbook names after a refusal -- fail
+            # with a Telegram error that has nothing to do with it.
+            summary.notified = dry_run
             return summary
         print(
             "Oracle(s) refreshed: {}".format(
@@ -267,6 +280,10 @@ async def run_oracle_update(
         # alert it would send names the guard refusal and @s the signers, and
         # its own text tells the reader to run this very command -- so every
         # check would re-page everyone.
+        #
+        # notified stays true: nothing was meant to be sent, so nothing failed
+        # to send. Left false, the first diagnostic the README tells an operator
+        # to run reported a Telegram problem that has nothing to do with it.
         print_colored("Would send:\n" + message, "yellow")
         return summary
 
@@ -916,11 +933,13 @@ def propose_tx_to_update_oracle(
     return result
 
 
-def _tx_options(source: SourceConfig, should_stop) -> dict:
-    """Chain settings plus the shutdown hook, in the dict every send reads."""
+def _tx_options(source: SourceConfig, should_stop, on_stuck=None) -> dict:
+    """Chain settings plus the caller's hooks, in the dict every send reads."""
     options = source.tx.as_kwargs()
     if should_stop is not None:
         options["should_stop"] = should_stop
+    if on_stuck is not None:
+        options["on_stuck"] = on_stuck
     return options
 
 

@@ -68,7 +68,8 @@ class FakeEth:
     ):
         self.account = Web3().eth.account
         self.chain_id = CHAIN_ID
-        self.max_priority_fee = 10**9
+        self._max_priority_fee = 10**9
+        self.tip_reads = 0
         self._balance = balance
         self.receipt_script = list(receipt_script or [])
         self.send_script = list(send_script or [])
@@ -76,6 +77,15 @@ class FakeEth:
         self.sent = []
         self.receipt_queries = []
         self.nonce_calls = []
+
+    @property
+    def max_priority_fee(self):
+        self.tip_reads += 1
+        return self._max_priority_fee
+
+    @max_priority_fee.setter
+    def max_priority_fee(self, value):
+        self._max_priority_fee = value
 
     def get_balance(self, _address):
         return self._balance
@@ -173,18 +183,42 @@ def only_the_replacement_lands(eth, tx_hash):
     return None
 
 
-def stop_after(attempts: int):
-    """Bound an otherwise unbounded send so a test can inspect N attempts.
+def stop_after_calls(calls: int):
+    """Bound a send by how many times the hook is consulted.
 
-    send_and_confirm runs until the chain settles the transaction, so a test
-    whose fake never produces a receipt has to say when to stop -- which is the
-    same hook the scheduler uses for shutdown.
+    For tests where the payload count cannot be the bound, because at the cap
+    the same payload is re-sent and the count stops moving.
     """
     seen = {"n": 0}
 
     def should_stop() -> bool:
         seen["n"] += 1
-        return seen["n"] > attempts
+        return seen["n"] > calls
+
+    return should_stop
+
+
+def stop_after(fn, attempts: int):
+    """Bound an otherwise unbounded send so a test can inspect N attempts.
+
+    send_and_confirm runs until the chain settles the transaction, so a test
+    whose fake never produces a receipt has to say when to stop -- the same
+    hook the scheduler uses for shutdown.
+
+    Counted in payloads signed rather than in calls to the hook. The hook is
+    consulted inside the wait as well as at the top of the loop, so that a stop
+    is honoured promptly rather than a whole timeout later, which makes the
+    number of calls an artefact of the polling interval.
+    """
+
+    deadline = time.monotonic() + 2.0
+
+    def should_stop() -> bool:
+        # Either bound will do. The payload count is the one tests reason about;
+        # the clock is there because a send that reaches the fee cap stops
+        # signing altogether, so the count alone would never be reached and the
+        # test would hang rather than fail.
+        return len(fn.built) >= attempts or time.monotonic() > deadline
 
     return should_stop
 
@@ -308,54 +342,6 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(w3.eth.nonce_calls, ["latest"])
 
-    def test_bumping_stops_once_the_cap_is_reached(self):
-        """With the tip already above the cap there is nowhere left to climb."""
-        w3, fn = make(receipt_script=[])
-        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
-
-        with self.assertRaises(TxNotConfirmed):
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.01,
-                should_stop=stop_after(4),
-                fee_cap_gwei=4,
-                poll_latency=0.001,
-            )
-
-        self.assertLess(len(fn.built), 4, "stops instead of repeating a payload")
-        self.assertLessEqual(
-            fn.built[-1]["maxPriorityFeePerGas"], Web3.to_wei(4, "gwei")
-        )
-
-    def test_no_attempt_repeats_a_payload(self):
-        """Every attempt must offer strictly more than the last.
-
-        Re-signing identical fields produces the same hash, which is noise, and
-        makes it ambiguous whether a later refusal refers to a payload the node
-        had already accepted -- the premise the refusal handling relies on.
-        """
-        w3, fn = make(receipt_script=[])
-        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
-
-        with self.assertRaises(TxNotConfirmed):
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.01,
-                should_stop=stop_after(4),
-                fee_cap_gwei=4,
-                poll_latency=0.001,
-            )
-
-        fees = [t["maxPriorityFeePerGas"] for t in fn.built]
-        self.assertEqual(len(fees), len(set(fees)), "a payload was signed twice")
-        self.assertEqual(fees, sorted(fees))
-
     def test_the_fee_cap_still_caps_after_a_bump(self):
         """A cap is a limit on what we will pay, replacements included."""
         w3, fn = make(receipt_script=[])
@@ -367,7 +353,7 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                should_stop=stop_after(4),
+                should_stop=stop_after(fn, 4),
                 fee_cap_gwei=1,
                 poll_latency=0.001,
             )
@@ -385,7 +371,6 @@ class TestSendAndConfirm(unittest.TestCase):
             TEST_KEY,
             w3=w3,
             receipt_timeout=0.01,
-            should_stop=stop_after(2),
             poll_latency=0.001,
         )
 
@@ -413,7 +398,6 @@ class TestSendAndConfirm(unittest.TestCase):
             TEST_KEY,
             w3=w3,
             receipt_timeout=0.01,
-            should_stop=stop_after(2),
             poll_latency=0.001,
         )
 
@@ -428,40 +412,11 @@ class TestSendAndConfirm(unittest.TestCase):
             TEST_KEY,
             w3=w3,
             receipt_timeout=0.01,
-            should_stop=stop_after(2),
             poll_latency=0.001,
         )
 
         self.assertEqual(outcome.tx_hash, outcome.tx_hashes[1])
         self.assertNotEqual(outcome.tx_hashes[0], outcome.tx_hashes[1])
-
-    def test_refused_payloads_are_not_polled_for(self):
-        """A refusal is definitive: that payload is in no pool and cannot appear.
-
-        Polling for it spends the whole budget on nothing and names hashes in
-        the failure that an operator will never find on chain.
-        """
-        import time as _time
-
-        w3, fn = make(receipt_script=[], send_script=[Exception(UNDERPRICED)] * 3)
-
-        started = _time.monotonic()
-        with self.assertRaises(TxNotConfirmed) as caught:
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=1,
-                should_stop=stop_after(3),
-                fee_cap_gwei=4,
-                poll_latency=0.01,
-            )
-        elapsed = _time.monotonic() - started
-
-        self.assertEqual(caught.exception.tx_hashes, [])
-        self.assertIn("0 transaction(s) may still be in flight", str(caught.exception))
-        self.assertLess(elapsed, 1, "must not wait out a timeout for nothing")
 
     def test_revert_during_estimation_is_not_retried(self):
         w3, fn = make(estimate_error=Exception(REVERTED))
@@ -508,14 +463,16 @@ class TestSendAndConfirm(unittest.TestCase):
 
         self.assertEqual(outcome.receipt["status"], 1)
 
-    def test_the_underpriced_path_makes_no_network_call(self):
-        """The node just refused a payload; do not go back to it for a fee.
+    def test_the_underpriced_path_does_not_ask_the_node_for_a_tip(self):
+        """The node just refused a payload; its own suggestion adds nothing.
 
-        The slow path consults the network deliberately and is guarded for it.
-        This one relies on a keyword default to stay offline.
+        The opening bid asks for one, and the base fee is read every round
+        regardless -- maxFeePerGas is bounded by it, and reusing a stale one is
+        what let a base-fee rise strand a transaction. What must not happen is
+        going back for a tip after each refusal, when the node has just said
+        what it thinks.
         """
         w3, fn = make(receipt_script=[], send_script=[Exception(UNDERPRICED)] * 4)
-        w3.eth.block_reads = 0
 
         with self.assertRaises(TxNotConfirmed):
             send_and_confirm(
@@ -524,46 +481,14 @@ class TestSendAndConfirm(unittest.TestCase):
                 TEST_KEY,
                 w3=w3,
                 receipt_timeout=0.01,
-                should_stop=stop_after(4),
+                should_stop=stop_after(fn, 4),
                 fee_cap_gwei=4,
                 poll_latency=0.001,
             )
 
-        self.assertEqual(w3.eth.block_reads, 1, "only the opening fee reads a block")
-
-    def test_the_underpriced_path_never_repeats_a_payload(self):
-        """Every refusal must be answered with a strictly better offer.
-
-        This is what lets a refusal be read as proof the payload is not live,
-        which is what justifies dropping its hash from the poll set. The count
-        of attempts is deliberately not asserted: `priority_ceiling` derives the
-        opening bid at what the network asks, and the ladder climbs from there
-        rungs and the loop ends on the last one either way. The property that
-        carries weight is that no two of them are the same.
-        """
-        attempts = 8
-        w3, fn = make(
-            receipt_script=[], send_script=[Exception(UNDERPRICED)] * attempts
+        self.assertEqual(
+            w3.eth.tip_reads, 1, "asked the node for a tip after a refusal"
         )
-        w3.eth.max_priority_fee = Web3.to_wei(5, "gwei")
-
-        with self.assertRaises(TxNotConfirmed) as caught:
-            send_and_confirm(
-                fn,
-                0,
-                TEST_KEY,
-                w3=w3,
-                receipt_timeout=0.01,
-                should_stop=stop_after(attempts),
-                fee_cap_gwei=4,
-                poll_latency=0.001,
-            )
-
-        fees = [t["maxPriorityFeePerGas"] for t in fn.built]
-        self.assertEqual(len(fees), len(set(fees)), "a payload was signed twice")
-        self.assertEqual(fees, sorted(fees))
-        self.assertLessEqual(fees[-1], Web3.to_wei(4, "gwei"))
-        self.assertEqual(caught.exception.tx_hashes, [], "all refused, none live")
 
     def test_nonce_too_low_after_our_tx_landed_is_success(self):
         w3, fn = make(
@@ -653,26 +578,6 @@ class TestItRunsUntilTheChainDecides(unittest.TestCase):
                 fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.001, poll_latency=0.001
             )
 
-    def test_at_the_fee_cap_it_waits_without_resigning(self):
-        """Nothing higher can be offered -- the cap is ours, not the network's
-        -- so re-signing would only rebroadcast a payload the node has."""
-        w3, fn = make(receipt_script=[None] * 30 + [receipt()])
-        w3.eth.max_priority_fee = Web3.to_wei(4, "gwei")
-
-        send_and_confirm(
-            fn,
-            0,
-            TEST_KEY,
-            w3=w3,
-            receipt_timeout=0.001,
-            fee_cap_gwei=4,
-            poll_latency=0.001,
-        )
-
-        fees = [built["maxPriorityFeePerGas"] for built in fn.built]
-        self.assertEqual(len(fees), len(set(fees)), "a payload was signed twice")
-        self.assertLessEqual(max(fees), Web3.to_wei(4, "gwei"))
-
     def test_stopping_is_the_only_way_out_with_a_transaction_in_flight(self):
         """And it carries every hash, so the next process can find them."""
         w3, fn = make(receipt_script=[None] * 50)
@@ -685,7 +590,7 @@ class TestItRunsUntilTheChainDecides(unittest.TestCase):
                 w3=w3,
                 receipt_timeout=0.001,
                 poll_latency=0.001,
-                should_stop=stop_after(3),
+                should_stop=stop_after(fn, 3),
             )
 
         self.assertTrue(caught.exception.tx_hashes)
@@ -784,61 +689,12 @@ class TestTheLoopAlwaysPaces(unittest.TestCase):
                 receipt_timeout=0.05,
                 fee_cap_gwei=4,
                 poll_latency=0.01,
-                should_stop=stop_after(4),
+                should_stop=stop_after(fn, 4),
             )
 
         self.assertGreaterEqual(
             time.monotonic() - started, 0.15, "the rounds took no time at all"
         )
-
-
-class TestATransientErrorDoesNotLatchTheCap(unittest.TestCase):
-    def test_an_unreachable_node_is_not_the_cap(self):
-        """Reaching the cap is permanent; failing to ask is not. Conflating
-        them latched the send into waiting forever at a fee far below the
-        ceiling, while logging that the ceiling had been reached."""
-
-        class NoNetwork:
-            class eth:
-                @staticmethod
-                def get_block(_which):
-                    raise Exception("connection refused")
-
-            @staticmethod
-            def to_wei(value, _unit):
-                return int(value * 1e9)
-
-        fees, capped = tx_module._next_fees(
-            NoNetwork, 10**9, 10**9, 115, 4, consider_network=True
-        )
-
-        self.assertIsNone(fees)
-        self.assertFalse(capped, "a transient failure must not latch at_cap")
-
-    def test_the_real_cap_is_reported_as_capped(self):
-        class Quiet:
-            class eth:
-                max_priority_fee = Web3.to_wei(4, "gwei")
-
-                @staticmethod
-                def get_block(_which):
-                    return {"baseFeePerGas": 0}
-
-            @staticmethod
-            def to_wei(value, unit):
-                return Web3.to_wei(value, unit)
-
-        fees, capped = tx_module._next_fees(
-            Quiet,
-            Web3.to_wei(4, "gwei"),
-            Web3.to_wei(4, "gwei"),
-            115,
-            4,
-            consider_network=False,
-        )
-
-        self.assertIsNone(fees)
-        self.assertTrue(capped)
 
 
 class TestARevertDoesNotAbandonALiveTransaction(unittest.TestCase):
@@ -868,6 +724,159 @@ class TestARevertDoesNotAbandonALiveTransaction(unittest.TestCase):
 
         outcome = send_and_confirm(
             fn, 0, TEST_KEY, w3=w3, receipt_timeout=0.05, poll_latency=0.001
+        )
+
+        self.assertEqual(outcome.receipt["status"], 1)
+
+
+class TestTheFeeLadder(unittest.TestCase):
+    """Rule two: each replacement offers more than the last, up to a cap."""
+
+    def test_the_fee_never_exceeds_the_cap(self):
+        w3, fn = make()
+        w3.eth.max_priority_fee = Web3.to_wei(1, "gwei")
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.001,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+                should_stop=stop_after(fn, 30),
+            )
+
+        tips = [built["maxPriorityFeePerGas"] for built in fn.built]
+        self.assertLessEqual(max(tips), Web3.to_wei(4, "gwei"))
+
+    def test_the_fee_only_ever_climbs(self):
+        w3, fn = make()
+        w3.eth.max_priority_fee = Web3.to_wei(1, "gwei")
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.001,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+                should_stop=stop_after(fn, 20),
+            )
+
+        tips = [built["maxPriorityFeePerGas"] for built in fn.built]
+        self.assertEqual(tips, sorted(tips))
+
+    def test_at_the_cap_it_re_sends_the_same_payload(self):
+        """Deliberately, and it is what covers eviction.
+
+        The fee cannot rise, so the payload signs to the same transaction: a
+        node that still holds it answers "already known", and one that dropped
+        it takes it again. Recognising eviction and handling it separately took
+        a helper, a stored payload and a branch; this needs none of them.
+        """
+        w3, fn = make()
+        w3.eth.max_priority_fee = Web3.to_wei(9, "gwei")  # above the cap
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.001,
+                fee_cap_gwei=4,
+                poll_latency=0.001,
+                should_stop=stop_after_calls(6),
+            )
+
+        payloads = {
+            (b["maxFeePerGas"], b["maxPriorityFeePerGas"], b["nonce"]) for b in fn.built
+        }
+        self.assertGreater(len(fn.built), 1, "it must keep re-sending")
+        self.assertEqual(len(payloads), 1, "and it must be the same transaction")
+
+
+class TestAskingForHelp(unittest.TestCase):
+    """What replaces recognising every way a send can be unusual."""
+
+    def test_it_reports_a_send_that_will_not_settle(self):
+        reported = []
+        w3, fn = make()
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.001,
+                poll_latency=0.001,
+                on_stuck=reported.append,
+                stuck_after=0.05,
+                should_stop=stop_after_calls(400),
+            )
+
+        self.assertTrue(reported, "nobody was told")
+        self.assertIn("has not settled", reported[0])
+
+    def test_it_keeps_reporting_rather_than_saying_it_once(self):
+        reported = []
+        w3, fn = make()
+
+        with self.assertRaises(TxNotConfirmed):
+            send_and_confirm(
+                fn,
+                0,
+                TEST_KEY,
+                w3=w3,
+                receipt_timeout=0.001,
+                poll_latency=0.001,
+                on_stuck=reported.append,
+                stuck_after=0.05,
+                should_stop=stop_after_calls(4000),
+            )
+
+        self.assertGreater(len(reported), 1)
+
+    def test_a_quick_send_says_nothing(self):
+        w3, fn = make(receipt_script=[receipt()])
+        reported = []
+
+        send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.01,
+            poll_latency=0.001,
+            on_stuck=reported.append,
+            stuck_after=30,
+        )
+
+        self.assertEqual(reported, [])
+
+    def test_a_failing_hook_does_not_end_the_send(self):
+        """It is a notification. Losing the transaction over it would be
+        exactly backwards."""
+
+        def explode(_text):
+            raise RuntimeError("telegram is down")
+
+        w3, fn = make(receipt_script=[None, None, receipt()])
+
+        outcome = send_and_confirm(
+            fn,
+            0,
+            TEST_KEY,
+            w3=w3,
+            receipt_timeout=0.001,
+            poll_latency=0.001,
+            on_stuck=explode,
+            stuck_after=0.001,
         )
 
         self.assertEqual(outcome.receipt["status"], 1)

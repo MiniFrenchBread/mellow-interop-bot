@@ -320,12 +320,15 @@ def parse_deployments(config, deployments_raw):
     return valid_deployments
 
 
-def _with_stop(options, should_stop):
-    """Add the shutdown hook to a settings dict, which is how it reaches sends."""
-    if should_stop is None:
+def _with_stop(options, should_stop, on_stuck=None):
+    """Add the caller's hooks to a settings dict, which is how they reach sends."""
+    if should_stop is None and on_stuck is None:
         return options
     merged = dict(options or {})
-    merged["should_stop"] = should_stop
+    if should_stop is not None:
+        merged["should_stop"] = should_stop
+    if on_stuck is not None:
+        merged["on_stuck"] = on_stuck
     return merged
 
 
@@ -338,6 +341,7 @@ def run_all(
     force_withdrawal: bool = None,
     interactive: bool = True,
     should_stop=None,
+    on_stuck=None,
 ) -> List[Tuple[str, Optional[str]]]:
     """Rebalance every configured deployment.
 
@@ -419,6 +423,7 @@ def run_all(
             source_tx=_with_stop(
                 source.tx.as_kwargs() if getattr(source, "tx", None) else None,
                 should_stop,
+                on_stuck,
             ),
             target_tx=_with_stop(
                 (
@@ -427,6 +432,7 @@ def run_all(
                     else None
                 ),
                 should_stop,
+                on_stuck,
             ),
         )
         skipped.append(("{}:{}".format(source.name, deployment.name), reason))

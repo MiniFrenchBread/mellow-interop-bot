@@ -67,9 +67,18 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
     time.
     """
     config = getattr(source, "oracle_update", None)
-    if config is None or not config.updater_private_key:
-        print(f"No oracle-update key set for {source.name}, skipping the role check...")
+    if config is None:
+        print(f"No oracle-update section for {source.name}, skipping the role check...")
         return
+    if not config.updater_private_key:
+        # Declared and unresolved, which is a missing environment variable
+        # rather than a source that does not write the oracle. Skipping it here
+        # is how a deploy that forgot ORACLE_UPDATER_PK got a clean bill of
+        # health and then failed every cycle.
+        raise Exception(
+            f"{source.name} declares oracle-update but its private key is "
+            f"empty; set ORACLE_UPDATER_PK"
+        )
 
     updater = Account.from_key(config.updater_private_key).address
     for deployment in source.deployments:

@@ -135,10 +135,13 @@ class TestNothingWrittenIsAFailure(unittest.TestCase):
 
         self.assertEqual(asyncio.run(main.main()), 1)
 
-    def test_a_skip_exits_non_zero(self):
+    def test_a_skip_exits_zero(self):
+        """A skip is not a failure. A cross-chain transfer settles in minutes
+        and the next run writes; collapsing that into a process failure would
+        have cron reporting one whenever a transfer happened to be crossing."""
         self._summary(written=0, notified=True, skip_reasons=["OFT in flight"])
 
-        self.assertEqual(asyncio.run(main.main()), 1)
+        self.assertEqual(asyncio.run(main.main()), 0)
 
     def test_a_write_that_could_not_be_announced_exits_non_zero(self):
         self._summary(written=1, notified=False)

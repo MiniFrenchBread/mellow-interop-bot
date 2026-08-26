@@ -358,6 +358,7 @@ class Scheduler:
                 interactive=False,
                 force_withdrawal=False,
                 should_stop=lambda: self.stopping,
+                on_stuck=lambda text: self.notify("⚠️ " + text),
             )
             or []
         )
@@ -391,14 +392,17 @@ class Scheduler:
                 "red",
             )
 
-        if summary.skip_reasons and not summary.written:
-            # Nothing was written and every deployment had a reason. One is
-            # routine -- a transfer settles in minutes -- but a run of them means
-            # the oracle has stopped being refreshed while every task still
-            # reports success, which is exactly the silence this tracking exists
-            # to break.
+        if not summary.written:
+            # Nothing was written, whatever the reason. Keying this on
+            # skip_reasons alone missed the case that matters most: a guard
+            # refusal populates `alerts`, not `skip_reason`, so a refused write
+            # counted as a completed run -- advancing last_run past ascend's,
+            # marking the dependency it owes as paid, and clearing the window
+            # that would have alerted. That is the one kind of "did not write"
+            # which will not resolve on its own.
             self.record_skip(
-                "oracle_update", "; ".join(sorted(set(summary.skip_reasons)))
+                "oracle_update",
+                "; ".join(sorted(set(summary.skip_reasons))) or "nothing written",
             )
             # Declining to act is not acting. Saying so keeps the task due, so
             # it tries again next cycle and writes as soon as the transfer
@@ -431,14 +435,17 @@ class Scheduler:
         """Transaction settings plus the shutdown hook, for every send.
 
         Threaded through the same dict the settings already travel in, because
-        that dict is what reaches every call site. A send now runs until the
-        chain settles the transaction, so this hook is the only thing that can
-        interrupt one -- a send site that did not get it would make the process
-        unstoppable while a transaction is stuck, which is precisely the risk
-        that unbounded persistence introduces.
+        that dict is what reaches every call site. A send runs until the chain
+        settles the transaction, so a site that missed `should_stop` would make
+        the process unstoppable while a transaction is stuck, and one that
+        missed `on_stuck` would be silent about it.
         """
         options = tx_config.as_kwargs()
         options["should_stop"] = lambda: self.stopping
+        # A send never gives up, so the only thing that turns a transaction
+        # nobody can land into something anybody hears about is this. It
+        # replaces asking the code to recognise each way a send can be unusual.
+        options["on_stuck"] = lambda text: self.notify("⚠️ " + text)
         return options
 
     def owes_dependency(self, task: str) -> bool:
