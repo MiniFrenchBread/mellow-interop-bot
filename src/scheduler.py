@@ -23,15 +23,17 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Callable, Optional
 
 import dotenv
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from config import read_config
+from config import check_operator_requirements, read_config
 from config.mask_sensitive_data import mask_all_sensitive_config_data
 from config.read_config import Config
 from process_lock import LockHeld, ProcessLock, resolve_lock_path
+from tapp import inject_tee_keys
 from telegram_bot import send_message
 from web3_scripts import get_w3, print_colored
 from web3_scripts.ascend import run_ascend
@@ -49,6 +51,12 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 # first, the pass immediately after every reward distribution was guaranteed to
 # refuse. Refreshing the oracle in between removes that.
 TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
+
+# How the startup gate paces itself. The check is a handful of eth_calls, so a
+# minute is cheap; the alert is for a human who has to run a multisig, so half
+# an hour between reminders is often enough.
+READY_CHECK_INTERVAL_SECONDS = 60
+READY_ALERT_EVERY_SECONDS = 1800
 
 # A task that owes a run whenever the task it depends on has run more recently
 # than it has, regardless of where the interval boundaries fall.
@@ -557,6 +565,57 @@ class Scheduler:
             self._sleep(slice_seconds)
             remaining -= slice_seconds
 
+    def wait_until_ready(self, address: Optional[str]) -> None:
+        """Hold before the first cycle until the signers can actually transact.
+
+        Without this the bot starts cleanly against an account with no gas and
+        no roles, and says so only by failing -- every eighth hour for the
+        oracle, and only on the third consecutive failure. Under a tapp that is
+        the normal first-boot state, because the address does not exist until
+        the bot derives it and nobody can fund or authorise it before then.
+
+        So: announce the address, then say what is still missing until nothing
+        is, and only then start. A revocation later is not this function's job;
+        the per-task failure path covers that.
+        """
+        if address:
+            self.notify(
+                "🔐 TEE signer is `{}`.\nIt needs gas on both chains and its "
+                "roles granted from the Safe before the bot can act.".format(address)
+            )
+            print_colored("TEE signer address: {}".format(address), "green")
+
+        last_alert = 0.0
+        first = True
+        while not self.stopping:
+            try:
+                missing = check_operator_requirements(self.config)
+            except Exception as e:
+                missing = ["readiness check itself failed: {}".format(e)]
+
+            if not missing:
+                if not first:
+                    self.notify("✅ Signer is ready. Starting the task loop.")
+                print_colored("Signer is ready.", "green")
+                return
+
+            print_colored("Not ready yet ({} item(s)):".format(len(missing)), "yellow")
+            for item in missing:
+                print_colored("  - {}".format(item), "yellow")
+
+            now = time.monotonic()
+            if first or now - last_alert >= READY_ALERT_EVERY_SECONDS:
+                last_alert = now
+                self.notify(
+                    "⏳ Bot is waiting to start -- {} unmet requirement(s):\n"
+                    "```\n{}\n```".format(
+                        len(missing),
+                        "\n".join(m.replace("`", "'") for m in missing),
+                    )
+                )
+            first = False
+            self.interruptible_sleep(READY_CHECK_INTERVAL_SECONDS)
+
     def run_forever(self) -> None:
         while not self.stopping:
             self.run_cycle()
@@ -572,8 +631,35 @@ class Scheduler:
         self.stopping = True
 
 
+def _pre_config_notifier() -> Optional[Callable[[str], None]]:
+    """Telegram sender for the window before the config is loaded.
+
+    Fetching the TEE key happens before read_config -- the key is one of the
+    things read_config reads -- so the wait for it cannot use the Scheduler's
+    notifier, which does not exist yet. Reads the same two variables read_config
+    would, and returns None when they are unset so a bot without Telegram
+    configured is not a bot that fails to start.
+    """
+    api_key = os.getenv("TELEGRAM_BOT_API_KEY")
+    chat_id = os.getenv("TELEGRAM_GROUP_CHAT_ID")
+    if not api_key or not chat_id:
+        return None
+
+    def notify(reason: str) -> None:
+        text = "⏳ Still waiting for the TEE key.\n```\n{}\n```".format(
+            reason.replace("`", "'")
+        )
+        try:
+            asyncio.run(send_message(api_key, chat_id, text))
+        except Exception as e:
+            print_colored("Could not send Telegram alert: {}".format(e), "yellow")
+
+    return notify
+
+
 def main() -> int:
     dotenv.load_dotenv()
+    tee_address = inject_tee_keys(on_retry=_pre_config_notifier())
     config = read_config(str(CONFIG_PATH))
     scheduler = Scheduler(config)
 
@@ -599,8 +685,16 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    print("Starting scheduler. Intervals: {}".format(config.scheduler.task_intervals))
+    # After the signal handlers, so the wait can be interrupted, and inside the
+    # try/finally so the lock is released if it is.
     try:
+        if tee_address:
+            scheduler.wait_until_ready(tee_address)
+        if scheduler.stopping:
+            return 0
+        print(
+            "Starting scheduler. Intervals: {}".format(config.scheduler.task_intervals)
+        )
         scheduler.run_forever()
     finally:
         lock.release()

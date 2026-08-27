@@ -25,6 +25,7 @@ from web3_scripts import (
 )
 from safe_global import PendingTransactionInfo, ProposalPosted, propose_tx_if_needed
 from process_lock import LockHeld, ProcessLock
+from tapp import inject_tee_keys
 from dataclasses import dataclass, field
 
 from web3_scripts.base import print_colored
@@ -112,6 +113,7 @@ async def main() -> int:
     config = None
     try:
         dotenv.load_dotenv()
+        inject_tee_keys()
         config = read_config(str(CONFIG_PATH))
         with ProcessLock(config.scheduler.lock_file):
             summary = await run_oracle_update(config)

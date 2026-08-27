@@ -93,6 +93,243 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
         print(f"Oracle updater {updater} can write {deployment.name}'s oracle")
 
 
+# Gas floors for the readiness check below. Deliberately not in config.json:
+# they are a smoke test ("has anyone funded this account?"), not a budget, and
+# the codebase already reads tuning of this kind straight from the environment
+# (see operator_bot's SOURCE_RATIO_D3 and friends).
+#
+# The target-chain floor is the larger one because pushToSource and pushToTarget
+# carry a LayerZero fee as msg.value on top of gas, quoted per call, and a run
+# that cannot pay it fails at the send rather than here.
+DEFAULT_SOURCE_MIN_BALANCE_WEI = 10**17  # 0.1 native
+DEFAULT_TARGET_MIN_BALANCE_WEI = 2 * 10**16  # 0.02 ETH
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    return int(raw) if raw else default
+
+
+def check_operator_requirements(config: Config) -> list:
+    """Everything the signers need before any task can succeed, as a list of
+    what is still missing. Empty means ready.
+
+    Reports rather than raises, and keeps going after each failure, because the
+    caller is someone who has just been handed a fresh address and wants the
+    whole list of grants to make -- not the first one alphabetically. An RPC
+    that will not answer is reported as an unchecked item rather than swallowed:
+    "could not check" and "granted" must never look the same.
+
+    This covers the six roles the bot needs. validate_oracle_updater above
+    checks one of them and raises; it stays as it is because `validate-config`
+    is a pass/fail gate at deploy time, and this is a loop that runs until the
+    grants land.
+    """
+    missing = []
+
+    try:
+        target_w3 = get_w3(config.target_rpc)
+        target_w3.eth.block_number
+    except Exception as e:
+        return ["target chain RPC unreachable: {}".format(e)]
+
+    for source in config.sources:
+        try:
+            source_w3 = get_w3(source.rpc)
+            source_w3.eth.block_number
+        except Exception as e:
+            missing.append("{} RPC unreachable: {}".format(source.name, e))
+            continue
+        _check_source(missing, source_w3, target_w3, source)
+
+    return missing
+
+
+def _check_source(
+    missing: list, source_w3: Web3, target_w3: Web3, source: SourceConfig
+) -> None:
+    if not source.executor_private_key:
+        missing.append(
+            "{}: no executor key (set OPERATOR_PK, or TAPP_APP_ID to derive "
+            "one in the TEE)".format(source.name)
+        )
+        return
+    operator = Account.from_key(source.executor_private_key).address
+
+    oracle_update = getattr(source, "oracle_update", None)
+    updater = (
+        Account.from_key(oracle_update.updater_private_key).address
+        if oracle_update and oracle_update.updater_private_key
+        else None
+    )
+
+    for deployment in source.deployments:
+        label = "{}/{}".format(source.name, deployment.name)
+
+        if updater:
+            # Defined by the Oracle but enforced against the SourceCore's
+            # access control, so grantRole goes to the SourceCore.
+            _check_role(
+                missing,
+                source_w3,
+                deployment.source_core,
+                "SourceCore",
+                "SET_VALUE_ROLE",
+                SET_VALUE_ROLE,
+                updater,
+                "{} oracle updater".format(label),
+            )
+
+        _check_named_role(
+            missing,
+            source_w3,
+            deployment.source_core,
+            "SourceCore",
+            "PUSH_ROLE",
+            operator,
+            "{} operator".format(label),
+        )
+        for role in ("PUSH_ROLE", "REDEEM_ROLE", "DEPOSIT_ROLE"):
+            _check_named_role(
+                missing,
+                target_w3,
+                deployment.target_core,
+                "TargetCore",
+                role,
+                operator,
+                "{} operator".format(label),
+            )
+        _check_claim_permission(missing, target_w3, deployment, operator, label)
+
+    _check_balance(
+        missing,
+        source_w3,
+        operator,
+        "{} operator".format(source.name),
+        _int_env("OPERATOR_MIN_BALANCE_WEI", DEFAULT_SOURCE_MIN_BALANCE_WEI),
+    )
+    _check_balance(
+        missing,
+        target_w3,
+        operator,
+        "target-chain operator",
+        _int_env("TARGET_OPERATOR_MIN_BALANCE_WEI", DEFAULT_TARGET_MIN_BALANCE_WEI),
+    )
+    if updater and updater != operator:
+        _check_balance(
+            missing,
+            source_w3,
+            updater,
+            "{} oracle updater".format(source.name),
+            oracle_update.min_balance_wei,
+        )
+
+
+def _check_named_role(
+    missing: list,
+    w3: Web3,
+    address: str,
+    contract_name: str,
+    role_name: str,
+    holder: str,
+    who: str,
+) -> None:
+    """Read the role's bytes32 off the contract, then check it.
+
+    Read rather than derived from a guessed preimage: these constants are
+    exposed as views precisely so callers do not have to know the string, and a
+    wrong guess produces a role nobody holds -- which reads as "not granted"
+    and sends the operator off to grant something that does not exist.
+    """
+    try:
+        contract = get_contract(w3, address, contract_name)
+        role = getattr(contract.functions, role_name)().call()
+    except Exception as e:
+        missing.append(
+            "could not read {}.{} at {}: {}".format(
+                contract_name, role_name, address, e
+            )
+        )
+        return
+    _check_role(missing, w3, address, contract_name, role_name, role, holder, who)
+
+
+def _check_role(
+    missing: list,
+    w3: Web3,
+    address: str,
+    contract_name: str,
+    role_name: str,
+    role: bytes,
+    holder: str,
+    who: str,
+) -> None:
+    try:
+        contract = get_contract(w3, address, contract_name)
+        held = contract.functions.hasRole(role, holder).call()
+    except Exception as e:
+        missing.append(
+            "could not check {} on {} {}: {}".format(
+                role_name, contract_name, address, e
+            )
+        )
+        return
+    if not held:
+        missing.append(
+            "{} lacks {} on {} {} -- grant it from the Safe: "
+            "grantRole({}, {})".format(
+                who,
+                role_name,
+                contract_name,
+                address,
+                Web3.to_hex(role),
+                holder,
+            )
+        )
+
+
+def _check_claim_permission(
+    missing: list, w3: Web3, deployment: Deployment, operator: str, label: str
+) -> None:
+    """TargetCore.claim is gated twice over -- a role and a single named
+    claimer -- and either one is enough. Checking only the role would report a
+    working deployment as broken."""
+    try:
+        core = get_contract(w3, deployment.target_core, "TargetCore")
+        if core.functions.claimer().call() == operator:
+            return
+        role = core.functions.CLAIM_ROLE().call()
+        if core.functions.hasRole(role, operator).call():
+            return
+    except Exception as e:
+        missing.append(
+            "could not check claim permission on TargetCore {}: {}".format(
+                deployment.target_core, e
+            )
+        )
+        return
+    missing.append(
+        "{} operator cannot claim on TargetCore {} -- grant CLAIM_ROLE or set it "
+        "as claimer() from the Safe".format(label, deployment.target_core)
+    )
+
+
+def _check_balance(
+    missing: list, w3: Web3, address: str, who: str, minimum: int
+) -> None:
+    try:
+        balance = w3.eth.get_balance(address)
+    except Exception as e:
+        missing.append("could not read {} balance for {}: {}".format(who, address, e))
+        return
+    if balance < minimum:
+        missing.append(
+            "{} {} has {} wei, below the {} wei floor -- send it gas".format(
+                who, address, balance, minimum
+            )
+        )
+
+
 def validate_all_safe_globals(w3: Web3, source: SourceConfig):
     """
     Validate all unique SafeGlobal configs for a source chain.
@@ -446,7 +683,10 @@ if __name__ == "__main__":
     import os
     import dotenv
 
+    from tapp import inject_tee_keys
+
     dotenv.load_dotenv()
+    inject_tee_keys()
 
     config = read_config(os.getcwd() + "/config.json")
 

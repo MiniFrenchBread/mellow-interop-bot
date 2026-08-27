@@ -1,0 +1,19 @@
+.git
+.github
+.venv
+.env
+bot.env
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+tests
+.scheduler.lock
+.scheduler-state.json
+
+# Generated into the working tree by scripts/gen_proto.sh. The image builds its
+# own in the proto stage; copying a local build in would let whatever
+# grpcio-tools happened to be installed on a developer's machine decide what
+# ships.
+src/tapp/tapp_service_pb2.py
+src/tapp/tapp_service_pb2_grpc.py

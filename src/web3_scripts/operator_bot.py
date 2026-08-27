@@ -449,8 +449,10 @@ if __name__ == "__main__":
     sys.path.insert(0, str(src_path))
 
     from config.read_config import read_config
+    from tapp import inject_tee_keys
 
     dotenv.load_dotenv()
+    inject_tee_keys()
 
     config_path = src_path.parent / "config.json"
 

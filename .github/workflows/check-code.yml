@@ -27,5 +27,16 @@ jobs:
     - name: Check formatting with Black
       run: black --check .
 
+    # After the formatting check, deliberately: protoc output is not Black-clean
+    # and is gitignored for the same reason it is generated here rather than
+    # committed -- it is pinned to the grpcio that produced it.
+    #
+    # Without this step the tapp signer's end-to-end tests skip themselves, and
+    # a skipped test that guards the bot's signing key reads as a passing one.
+    - name: Generate tapp gRPC stubs
+      run: |
+        pip install grpcio-tools==1.83.0
+        ./scripts/gen_proto.sh
+
     - name: Run tests
       run: python -m unittest discover -s tests -p "test_*.py" -v

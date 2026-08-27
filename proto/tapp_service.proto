@@ -1,0 +1,42 @@
+// Client-side subset of the 0G Tapp gRPC service.
+//
+// Upstream: 0glabs/0g-tapp, proto/tapp_service.proto @ 5723256 (tapp-server v0.6.0).
+// Only GetSecretResource is declared here, because it is the only RPC this bot
+// calls. gRPC dispatches on the full method path, so a client that declares one
+// method of a service talks to a server that implements many; and protobuf
+// ignores fields it does not know, so a server that grows new response fields
+// stays compatible. Field numbers below are copied verbatim from upstream and
+// must not be renumbered.
+//
+// Why this bot speaks gRPC at all: GetSecretResource is served ONLY on the tapp
+// Unix socket (over TCP it is refused), and it is the only key source that
+// survives a restart. The alternative in-TEE signer is regenerated on every
+// tapp-server process start, so an address funded and granted roles under it
+// would be stranded on the next restart.
+
+syntax = "proto3";
+
+package tapp_service;
+
+service TappService {
+  // Get KMS-managed secret resource for this app. LOCAL ACCESS ONLY.
+  // tapp signs the KMS request with its in-memory key, decrypts the response,
+  // and returns plaintext.
+  rpc GetSecretResource(GetSecretResourceRequest)
+      returns (GetSecretResourceResponse);
+}
+
+message GetSecretResourceRequest {
+  string app_id = 1;
+
+  // Optional hex-encoded derivation material, opaque to tapp -- forwarded
+  // verbatim to KMS /app-key, which binds it into the derived key alongside
+  // app_id. Absent/empty derives purely from the app_id namespace.
+  string material = 2;
+}
+
+message GetSecretResourceResponse {
+  bool success = 1;
+  string message = 2;
+  bytes secret = 3;  // plaintext KMS-derived app key
+}

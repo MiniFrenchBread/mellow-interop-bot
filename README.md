@@ -182,7 +182,7 @@ vault is frozen until someone acts.
    an interval boundary silently forfeits that run:
 
     ```bash
-    docker run --env-file .env -v mellow-bot-state:/app/state mellow-interop-bot
+    docker run --env-file .env -v mellow-bot-state:/state mellow-interop-bot
     ```
 
    To run a single monitoring pass instead, override the command:
@@ -190,6 +190,138 @@ vault is frozen until someone acts.
     ```bash
     docker run --env-file .env mellow-interop-bot python ./src/main.py
     ```
+
+## Running on 0G Tapp (keys inside a TEE)
+
+Deployed as a [0G Tapp](https://github.com/0glabs/0g-tapp) application, the bot
+does not read its signing key from anywhere. It fetches one from the tapp Unix
+socket at every start, and that key exists only in the process's memory: nothing
+is written to disk, and nobody with shell on the host can read it back.
+
+Set `TAPP_APP_ID` and the bot switches to that path. Leave it unset — locally,
+and on the current server deployment — and nothing changes: keys come from
+`.env` exactly as before.
+
+### Which key, and why it survives a restart
+
+A tapp offers two. The default one (`GetAppSecretKey`) is generated with
+`OsRng` inside the tapp-server process and is regenerated whenever that process
+restarts — a package upgrade, a crash, a reboot. An address funded and granted
+roles under it is stranded on the next restart, so it is unusable here.
+
+The bot uses `GetSecretResource` instead: a key the KMS cluster derives from
+`(app_id, material)`. It is identical across container restarts, tapp-server
+restarts, CVM reboots, image upgrades and every node of the app — fund it once,
+grant its roles once.
+
+The catch is that the KMS authenticates the caller by the tapp node's on-chain
+registered signer, so the app must be registered in TappRegistry before a fetch
+succeeds, and a fresh registration answers `401` for a while as the cluster's
+view of the chain catches up. The bot retries indefinitely through that window
+rather than crash-looping, and says so on Telegram.
+
+After anything that restarts tapp-server, the node's registered signer is stale
+and the fetch fails until it is re-registered:
+
+```bash
+tapp-cli -s http://<tapp>:50051 -k 0x<owner> update-node-onchain \
+  --app-id mellow-interop-bot --rpc-url <0G RPC> --contract 0x<TappRegistry>
+```
+
+After a CVM reboot the tapp is unclaimed as well, so `claim-config` comes first.
+The bot's own address is unchanged throughout.
+
+### What goes where
+
+Everything `tapp-cli` uploads is hashed into the runtime measurement, and
+`GetAppInfo` — an unauthenticated RPC — hands the compose text back to anyone
+who asks. So:
+
+| | where | published |
+|---|---|---|
+| intervals, thresholds, `DEPLOYMENTS` | `docker-compose.yml` `environment:` | yes, in full |
+| Telegram token, credentialed RPC URLs | `bot.env` (see `bot.env.example`) | hash only |
+| the signing key | derived in the TEE, never transmitted | no |
+
+Changing any of the first two changes the measurement, so `update-onchain` has
+to follow or `verify-app` reports a mismatch.
+
+`bot.env` travels to the CVM over plaintext gRPC (tapp-server's `tls_enabled`
+defaults to false) — run `start-app` over an SSH tunnel, or configure server TLS.
+
+### Deploying
+
+```bash
+# 1. Claim the node, pointing it at the chain, the KMS cluster and a verifier.
+tapp-cli -s http://<tapp>:50051 -k 0x<owner> claim-config \
+  --chain-rpc-url <0G RPC> --chain-contract 0x<TappRegistry> \
+  --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
+  --scan-url https://<scan> --scan-pubkey 0x<sha256>
+
+# 2. Log in to the registry holding the bot image.
+tapp-cli -s http://<tapp>:50051 -k 0x<owner> docker-login -r ghcr.io -u <user> -p <pat>
+
+# 3. Register on chain and start. Idempotent, and re-registers a stale signer.
+tapp-cli -s http://<tapp>:50051 -k 0x<owner> start-app \
+  -f docker-compose.yml --app-id mellow-interop-bot \
+  --register-onchain --rpc-url <0G RPC> --contract 0x<TappRegistry> \
+  --stake-wei 1000000000000000000
+
+# 4. Read the address it derived. It also announces itself on Telegram.
+tapp-cli -s http://<tapp>:50051 -k 0x<owner> get-app-logs --app-id mellow-interop-bot -n 50
+```
+
+The bot then holds before its first cycle, listing what it still needs, until
+all of it is done — see below. Finish by revoking the old EOA's roles and
+sweeping its balances.
+
+### What the new address needs
+
+One address does both jobs (`OPERATOR_PK` and `ORACLE_UPDATER_PK` are set from
+the same derived key). It needs six grants, all made by the Safe, plus gas on
+both chains:
+
+| chain | contract | grant |
+|---|---|---|
+| 0G | SourceCore | `SET_VALUE_ROLE` (`keccak256("ORACLE:SET_VALUE_ROLE")`) |
+| 0G | SourceCore | `PUSH_ROLE` |
+| Ethereum | TargetCore | `PUSH_ROLE`, `REDEEM_ROLE`, `DEPOSIT_ROLE` |
+| Ethereum | TargetCore | `CLAIM_ROLE`, or being set as `claimer()` |
+
+`Rewarder.claim`, `AscendRouter.distribute` and `WithdrawalQueue.handleEpoch`
+carry no access control. The Safe proposer stays outside the TEE, so the derived
+address needs to be neither a Safe owner nor a delegate — `oracle-propose`
+remains a command a person runs locally.
+
+### The startup gate
+
+Under a tapp the scheduler will not begin its first cycle until every one of
+those grants is in place and both balances clear their floor. It re-checks each
+minute and reports the outstanding list on Telegram, at first and then every
+half hour.
+
+This exists because a tapp's first boot is the one case where the bot is
+guaranteed to be unable to act: it derives an address nobody has seen, so nobody
+can have funded or authorised it beforehand. Without the gate that state is
+indistinguishable from an ordinary failure — a silent retry loop that the oracle
+task would report only after three failures at eight-hour intervals.
+
+The floors default to 0.1 native on the source chain and 0.02 ETH on the target;
+override with `OPERATOR_MIN_BALANCE_WEI` and `TARGET_OPERATOR_MIN_BALANCE_WEI`.
+The target floor is the larger one because `pushToSource` and `pushToTarget`
+carry a LayerZero fee as `msg.value` on top of gas.
+
+### Working on the tapp path locally
+
+The gRPC stubs are generated, not committed — they are pinned to the grpcio that
+produced them:
+
+```bash
+pip install grpcio-tools==1.83.0
+./scripts/gen_proto.sh
+```
+
+Without them the tapp tests skip themselves; CI generates them so they do not.
 
 ### Running scripts
 

@@ -22,12 +22,14 @@ from web3_scripts import get_w3, print_colored
 from web3_scripts.ascend import run_ascend
 from web3_scripts.operator_bot import run_all as run_rebalance
 from web3_scripts.withdrawal_queue import handle_epochs
+from tapp import inject_tee_keys
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 
 
 def load() -> Config:
     dotenv.load_dotenv()
+    inject_tee_keys()
     return read_config(str(CONFIG_PATH))
 
 

@@ -1,0 +1,76 @@
+# Deployment descriptor for 0G Tapp.
+#
+#   tapp-cli -s http://<tapp>:50051 -k 0x<owner> start-app \
+#     -f docker-compose.yml --app-id mellow-interop-bot \
+#     --register-onchain --rpc-url <0G RPC> --contract 0x<TappRegistry> \
+#     --stake-wei 1000000000000000000
+#
+# Two things about this file are load-bearing and easy to get wrong.
+#
+# It is PUBLIC. tapp-cli uploads it, tapp hashes it into the runtime measurement,
+# and GetAppInfo hands the text back to anyone who asks -- it is an unauthenticated
+# RPC. Nothing secret goes in `environment:`. Files listed under `volumes:` are
+# uploaded too, but only their hashes are published, which is why the credentials
+# live in bot.env instead.
+#
+# Every value here is measured. Change one and the compose hash changes, the
+# on-chain reference value goes stale, and `verify-app` reports `compose✗` until
+# `update-onchain` is run.
+
+services:
+  bot:
+    # Pin by digest, not by tag. The image hash is measured and registered on
+    # chain, so a tag that moves underneath the deployment turns into a
+    # verification failure at the next attestation rather than an upgrade.
+    image: ghcr.io/OWNER/mellow-interop-bot@sha256:REPLACE_ME
+    restart: unless-stopped
+
+    # Non-root, plus the socket's group. The tapp socket is 0660 and root-owned,
+    # and this is the pairing that lets a hardened container still open it.
+    user: "10001"
+    group_add: ["0"]
+
+    environment:
+      # Presence of this switches the bot to the TEE signer. Must match the
+      # --app-id passed to start-app: the key is derived from it.
+      TAPP_APP_ID: mellow-interop-bot
+      TAPP_SOCKET: /run/tapp/tapp.sock
+      # hex("mellow-operator"). Namespaces the KMS derivation. Changing it
+      # changes the bot's address, stranding its gas and voiding its roles.
+      TAPP_KEY_MATERIAL: "6d656c6c6f772d6f70657261746f72"
+
+      # operator_bot reads this straight from the environment and raises without
+      # it, which would fail the rebalance task every two hours.
+      DEPLOYMENTS: "OG"
+      NON_INTERACTIVE: "true"
+
+      # Tuning. Non-secret by nature, and being publicly readable is fine --
+      # these are the numbers a verifier should be able to see.
+      LOOP_SLEEP_SECONDS: "300"
+      POST_ASCEND_GAP_SECONDS: "60"
+      ALERT_AFTER_FAILURES: "3"
+      ASCEND_INTERVAL_SECONDS: "28800"
+      ORACLE_UPDATE_INTERVAL_SECONDS: "28800"
+      REBALANCE_INTERVAL_SECONDS: "7200"
+      HANDLE_EPOCH_INTERVAL_SECONDS: "300"
+
+    # Credentials. Uploaded because it appears in volumes: below; only its hash
+    # is measured and published, never its contents.
+    env_file:
+      - ./bot.env
+
+    volumes:
+      # The only contact with tapp, and the only source of the signing key.
+      - /run/tapp/tapp.sock:/run/tapp/tapp.sock
+      # Mounted so that tapp-cli uploads it -- the uploader walks volumes:, and
+      # env_file alone would leave compose looking for a file that never
+      # arrived. Read-only: nothing writes it.
+      - ./bot.env:/app/bot.env:ro
+      # Named, not a bind mount. Docker seeds a named volume from the image
+      # directory and its ownership, which is what a non-root container needs;
+      # a bind mount arrives root-owned and unwritable. Holds only
+      # "task -> last run" timestamps, so the CVM's unencrypted /data is fine.
+      - mellow-state:/state
+
+volumes:
+  mellow-state:

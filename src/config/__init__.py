@@ -6,7 +6,7 @@ from .read_config import (
     SafeGlobal,
     OracleUpdateConfig,
 )
-from .validate_config import validate_config
+from .validate_config import check_operator_requirements, validate_config
 from .mask_sensitive_data import (
     mask_sensitive_data,
     mask_url_credentials,

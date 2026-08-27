@@ -112,6 +112,11 @@ python -m unittest discover -s tests -p "test_*.py" -v
 black --check .
 black .             # auto-format
 
+# Generate the tapp gRPC stubs (gitignored -- pinned to the grpcio that made
+# them). Without these the tapp signer's end-to-end tests skip themselves.
+pip install grpcio-tools==1.83.0
+./scripts/gen_proto.sh
+
 # Docker
 docker build -t mellow-interop-bot .
 docker run --env-file .env mellow-interop-bot
@@ -158,12 +163,17 @@ so a default there would enter public history.
 | `FORCE_WITHDRAWAL` | Standalone `operator_bot.py` only: pull the **entire** target-chain position back. The scheduler passes `False` explicitly so a stray export cannot trigger it unattended | 0 |
 | `SOURCE_RATIO_D3` | Target source asset ratio (per mille) | 50 |
 | `MAX_SOURCE_RATIO_D3` | Max source ratio before surplus rebalance | 100 |
+| `SCHEDULER_LOCK_FILE` | Where the process lock lives. Must not be on a persistent volume — it exists to stop two schedulers sharing one nonce sequence, and the kernel releases it on death | `.scheduler.lock` |
+| `TAPP_APP_ID` | Presence switches the bot to the TEE signer (see below). Must match the `--app-id` given to `start-app`: the key derives from it | (unset — keys come from `.env`) |
+| `TAPP_SOCKET` | The tapp Unix socket to fetch the key over | `/run/tapp/tapp.sock` |
+| `TAPP_KEY_MATERIAL` | Hex derivation material forwarded to the KMS. **Changing it changes the bot's address**, stranding its gas and voiding its roles | hex(`mellow-operator`) |
+| `OPERATOR_MIN_BALANCE_WEI` / `TARGET_OPERATOR_MIN_BALANCE_WEI` | Gas floors the startup gate holds against | 1e17 / 2e16 |
 
 Chain-specific overrides (e.g., `BSC_RPC`, `BSC_SAFE_API_KEY`, `FRAX_SAFE_PROPOSER_PK`) take precedence over global values.
 
 ## CI/CD (GitHub Actions)
 
-- **check-code.yml** -- On push to `*.py`: run Black formatter check + unit tests
+- **check-code.yml** -- On push to `*.py`: Black formatter check, generate the tapp gRPC stubs, run unit tests. The stub step sits *after* the Black check on purpose: protoc output is not Black-clean, and it is gitignored because it is pinned to the grpcio that produced it. Without the step the tapp signer's end-to-end tests skip themselves, and a skipped test guarding the signing key reads as a passing one.
 
 This deployment fork deliberately keeps no Actions secrets, so the two upstream workflows that
 need them were removed. `validate-config.yml` checked the config against live chains and could
@@ -171,6 +181,49 @@ only ever fail here; run `python ./src/cli.py validate-config` locally instead, 
 credentials already live in `.env`. `scheduled-bot-execution.yml` ran `main.py` on a cron, which
 would have proposed Safe transactions in parallel with the scheduler on the box -- two oracle
 proposers for one Safe.
+
+## Running under 0G Tapp
+
+`src/tapp/signer.py` replaces the file-based key when `TAPP_APP_ID` is set: it
+fetches a KMS-derived secret over the tapp Unix socket, derives a secp256k1 key
+from it, and exports `OPERATOR_PK` and `ORACLE_UPDATER_PK` before `read_config`
+runs. Deliberately *not* `SAFE_PROPOSER_PK` — proposing Safe transactions stays
+a human-run CLI command outside the TEE, so the derived address needs to be
+neither a Safe owner nor a delegate.
+
+Called from every entrypoint right after `dotenv.load_dotenv()`. A no-op when
+`TAPP_APP_ID` is unset, so local development and the current server deployment
+are unaffected.
+
+**Do not switch to `GetAppSecretKey`.** That is a tapp's default signer and it is
+generated with `OsRng` in the tapp-server process, so it changes on every restart
+of that process — a package upgrade, a crash, a reboot. Any address funded and
+granted roles under it is stranded on the next restart. `GetSecretResource` is
+derived by the KMS from `(app_id, material)` and is stable across all of those,
+which is the whole reason the deployment can be funded and authorised once.
+
+The price is that the KMS authenticates by the tapp node's on-chain registered
+signer, so the app must be registered in TappRegistry and anything that restarts
+tapp-server needs `update-node-onchain` (a CVM reboot needs `claim-config` first)
+before the fetch works again. The bot's own address is unchanged throughout; the
+fetch retries indefinitely rather than crash-looping.
+
+`check_operator_requirements()` in `src/config/validate_config.py` reports the
+six roles and two gas balances the signer needs, as a list rather than raising on
+the first — whoever is running the multisig ceremony needs all of them at once.
+`Scheduler.wait_until_ready()` holds before the first cycle until that list is
+empty. Both are new; `validate_oracle_updater` still checks one role and raises,
+because `validate-config` is a pass/fail deploy gate and the other is a loop.
+
+Role bytes32 values are read off the contracts (`PUSH_ROLE()` and friends are
+views) rather than derived from guessed preimages — a wrong guess yields a role
+nobody holds, which reads as "not granted". `SET_VALUE_ROLE` is the exception and
+stays hard-coded, for the reason already documented at its definition.
+
+`docker-compose.yml` and everything it mounts is hashed into the runtime
+measurement, and `GetAppInfo` publishes the compose text to unauthenticated
+callers. Non-secret tuning goes in `environment:`; credentials go in `bot.env`,
+whose hash is measured but whose contents are not published. Nothing else.
 
 ## Relationship to Other 0G Ecosystem Repos
 
