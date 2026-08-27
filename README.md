@@ -251,6 +251,10 @@ defaults to false) — run `start-app` over an SSH tunnel, or configure server T
 
 ### Deploying
 
+The copyable runbook, with what each step costs on chain and how to recover
+from a tapp-server restart, is in [`docs/TAPP_DEPLOY.md`](docs/TAPP_DEPLOY.md).
+The outline:
+
 ```bash
 # 1. Claim the node, pointing it at the chain, the KMS cluster and a verifier.
 tapp-cli -s http://<tapp>:50051 -k 0x<owner> claim-config \

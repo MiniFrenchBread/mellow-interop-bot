@@ -220,6 +220,10 @@ views) rather than derived from guessed preimages — a wrong guess yields a rol
 nobody holds, which reads as "not granted". `SET_VALUE_ROLE` is the exception and
 stays hard-coded, for the reason already documented at its definition.
 
+Operator runbook — the exact call/transaction sequence, the restart matrix, and
+the recovery after a tapp-server restart (which silently drops everything
+`claim-config` set except the owner): `docs/TAPP_DEPLOY.md`.
+
 `docker-compose.yml` and everything it mounts is hashed into the runtime
 measurement, and `GetAppInfo` publishes the compose text to unauthenticated
 callers. Non-secret tuning goes in `environment:`; credentials go in `bot.env`,
