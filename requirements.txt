@@ -4,3 +4,9 @@ python-telegram-bot==22.3
 web3==7.13.0
 safe-eth-py==7.9.0
 grpcio==1.83.0
+# Needed at runtime by the generated tapp stubs, and not pulled in by grpcio --
+# it is grpcio-tools that depends on it, and that lives only in the build stage
+# the image throws away. The generated code asserts a minimum runtime version
+# (>=7.35.1 for the current stubs), so this moves in step with the grpcio-tools
+# pin in the Dockerfile.
+protobuf==7.36.0

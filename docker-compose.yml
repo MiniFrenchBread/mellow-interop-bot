@@ -33,7 +33,15 @@ services:
     environment:
       # Presence of this switches the bot to the TEE signer. Must match the
       # --app-id passed to start-app: the key is derived from it.
-      TAPP_APP_ID: mellow-interop-bot
+      #
+      # The KMS derives from (app_id, material) alone -- a node's registered
+      # signer only gates access -- so every node of an app gets the same key.
+      # A box with shell access must therefore never be registered under the
+      # production app id: anyone with sudo there could read the production key
+      # off the tapp socket, and that key cannot be rotated without changing the
+      # address, which means re-funding it and re-running the Safe grants.
+      # Hence a separate id for any node that is not a hardened, no-SSH image.
+      TAPP_APP_ID: mellow-interop-bot-dev
       TAPP_SOCKET: /run/tapp/tapp.sock
       # hex("mellow-operator"). Namespaces the KMS derivation. Changing it
       # changes the bot's address, stranding its gas and voiding its roles.
