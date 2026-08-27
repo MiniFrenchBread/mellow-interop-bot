@@ -8,3 +8,6 @@ __pycache__
 src/tapp/tapp_service_pb2.py
 src/tapp/tapp_service_pb2.pyi
 src/tapp/tapp_service_pb2_grpc.py
+
+# Credentials for the tapp deployment (see bot.env.example).
+bot.env

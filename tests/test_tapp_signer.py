@@ -96,6 +96,61 @@ class TestDerivation(unittest.TestCase):
 
 
 @unittest.skipUnless(STUBS, "run scripts/gen_proto.sh first")
+class TestTheChannelAuthority(unittest.TestCase):
+    """Pins the one channel option that the test server below cannot check.
+
+    grpc derives :authority from the target, so a Unix socket path lands there
+    verbatim -- and an authority containing "/" is not valid HTTP/2. tapp's
+    server is tonic over hyper and resets the stream with a bare PROTOCOL_ERROR,
+    which reads like a refusal rather than a malformed request. A Python gRPC
+    server accepts it, so TestAgainstAServer passes either way; only the real
+    server rejects it. Hence a test on the argument rather than the behaviour.
+    """
+
+    def test_an_explicit_authority_is_set(self):
+        captured = {}
+
+        import grpc as grpc_mod
+
+        original = grpc_mod.insecure_channel
+
+        def spy(target, options=None, *a, **kw):
+            captured["target"] = target
+            captured["options"] = dict(options or [])
+            raise RuntimeError("stop here -- the channel is all we wanted to see")
+
+        grpc_mod.insecure_channel = spy
+        try:
+            with KeyEnv():
+                os.environ["TAPP_APP_ID"] = APP_ID
+                os.environ["TAPP_SOCKET"] = "/run/tapp/tapp.sock"
+                signer._RETRY_INITIAL_SECONDS = 0.01
+                # Unbounded retry by design, so let it fail once and bail out.
+                import threading
+
+                done = threading.Event()
+
+                def run():
+                    try:
+                        signer.inject_tee_keys()
+                    except BaseException:
+                        pass
+                    finally:
+                        done.set()
+
+                t = threading.Thread(target=run, daemon=True)
+                t.start()
+                done.wait(timeout=2) or t.join(0.1)
+        finally:
+            grpc_mod.insecure_channel = original
+
+        self.assertEqual(captured.get("target"), "unix:///run/tapp/tapp.sock")
+        self.assertEqual(
+            captured.get("options", {}).get("grpc.default_authority"), "localhost"
+        )
+
+
+@unittest.skipUnless(STUBS, "run scripts/gen_proto.sh first")
 class TestAgainstAServer(unittest.TestCase):
     """The whole path: gRPC over a Unix socket, retry, derive, inject."""
 

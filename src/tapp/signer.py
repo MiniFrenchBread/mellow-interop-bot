@@ -150,6 +150,16 @@ def _fetch_secret(
     target = "unix://{}".format(socket_path)
     request = pb.GetSecretResourceRequest(app_id=identifier, material=material)
 
+    # Without this, grpc derives :authority from the target and a socket path
+    # lands there verbatim. An authority containing "/" is not valid HTTP/2, and
+    # tapp's server -- tonic over hyper -- resets the stream with a bare
+    # PROTOCOL_ERROR rather than a status, which reads like the server refusing
+    # the call. Any valid token works; the value is meaningless over a socket.
+    #
+    # A Python gRPC server accepts the malformed authority, so a test that
+    # stands one up cannot see this. It took the real server to surface it.
+    options = [("grpc.default_authority", "localhost")]
+
     delay = _RETRY_INITIAL_SECONDS
     attempt = 0
     last_alert = 0.0
@@ -157,7 +167,7 @@ def _fetch_secret(
     while True:
         attempt += 1
         try:
-            with grpc.insecure_channel(target) as channel:
+            with grpc.insecure_channel(target, options=options) as channel:
                 response = pb_grpc.TappServiceStub(channel).GetSecretResource(request)
             if not response.success:
                 raise RuntimeError(response.message or "tapp reported failure")
