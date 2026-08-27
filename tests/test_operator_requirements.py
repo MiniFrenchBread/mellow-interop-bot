@@ -123,7 +123,16 @@ class Harness(unittest.TestCase):
         vc.get_w3 = lambda rpc: FakeW3(self.balances)
         vc.get_contract = self.fake_contract
 
+        # A valid value by default, so the role and balance tests assert on the
+        # findings they are about. TestDeployments overrides it.
+        self._saved_deployments = os.environ.get("DEPLOYMENTS")
+        os.environ["DEPLOYMENTS"] = "OG:OG"
+
     def tearDown(self):
+        if self._saved_deployments is None:
+            os.environ.pop("DEPLOYMENTS", None)
+        else:
+            os.environ["DEPLOYMENTS"] = self._saved_deployments
         vc.get_w3 = self._get_w3
         vc.get_contract = self._get_contract
 
@@ -222,6 +231,35 @@ class TestUnreachableIsNotGranted(Harness):
         missing = self.check()
         self.assertTrue(missing)
         self.assertTrue(all("could not" in m for m in missing if "gas" not in m))
+
+
+class TestDeployments(Harness):
+    """DEPLOYMENTS is read straight from the environment by operator_bot, so
+    nothing else validates it -- and a value that parses to nothing fails the
+    rebalance task on every run while the gate reports the signer as ready.
+    That combination is exactly what this check exists to prevent."""
+
+    def test_a_valid_pair_passes(self):
+        self.assertEqual([m for m in self.check() if "DEPLOYMENTS" in m], [])
+
+    def test_a_bare_source_name_is_rejected(self):
+        # "OG" instead of "OG:OG" -- parse_deployments needs the pair, and a
+        # bare name yields an empty list that reads like an unset variable.
+        os.environ["DEPLOYMENTS"] = "OG"
+        (line,) = [m for m in self.check() if "DEPLOYMENTS" in m]
+        self.assertIn("matches no deployment", line)
+        self.assertIn("OG:OG", line)
+
+    def test_unset_is_reported(self):
+        del os.environ["DEPLOYMENTS"]
+        (line,) = [m for m in self.check() if "DEPLOYMENTS" in m]
+        self.assertIn("unset", line)
+        self.assertIn("OG:OG", line)
+
+    def test_an_unknown_pair_is_reported(self):
+        os.environ["DEPLOYMENTS"] = "OG:NOPE"
+        (line,) = [m for m in self.check() if "DEPLOYMENTS" in m]
+        self.assertIn("matches no deployment", line)
 
 
 class TestNoKey(Harness):

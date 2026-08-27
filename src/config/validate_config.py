@@ -133,6 +133,8 @@ def check_operator_requirements(config: Config) -> list:
     except Exception as e:
         return ["target chain RPC unreachable: {}".format(e)]
 
+    _check_deployments(missing, config)
+
     for source in config.sources:
         try:
             source_w3 = get_w3(source.rpc)
@@ -143,6 +145,51 @@ def check_operator_requirements(config: Config) -> list:
         _check_source(missing, source_w3, target_w3, source)
 
     return missing
+
+
+def _check_deployments(missing: list, config: Config) -> None:
+    """DEPLOYMENTS has to parse, or the rebalance task fails on every run.
+
+    It is read straight from the environment by operator_bot rather than through
+    config.json, so nothing else validates it, and the failure mode is the one
+    this whole function exists to prevent: the bot starts, the gate says the
+    signer is ready, and then one of four tasks raises "No valid deployments
+    found" every two hours forever.
+
+    The format is comma-separated SOURCE:DEPLOYMENT. A bare source name parses
+    to nothing and is rejected, which is indistinguishable from leaving the
+    variable unset.
+    """
+    # Imported here rather than at module scope to keep config independent of
+    # web3_scripts.operator_bot, and reused rather than reimplemented so this
+    # cannot drift from what run_all will actually accept.
+    from web3_scripts.operator_bot import parse_deployments
+
+    raw = os.getenv("DEPLOYMENTS")
+    if not raw:
+        missing.append(
+            "DEPLOYMENTS is unset -- the rebalance task needs comma-separated "
+            "SOURCE:DEPLOYMENT pairs, e.g. {}".format(_available_pairs(config))
+        )
+        return
+    try:
+        parsed = parse_deployments(config, raw)
+    except Exception as e:
+        missing.append("DEPLOYMENTS could not be parsed: {}".format(e))
+        return
+    if not parsed:
+        missing.append(
+            "DEPLOYMENTS='{}' matches no deployment -- expected comma-separated "
+            "SOURCE:DEPLOYMENT pairs from {}".format(raw, _available_pairs(config))
+        )
+
+
+def _available_pairs(config: Config) -> str:
+    return ", ".join(
+        "{}:{}".format(source.name, deployment.name)
+        for source in config.sources
+        for deployment in source.deployments
+    )
 
 
 def _check_source(

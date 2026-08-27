@@ -40,8 +40,10 @@ services:
       TAPP_KEY_MATERIAL: "6d656c6c6f772d6f70657261746f72"
 
       # operator_bot reads this straight from the environment and raises without
-      # it, which would fail the rebalance task every two hours.
-      DEPLOYMENTS: "OG"
+      # it, which would fail the rebalance task every two hours. The format is
+      # comma-separated SOURCE:DEPLOYMENT pairs -- a bare "OG" parses to nothing
+      # and is rejected, which looks identical to not setting it at all.
+      DEPLOYMENTS: "OG:OG"
       NON_INTERACTIVE: "true"
 
       # Tuning. Non-secret by nature, and being publicly readable is fine --
