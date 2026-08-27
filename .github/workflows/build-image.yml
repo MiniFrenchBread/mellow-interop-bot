@@ -24,6 +24,21 @@ on:
   push:
     tags:
       - "v*"
+    # workflow_dispatch is only offered on the default branch, so a feature
+    # branch cannot be built by hand. Building on push is what makes "do not
+    # build this locally" a usable rule rather than advice.
+    branches:
+      - main
+      - "feat/**"
+    paths:
+      - "src/**"
+      - "abi/**"
+      - "proto/**"
+      - "scripts/gen_proto.sh"
+      - "config.json"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/build-image.yml"
 
 jobs:
   build:
@@ -50,7 +65,8 @@ jobs:
         id: tag
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            # A branch name may contain '/', which a docker tag may not.
+            echo "value=$(echo "$GITHUB_REF_NAME" | tr '/' '-')" >> "$GITHUB_OUTPUT"
           else
             echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
