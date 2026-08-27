@@ -82,6 +82,20 @@ It is also discoverable on chain, if you ever need to check it:
 `getNodeList("0g-kms")` → each node's `getNode(...).teeUrl`, then swap the tapp
 port `:50051` for the KMS port `:9443`.
 
+The verifier address and pin above are 0G infrastructure, not ours, and an
+address written into a runbook rots quietly. Re-derive them rather than trusting
+this file if anything looks wrong — the symptom of a stale pin is the misleading
+KMS error described under "Recovering from a tapp-server restart":
+
+```bash
+# the pin is the sha256 of the verifier's attested TLS public key
+echo | openssl s_client -connect <verifier-host>:443 2>/dev/null \
+  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256
+# and the KMS pins it serves, in curl's --pinnedpubkey format
+curl -sk https://<verifier-host>/api/apps/0g-kms/cert
+```
+
 Expect a compose lint warning about the `/run/tapp/tapp.sock` bind mount. It is
 a false positive — a socket stores nothing — and the app starts anyway.
 

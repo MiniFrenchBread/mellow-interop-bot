@@ -53,10 +53,15 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 
 # How the startup gate paces itself. The check is a handful of eth_calls, so a
-# minute is cheap; the alert is for a human who has to run a multisig, so half
-# an hour between reminders is often enough.
+# minute is cheap -- the moment the last grant lands, the bot starts.
+#
+# The reminder is a day apart, which looks slow next to that and is not. It
+# repeats one unchanging sentence: the same roles are still ungranted. Anyone
+# able to act on it is already acting, and the first alert -- sent immediately --
+# is the one that carries the information. A shorter interval only buries the
+# messages that say something in ones that do not.
 READY_CHECK_INTERVAL_SECONDS = 60
-READY_ALERT_EVERY_SECONDS = 1800
+READY_ALERT_EVERY_SECONDS = 86400
 
 # A task that owes a run whenever the task it depends on has run more recently
 # than it has, regardless of where the interval boundaries fall.
