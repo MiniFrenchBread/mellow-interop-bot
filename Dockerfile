@@ -49,6 +49,14 @@ ENV SCHEDULER_STATE_FILE=/state/scheduler-state.json
 # outlive the process that held it.
 ENV SCHEDULER_LOCK_FILE=/tmp/.scheduler.lock
 
+# Points the image back at the source it was built from. GHCR reads this to link
+# the package to the repository, but the reason it matters here is the tapp: the
+# image digest is measured and registered on chain, so anyone can see WHICH image
+# a node runs. Without a way back to the source, that digest is an opaque number
+# and the attestation says only "it runs something". Placed after the copies so a
+# change here does not invalidate the dependency layer.
+LABEL org.opencontainers.image.source=https://github.com/MiniFrenchBread/mellow-interop-bot
+
 # Non-root. Under a tapp this pairs with `group_add: ["0"]` in the compose,
 # which is how a container that is not root still opens the 0660 tapp socket.
 USER 10001
