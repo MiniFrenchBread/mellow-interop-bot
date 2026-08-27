@@ -22,7 +22,7 @@ services:
     # Pin by digest, not by tag. The image hash is measured and registered on
     # chain, so a tag that moves underneath the deployment turns into a
     # verification failure at the next attestation rather than an upgrade.
-    image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:9e808775a58bc3a918275e3cc8217942d5bdcf214849c471d0dd7b91e94fbc38
+    image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:8dea0b50beb6fd24c5c3bd9697298806fcd21977b59a8904bd1db682c74b6473
     restart: unless-stopped
 
     # Non-root, plus the socket's group. The tapp socket is 0660 and root-owned,
