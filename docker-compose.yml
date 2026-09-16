@@ -41,6 +41,13 @@ services:
     image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:5391795ede9991a74e92892ccb60e71d0547a8f8c84e3f88a02c0d3d65a326d1
     restart: unless-stopped
 
+    # Docker's default is 10s, then SIGKILL. The scheduler's first SIGTERM
+    # deliberately finishes the task in flight rather than dying mid-broadcast
+    # and leaving a transaction sent but unrecorded -- and a send runs until the
+    # chain settles it, up to TARGET_RECEIPT_TIMEOUT (600s). Ten seconds would
+    # make that handler decorative.
+    stop_grace_period: 15m
+
     # Non-root, plus the socket's group. The tapp socket is 0660 and root-owned,
     # and this is the pairing that lets a hardened container still open it.
     user: "10001"

@@ -104,7 +104,13 @@ DEFAULT_TARGET_GAS_WEI = 2 * 10**16  # 0.02 ETH
 # shape for this number -- the LayerZero fee is quoted per call and moves with
 # gas and token price -- so it is only ever the fallback, and a finding that
 # used it says so.
-FALLBACK_PUSH_FEE_WEI = 10**19  # 10 native: an order of magnitude, not a budget
+#
+# Per chain, because the two are three orders of magnitude apart: a source-side
+# push quotes in whole 0G, a target-side one in thousandths of an ETH. Sharing
+# one constant meant an unreadable target quote demanded 10 ETH, which no
+# override could lower.
+FALLBACK_SOURCE_PUSH_FEE_WEI = 10**19  # 10 native
+FALLBACK_TARGET_PUSH_FEE_WEI = 2 * 10**15  # 0.002 ETH
 
 
 def _int_env(name: str, default: int) -> int:
@@ -276,6 +282,7 @@ def _check_source(
         "SourceHelper",
         "quotePushToTarget",
         deployment.source_core if deployment else None,
+        FALLBACK_SOURCE_PUSH_FEE_WEI,
     )
     target_fee, target_note = _push_fee(
         target_w3,
@@ -283,6 +290,7 @@ def _check_source(
         "TargetHelper",
         "quotePushToSource",
         deployment.target_core if deployment else None,
+        FALLBACK_TARGET_PUSH_FEE_WEI,
     )
 
     _check_balance(
@@ -392,22 +400,20 @@ def _check_balance(
         )
 
 
-def _push_fee(w3: Web3, helper: str, abi: str, fn: str, core):
+def _push_fee(w3: Web3, helper: str, abi: str, fn: str, core, fallback: int):
     """The live LayerZero fee for one push, and a note when it had to be guessed.
 
     The bot pays this as msg.value -- operator_bot calls these same two views --
     so it is the number a balance has to clear, and it is not a constant.
     """
     if not core:
-        return FALLBACK_PUSH_FEE_WEI, " (assumed: no deployment to quote)"
+        return fallback, " (assumed: no deployment to quote)"
     try:
         contract = get_contract(w3, helper, abi)
         fee = getattr(contract.functions, fn)(Web3.to_checksum_address(core)).call()
         return fee, ""
     except Exception as e:
-        return FALLBACK_PUSH_FEE_WEI, " (assumed: {}.{} unreadable: {})".format(
-            abi, fn, e
-        )
+        return fallback, " (assumed: {}.{} unreadable: {})".format(abi, fn, e)
 
 
 def validate_all_safe_globals(w3: Web3, source: SourceConfig):

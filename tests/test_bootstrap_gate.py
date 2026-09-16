@@ -96,6 +96,34 @@ class TestWaiting(GateHarness):
         self.assertTrue(any("no route" in a for a in self.alerts))
 
 
+class TestTheGateGivesUp(GateHarness):
+    """Blocking forever turns any restart into an outage of everything.
+
+    Three of the four tasks are source-chain-only. Holding them because the
+    target chain is unreachable, or because a balance slipped under a LayerZero
+    quote that moved with gas, stops the oracle heartbeat -- and a stale oracle
+    past its maxAge freezes the vault. That is worse than the silent retry loop
+    the gate exists to prevent, so the gate is bounded.
+    """
+
+    def test_it_starts_anyway_once_the_budget_is_spent(self):
+        self.answers = [["needs PUSH_ROLE"]] * 50
+        clock = iter([0.0, scheduler_module.READY_GATE_MAX_WAIT_SECONDS + 1])
+        real = scheduler_module.time.monotonic
+        scheduler_module.time.monotonic = lambda: next(clock, 1e9)
+        try:
+            self.scheduler.wait_until_ready(ADDRESS)
+        finally:
+            scheduler_module.time.monotonic = real
+        self.assertTrue(any("Starting anyway" in a for a in self.alerts))
+        # It returned rather than looping on the remaining 49 answers.
+        self.assertLessEqual(len(self.slept), 1)
+
+    def test_a_ready_signer_never_reaches_the_timeout(self):
+        self.scheduler.wait_until_ready(ADDRESS)
+        self.assertFalse(any("Starting anyway" in a for a in self.alerts))
+
+
 class TestStopping(GateHarness):
     def test_sigterm_during_the_wait_returns_instead_of_looping(self):
         def stop_then_answer(config):

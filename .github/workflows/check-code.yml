@@ -5,6 +5,12 @@ on:
     paths:
       - '**.py'
       - '.github/workflows/check-code.yml'
+      # Every input to the generated stubs. Without these a change to the proto,
+      # the generator or the pins runs no tests at all -- while the tapp tests
+      # skip themselves when the stubs are absent, so the gap reads as green.
+      - 'proto/**'
+      - 'scripts/gen_proto.sh'
+      - 'requirements.txt'
 
 jobs:
   check-code:
