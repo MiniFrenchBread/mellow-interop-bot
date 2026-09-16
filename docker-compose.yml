@@ -38,7 +38,7 @@ services:
     # Pin by digest, not by tag. The image hash is measured and registered on
     # chain, so a tag that moves underneath the deployment turns into a
     # verification failure at the next attestation rather than an upgrade.
-    image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:5391795ede9991a74e92892ccb60e71d0547a8f8c84e3f88a02c0d3d65a326d1
+    image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:e96bb6ecf802dd3cf19e1d3e2b334ca3e2114a156092e28fb6b601d4a77be5ed
     restart: unless-stopped
 
     # Docker's default is 10s, then SIGKILL. The scheduler's first SIGTERM
