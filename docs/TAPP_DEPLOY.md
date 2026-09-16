@@ -104,6 +104,20 @@ server has TLS configured.
 - The image published and pinned **by digest** in `docker-compose.yml`. Built by
   CI, not locally — see `.github/workflows/build-image.yml`.
 
+  That digest is what tapp measures and registers on chain, so it is the thing a
+  verifier ends up holding. To tie it back to source — which nothing in the image
+  itself can prove, a label being only a string its builder chose:
+
+  ```bash
+  gh attestation verify oci://ghcr.io/<owner>/mellow-interop-bot@sha256:<digest> \
+    --owner <owner> --format json \
+    | jq -r '.[0].verificationResult.statement.predicate
+             .buildDefinition.resolvedDependencies[0].digest.gitCommit'
+  ```
+
+  The workflow publishes a signed SLSA provenance statement naming the commit and
+  the run that built it; this checks the signature and prints the commit.
+
 ---
 
 ## First deployment
