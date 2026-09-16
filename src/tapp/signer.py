@@ -78,14 +78,6 @@ def app_id() -> Optional[str]:
     return os.getenv(TAPP_APP_ID_ENV) or None
 
 
-def derived_address() -> Optional[str]:
-    """The address the injected key belongs to, once inject_tee_keys has run."""
-    key = os.getenv(_KEY_ENV_VARS[0])
-    if not app_id() or not key:
-        return None
-    return Account.from_key(key).address
-
-
 def inject_tee_keys(on_retry: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Fetch the KMS-derived key over the tapp socket and export it.
 
@@ -106,6 +98,8 @@ def inject_tee_keys(on_retry: Optional[Callable[[str], None]] = None) -> Optiona
     socket_path = os.getenv("TAPP_SOCKET", _DEFAULT_SOCKET)
     material = os.getenv("TAPP_KEY_MATERIAL", _DEFAULT_MATERIAL)
 
+    _warn_about_overriding_keys()
+
     secret = _fetch_secret(identifier, socket_path, material, on_retry)
     private_key = Web3.keccak(_DERIVATION_LABEL + secret)
     address = Account.from_key(private_key).address
@@ -123,6 +117,35 @@ def inject_tee_keys(on_retry: Optional[Callable[[str], None]] = None) -> Optiona
         )
     )
     return address
+
+
+def _warn_about_overriding_keys() -> None:
+    """Shout about a file key that would outrank the derived one.
+
+    config.json resolves the executor as "${OG_EXECUTOR_PK:${OPERATOR_PK}}", so a
+    chain-prefixed key left over from the pre-tapp deployment wins over anything
+    injected here -- and it wins silently. The startup gate would then announce
+    the derived address, check the file one, and never clear, because the
+    operator funds and authorises an address that signs nothing.
+
+    Only the two unprefixed names are overwritten, deliberately: overwriting the
+    whole family would hide a misconfiguration rather than surface it.
+    """
+    intruders = sorted(
+        name
+        for name in os.environ
+        if name.endswith("_PK")
+        and name not in _KEY_ENV_VARS
+        and name != "SAFE_PROPOSER_PK"  # stays outside the TEE by design
+        and os.environ[name]
+    )
+    if intruders:
+        print(
+            "WARNING: {} set alongside TAPP_APP_ID. config.json prefers a "
+            "chain-prefixed key over the TEE-derived one, so the bot may sign "
+            "with a file key while the startup gate reports the derived "
+            "address. Remove them from bot.env.".format(", ".join(intruders))
+        )
 
 
 def _fetch_secret(

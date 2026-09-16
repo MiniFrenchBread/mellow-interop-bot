@@ -224,7 +224,7 @@ After anything that restarts tapp-server, the node's registered signer is stale
 and the fetch fails until it is re-registered:
 
 ```bash
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> update-node-onchain \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> update-node-onchain \
   --app-id mellow-interop-bot --rpc-url <0G RPC> --contract 0x<TappRegistry>
 ```
 
@@ -246,8 +246,9 @@ who asks. So:
 Changing any of the first two changes the measurement, so `update-onchain` has
 to follow or `verify-app` reports a mismatch.
 
-`bot.env` travels to the CVM over plaintext gRPC (tapp-server's `tls_enabled`
-defaults to false) — run `start-app` over an SSH tunnel, or configure server TLS.
+`bot.env` is the only part of the deployment carrying secrets, so upload it over
+the TLS port (`:50052`, pinned with `--tls-pin`) rather than the plaintext one. A
+hardened image has no SSH, so there is no tunnel to fall back on.
 
 ### Deploying
 
@@ -257,22 +258,19 @@ The outline:
 
 ```bash
 # 1. Claim the node, pointing it at the chain, the KMS cluster and a verifier.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> claim-config \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> claim-config \
   --chain-rpc-url <0G RPC> --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --scan-url https://<scan> --scan-pubkey 0x<sha256>
 
-# 2. Log in to the registry holding the bot image.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> docker-login -r ghcr.io -u <user> -p <pat>
-
 # 3. Register on chain and start. Idempotent, and re-registers a stale signer.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> start-app \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> start-app \
   -f docker-compose.yml --app-id mellow-interop-bot \
   --register-onchain --rpc-url <0G RPC> --contract 0x<TappRegistry> \
-  --stake-wei 1000000000000000000
+  --stake-wei <minStakeAmount()>  # read it from the registry, see docs/TAPP_DEPLOY.md
 
 # 4. Read the address it derived. It also announces itself on Telegram.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> get-app-logs --app-id mellow-interop-bot -n 50
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> get-app-logs --app-id mellow-interop-bot -n 50
 ```
 
 The bot then holds before its first cycle, listing what it still needs, until
@@ -290,7 +288,7 @@ both chains:
 | 0G | SourceCore | `SET_VALUE_ROLE` (`keccak256("ORACLE:SET_VALUE_ROLE")`) |
 | 0G | SourceCore | `PUSH_ROLE` |
 | Ethereum | TargetCore | `PUSH_ROLE`, `REDEEM_ROLE`, `DEPOSIT_ROLE` |
-| Ethereum | TargetCore | `CLAIM_ROLE`, or being set as `claimer()` |
+| Ethereum | TargetCore | `CLAIM_ROLE` (`claimer()` is the address the call is forwarded to, not a second authoriser) |
 
 `Rewarder.claim`, `AscendRouter.distribute` and `WithdrawalQueue.handleEpoch`
 carry no access control. The Safe proposer stays outside the TEE, so the derived
@@ -301,8 +299,9 @@ remains a command a person runs locally.
 
 Under a tapp the scheduler will not begin its first cycle until every one of
 those grants is in place and both balances clear their floor. It re-checks each
-minute and reports the outstanding list on Telegram, at first and then every
-half hour.
+minute and reports the outstanding list on Telegram, at first and then once a
+day — the list does not change on its own, and a reminder that repeats itself
+only buries the messages that say something new.
 
 This exists because a tapp's first boot is the one case where the bot is
 guaranteed to be unable to act: it derives an address nobody has seen, so nobody
@@ -310,10 +309,14 @@ can have funded or authorised it beforehand. Without the gate that state is
 indistinguishable from an ordinary failure — a silent retry loop that the oracle
 task would report only after three failures at eight-hour intervals.
 
-The floors default to 0.1 native on the source chain and 0.02 ETH on the target;
-override with `OPERATOR_MIN_BALANCE_WEI` and `TARGET_OPERATOR_MIN_BALANCE_WEI`.
-The target floor is the larger one because `pushToSource` and `pushToTarget`
-carry a LayerZero fee as `msg.value` on top of gas.
+Each floor is a live LayerZero quote plus a gas allowance, because the fee
+dominates and is not a constant — `quotePushToTarget` on the source chain reads
+in whole tokens today. The allowance defaults to 0.1 native / 0.02 ETH and is
+overridable with `OPERATOR_MIN_BALANCE_WEI` and `TARGET_OPERATOR_MIN_BALANCE_WEI`;
+the quote itself is not, since guessing it is the mistake. When the quote
+cannot be read at all, the gate says so rather than inventing a figure —
+an unreadable quote is a broken helper or RPC, not a shortfall, and
+reporting it as one sends you to top up against a number nobody measured.
 
 ### Working on the tapp path locally
 

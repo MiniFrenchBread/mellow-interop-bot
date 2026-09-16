@@ -63,6 +63,21 @@ TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 READY_CHECK_INTERVAL_SECONDS = 60
 READY_ALERT_EVERY_SECONDS = 86400
 
+# And then it gives up and starts anyway.
+#
+# The gate is a first-boot aid, not a supervisor. On a first boot nothing can
+# work -- the address is one nobody has seen -- and without the gate that is
+# indistinguishable from a broken bot. Afterwards the per-task failure path is
+# strictly better, because it is per task.
+#
+# Blocking indefinitely turns any restart into an outage of everything. Three of
+# the four tasks are source-chain-only and need no target-chain funds at all, so
+# a target RPC blip, or a balance that slipped under a LayerZero quote that moved
+# with gas, would stop the oracle heartbeat -- and a stale oracle past its maxAge
+# freezes the vault. That is a worse failure than the silent retry loop the gate
+# exists to prevent, and it arrives at a moment nobody chose.
+READY_GATE_MAX_WAIT_SECONDS = int(os.getenv("READY_GATE_MAX_WAIT_SECONDS", 3600))
+
 # A task that owes a run whenever the task it depends on has run more recently
 # than it has, regardless of where the interval boundaries fall.
 #
@@ -592,6 +607,7 @@ class Scheduler:
 
         last_alert = 0.0
         first = True
+        started_waiting = time.monotonic()
         while not self.stopping:
             try:
                 missing = check_operator_requirements(self.config)
@@ -604,19 +620,41 @@ class Scheduler:
                 print_colored("Signer is ready.", "green")
                 return
 
-            print_colored("Not ready yet ({} item(s)):".format(len(missing)), "yellow")
-            for item in missing:
+            # Masked for the same reason the Telegram body is: these findings
+            # quote raw exception text, and an RPC URL carries an API key in its
+            # path. The log is owner-and-whitelist readable, not public -- a
+            # smaller audience, not no audience.
+            shown = [mask_all_sensitive_config_data(m, self.config) for m in missing]
+            print_colored("Not ready yet ({} item(s)):".format(len(shown)), "yellow")
+            for item in shown:
                 print_colored("  - {}".format(item), "yellow")
+
+            waited = time.monotonic() - started_waiting
+            if READY_GATE_MAX_WAIT_SECONDS and waited >= READY_GATE_MAX_WAIT_SECONDS:
+                self.notify(
+                    "▶️ Starting anyway after {} with {} requirement(s) still "
+                    "unmet. What they block will fail per task and alert; "
+                    "everything else runs.\n```\n{}\n```".format(
+                        format_duration(int(waited)),
+                        len(shown),
+                        "\n".join(m.replace("`", "'") for m in shown),
+                    )
+                )
+                print_colored(
+                    "Gate timed out after {} -- starting with {} unmet".format(
+                        format_duration(int(waited)), len(shown)
+                    ),
+                    "yellow",
+                )
+                return
 
             now = time.monotonic()
             if first or now - last_alert >= READY_ALERT_EVERY_SECONDS:
                 last_alert = now
+                body = "\n".join(m.replace("`", "'") for m in shown)
                 self.notify(
                     "⏳ Bot is waiting to start -- {} unmet requirement(s):\n"
-                    "```\n{}\n```".format(
-                        len(missing),
-                        "\n".join(m.replace("`", "'") for m in missing),
-                    )
+                    "```\n{}\n```".format(len(missing), body)
                 )
             first = False
             self.interruptible_sleep(READY_CHECK_INTERVAL_SECONDS)

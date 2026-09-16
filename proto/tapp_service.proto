@@ -1,6 +1,8 @@
 // Client-side subset of the 0G Tapp gRPC service.
 //
-// Upstream: 0glabs/0g-tapp, proto/tapp_service.proto @ 5723256 (tapp-server v0.6.0).
+// Upstream: 0glabs/0g-tapp, proto/tapp_service.proto @ tag v0.8.0.
+// Re-checked against that tag: package, service and both messages, field numbers
+// included, are unchanged from v0.6.0 -- wire-compatible either way.
 // Only GetSecretResource is declared here, because it is the only RPC this bot
 // calls. gRPC dispatches on the full method path, so a client that declares one
 // method of a service talks to a server that implements many; and protobuf

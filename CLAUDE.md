@@ -167,7 +167,8 @@ so a default there would enter public history.
 | `TAPP_APP_ID` | Presence switches the bot to the TEE signer (see below). Must match the `--app-id` given to `start-app`: the key derives from it | (unset — keys come from `.env`) |
 | `TAPP_SOCKET` | The tapp Unix socket to fetch the key over | `/run/tapp/tapp.sock` |
 | `TAPP_KEY_MATERIAL` | Hex derivation material forwarded to the KMS. **Changing it changes the bot's address**, stranding its gas and voiding its roles | hex(`mellow-operator`) |
-| `OPERATOR_MIN_BALANCE_WEI` / `TARGET_OPERATOR_MIN_BALANCE_WEI` | Gas floors the startup gate holds against | 1e17 / 2e16 |
+| `OPERATOR_MIN_BALANCE_WEI` / `TARGET_OPERATOR_MIN_BALANCE_WEI` | Gas *allowance* the startup gate adds on top of a live LayerZero quote — the fee dominates and is not a constant | 1e17 / 2e16 |
+| `READY_GATE_MAX_WAIT_SECONDS` | How long the startup gate blocks before starting anyway and letting the per-task failure path take over | 3600 |
 
 Chain-specific overrides (e.g., `BSC_RPC`, `BSC_SAFE_API_KEY`, `FRAX_SAFE_PROPOSER_PK`) take precedence over global values.
 
@@ -191,9 +192,16 @@ runs. Deliberately *not* `SAFE_PROPOSER_PK` — proposing Safe transactions stay
 a human-run CLI command outside the TEE, so the derived address needs to be
 neither a Safe owner nor a delegate.
 
-Called from every entrypoint right after `dotenv.load_dotenv()`. A no-op when
+Called from all seven `__main__` entrypoints right after `dotenv.load_dotenv()`
+and before `read_config()`, which is the order that matters. A no-op when
 `TAPP_APP_ID` is unset, so local development and the current server deployment
 are unaffected.
+
+It only overwrites the two unprefixed names. `config.json` prefers a
+chain-prefixed key (`${OG_EXECUTOR_PK:${OPERATOR_PK}}`), so one left in
+`bot.env` would outrank the derived key silently — the signer warns rather than
+swallowing it, because overwriting the whole family would hide the
+misconfiguration instead of surfacing it.
 
 **Do not switch to `GetAppSecretKey`.** That is a tapp's default signer and it is
 generated with `OsRng` in the tapp-server process, so it changes on every restart
