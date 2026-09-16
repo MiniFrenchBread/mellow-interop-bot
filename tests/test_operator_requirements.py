@@ -64,9 +64,10 @@ def make_config(**source_overrides) -> Config:
 class FakeCore:
     """A core contract that grants whatever it is told to."""
 
-    def __init__(self, name, granted, claimer=None):
+    def __init__(self, name, granted, claimer=None, push_fee=0):
         self.name = name
         self.granted = set(granted)
+        self.push_fee = push_fee
         self._claimer = claimer or ("0x" + "99" * 20)
 
     @property
@@ -78,6 +79,12 @@ class FakeCore:
 
     def claimer(self):
         return SimpleNamespace(call=lambda: self._claimer)
+
+    def quotePushToTarget(self, core):
+        return SimpleNamespace(call=lambda: self.push_fee)
+
+    def quotePushToSource(self, core):
+        return SimpleNamespace(call=lambda: self.push_fee)
 
     def __getattr__(self, item):
         if item.endswith("_ROLE"):
@@ -109,6 +116,7 @@ class Harness(unittest.TestCase):
         }
         self.target_granted = {role_id(r) for r in TARGET_ROLES}
         self.claimer = "0x" + "99" * 20
+        self.push_fee = 0
         self.balances = {}
 
         from eth_account import Account
@@ -137,6 +145,8 @@ class Harness(unittest.TestCase):
         vc.get_contract = self._get_contract
 
     def fake_contract(self, w3, address, name):
+        if name in ("SourceHelper", "TargetHelper"):
+            return FakeCore(name, set(), push_fee=self.push_fee)
         if name == "SourceCore":
             return FakeCore(name, self.source_granted)
         return FakeCore(name, self.target_granted, claimer=self.claimer)
@@ -177,37 +187,76 @@ class TestMissingRoles(Harness):
         self.assertIn(self.updater, line)
 
 
-class TestClaimIsGatedTwice(Harness):
-    def test_the_role_alone_is_enough(self):
-        self.claimer = "0x" + "88" * 20
-        self.assertEqual([m for m in self.check() if "claim" in m.lower()], [])
+class TestClaimRole(Harness):
+    """TargetCore.claim is `onlyRole(CLAIM_ROLE)` and nothing else.
 
-    def test_being_the_named_claimer_alone_is_enough(self):
-        # Checking only the role would report a working deployment as broken.
+    An earlier version of this check treated `claimer()` as a second way to be
+    authorised. It is not -- `claim` forwards the call to `claimer()`
+    (`Address.functionCall(claimer(), data)`), so holding that address grants
+    nothing. A deployment whose claimer happens to be the bot would have been
+    reported ready while every claim reverted.
+    """
+
+    def test_missing_claim_role_is_reported(self):
+        self.target_granted -= {role_id("CLAIM_ROLE")}
+        (line,) = [m for m in self.check() if "CLAIM_ROLE" in m]
+        self.assertIn("grantRole", line)
+        self.assertIn(TARGET_CORE.lower(), line.lower())
+
+    def test_being_the_named_claimer_does_not_substitute(self):
         self.target_granted -= {role_id("CLAIM_ROLE")}
         self.claimer = self.operator
-        self.assertEqual([m for m in self.check() if "claim" in m.lower()], [])
+        self.assertTrue(
+            [m for m in self.check() if "CLAIM_ROLE" in m],
+            "claimer() must not be accepted in place of the role",
+        )
 
-    def test_neither_is_reported(self):
-        self.target_granted -= {role_id("CLAIM_ROLE")}
-        self.claimer = "0x" + "88" * 20
-        (line,) = [m for m in self.check() if "cannot claim" in m]
-        self.assertIn(TARGET_CORE, line)
+    def test_granted_role_passes(self):
+        self.assertEqual([m for m in self.check() if "CLAIM_ROLE" in m], [])
 
 
 class TestBalances(Harness):
     def test_an_unfunded_operator_is_reported_on_both_chains(self):
         self.balances[self.operator] = 0
-        missing = [m for m in self.check() if "send it gas" in m]
+        missing = [m for m in self.check() if "send it more" in m]
         self.assertEqual(len(missing), 2, missing)
 
     def test_the_floors_are_overridable(self):
         self.balances[self.operator] = 10**18
         os.environ["OPERATOR_MIN_BALANCE_WEI"] = str(10**19)
         try:
-            self.assertTrue(any("send it gas" in m for m in self.check()))
+            self.assertTrue(any("send it more" in m for m in self.check()))
         finally:
             del os.environ["OPERATOR_MIN_BALANCE_WEI"]
+
+
+class TestThePushFeeIsPartOfTheFloor(Harness):
+    """The floor is dominated by the LayerZero fee, not by gas.
+
+    pushToTarget is a SourceCore call and pays on the source chain; a fixed floor
+    written for gas alone was ~80x short of the live fee. The gate would have
+    reported ready and the first rebalance would have failed on funds, silently,
+    for hours.
+    """
+
+    def test_a_balance_that_clears_gas_but_not_the_fee_is_reported(self):
+        self.push_fee = 8 * 10**18
+        self.balances[self.operator] = 10**18  # would have passed the old floor
+        (line,) = [m for m in self.check() if "pushToTarget" in m]
+        self.assertIn(str(8 * 10**18 + 10**17), line)
+
+    def test_an_unreadable_quote_falls_back_and_says_so(self):
+        real = self.fake_contract
+
+        def boom(w3, address, name):
+            if name in ("SourceHelper", "TargetHelper"):
+                raise ValueError("execution reverted")
+            return real(w3, address, name)
+
+        vc.get_contract = boom
+        self.balances[self.operator] = 10**18
+        (line,) = [m for m in self.check() if "pushToTarget" in m]
+        self.assertIn("assumed", line)
 
 
 class TestUnreachableIsNotGranted(Harness):

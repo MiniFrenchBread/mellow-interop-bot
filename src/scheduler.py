@@ -611,12 +611,16 @@ class Scheduler:
             now = time.monotonic()
             if first or now - last_alert >= READY_ALERT_EVERY_SECONDS:
                 last_alert = now
+                # Masked like every other path that puts text on the wire. These
+                # findings quote raw exception text -- "target chain RPC
+                # unreachable: {e}" is the first one an operator sees -- and an
+                # RPC URL carries an API key in its path.
+                body = mask_all_sensitive_config_data(
+                    "\n".join(missing), self.config
+                ).replace("`", "'")
                 self.notify(
                     "⏳ Bot is waiting to start -- {} unmet requirement(s):\n"
-                    "```\n{}\n```".format(
-                        len(missing),
-                        "\n".join(m.replace("`", "'") for m in missing),
-                    )
+                    "```\n{}\n```".format(len(missing), body)
                 )
             first = False
             self.interruptible_sleep(READY_CHECK_INTERVAL_SECONDS)

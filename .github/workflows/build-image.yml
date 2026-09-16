@@ -73,8 +73,9 @@ jobs:
           # GHCR paths are lowercase; a mixed-case owner is rejected on push.
           echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')" >> "$GITHUB_OUTPUT"
 
-      # Built and loaded before it is pushed, so the smoke test below runs on
-      # exactly the artifact that gets published.
+      # Built and loaded first so the smoke test has something to run, but the
+      # test that counts is the one after the push: `load` and `push` are separate
+      # outputs, and only the pushed digest is measured and registered on chain.
       - name: Build
         uses: docker/build-push-action@v6
         with:
@@ -121,6 +122,33 @@ jobs:
       # Ties the published digest to this commit and this workflow run, which is
       # what makes a public image worth publishing: the on-chain digest becomes
       # traceable to source instead of an opaque number.
+      # The published artifact, not a local build that shares its layers. If the
+      # cache ever misses between the two steps, this is what notices.
+      - name: Smoke test the published digest
+        run: |
+          IMG="${{ steps.tag.outputs.image }}@${{ steps.push.outputs.digest }}"
+          docker pull -q "$IMG"
+          docker run --rm --entrypoint sh "$IMG" -c '
+            set -e
+            test "$(id -u)" = "10001"
+            touch /state/.probe && rm /state/.probe
+            python - <<PY
+          import sys, json
+          sys.path.insert(0, "/app/src")
+          import grpc, google.protobuf
+          from tapp import inject_tee_keys, tapp_service_pb2_grpc
+          import scheduler, cli, main
+          from config import read_config
+          # Not just imports: a .dockerignore regression that dropped config.json
+          # or abi/ would sail through an import-only check and die on cycle one.
+          cfg = read_config("/app/config.json")
+          json.load(open("/app/abi/SourceCore.json"))
+          assert cfg.sources, "config parsed but has no sources"
+          assert inject_tee_keys() is None, "must be a no-op without TAPP_APP_ID"
+          print("published digest ok")
+          PY
+          '
+
       - uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ steps.tag.outputs.image }}

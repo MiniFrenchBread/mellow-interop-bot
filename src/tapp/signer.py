@@ -78,14 +78,6 @@ def app_id() -> Optional[str]:
     return os.getenv(TAPP_APP_ID_ENV) or None
 
 
-def derived_address() -> Optional[str]:
-    """The address the injected key belongs to, once inject_tee_keys has run."""
-    key = os.getenv(_KEY_ENV_VARS[0])
-    if not app_id() or not key:
-        return None
-    return Account.from_key(key).address
-
-
 def inject_tee_keys(on_retry: Optional[Callable[[str], None]] = None) -> Optional[str]:
     """Fetch the KMS-derived key over the tapp socket and export it.
 

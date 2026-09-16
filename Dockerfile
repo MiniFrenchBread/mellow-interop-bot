@@ -38,8 +38,8 @@ ENV PYTHONUNBUFFERED=1
 #
 # A named volume rather than a bind mount: Docker seeds a fresh named volume
 # from this directory, ownership included, which is what lets the container
-# keep a non-root uid. It holds nothing but "task -> last run" timestamps, so
-# living on the CVM's unencrypted /data disk costs nothing.
+# keep a non-root uid. Under a tapp it is also what gets redirected onto the
+# app's encrypted volume -- see the x-tapp declaration in docker-compose.yml.
 RUN mkdir -p /state && chown 10001:0 /state && chmod 770 /state
 VOLUME ["/state"]
 ENV SCHEDULER_STATE_FILE=/state/scheduler-state.json

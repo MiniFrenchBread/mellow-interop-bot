@@ -67,7 +67,6 @@ class TestNotUnderATapp(unittest.TestCase):
             self.assertIsNone(signer.inject_tee_keys())
             self.assertEqual(os.environ["OPERATOR_PK"], "ab" * 32)
             self.assertNotIn("ORACLE_UPDATER_PK", os.environ)
-            self.assertIsNone(signer.derived_address())
 
 
 class TestDerivation(unittest.TestCase):
@@ -114,33 +113,24 @@ class TestTheChannelAuthority(unittest.TestCase):
 
         original = grpc_mod.insecure_channel
 
+        # BaseException, not Exception: _fetch_secret catches Exception and
+        # retries forever by design, so anything narrower leaves a thread
+        # hammering the real socket for the rest of the session.
+        class Stop(BaseException):
+            pass
+
         def spy(target, options=None, *a, **kw):
             captured["target"] = target
             captured["options"] = dict(options or [])
-            raise RuntimeError("stop here -- the channel is all we wanted to see")
+            raise Stop
 
         grpc_mod.insecure_channel = spy
         try:
             with KeyEnv():
                 os.environ["TAPP_APP_ID"] = APP_ID
                 os.environ["TAPP_SOCKET"] = "/run/tapp/tapp.sock"
-                signer._RETRY_INITIAL_SECONDS = 0.01
-                # Unbounded retry by design, so let it fail once and bail out.
-                import threading
-
-                done = threading.Event()
-
-                def run():
-                    try:
-                        signer.inject_tee_keys()
-                    except BaseException:
-                        pass
-                    finally:
-                        done.set()
-
-                t = threading.Thread(target=run, daemon=True)
-                t.start()
-                done.wait(timeout=2) or t.join(0.1)
+                with self.assertRaises(Stop):
+                    signer.inject_tee_keys()
         finally:
             grpc_mod.insecure_channel = original
 
@@ -205,7 +195,6 @@ class TestAgainstAServer(unittest.TestCase):
             ).address
 
             self.assertEqual(address, expected)
-            self.assertEqual(signer.derived_address(), expected)
             self.assertEqual(os.environ["OPERATOR_PK"], os.environ["ORACLE_UPDATER_PK"])
             self.assertNotIn("SAFE_PROPOSER_PK", os.environ)
 

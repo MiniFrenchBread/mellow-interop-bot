@@ -93,16 +93,18 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
         print(f"Oracle updater {updater} can write {deployment.name}'s oracle")
 
 
-# Gas floors for the readiness check below. Deliberately not in config.json:
-# they are a smoke test ("has anyone funded this account?"), not a budget, and
-# the codebase already reads tuning of this kind straight from the environment
-# (see operator_bot's SOURCE_RATIO_D3 and friends).
-#
-# The target-chain floor is the larger one because pushToSource and pushToTarget
-# carry a LayerZero fee as msg.value on top of gas, quoted per call, and a run
-# that cannot pay it fails at the send rather than here.
-DEFAULT_SOURCE_MIN_BALANCE_WEI = 10**17  # 0.1 native
-DEFAULT_TARGET_MIN_BALANCE_WEI = 2 * 10**16  # 0.02 ETH
+# Gas allowance for the readiness check, on top of whatever the cross-chain call
+# itself costs. Deliberately not in config.json: it is a smoke test ("has anyone
+# funded this account?"), not a budget, and the codebase already reads tuning of
+# this kind straight from the environment (see operator_bot's SOURCE_RATIO_D3).
+DEFAULT_SOURCE_GAS_WEI = 10**17  # 0.1 native
+DEFAULT_TARGET_GAS_WEI = 2 * 10**16  # 0.02 ETH
+
+# What one push costs when the quote cannot be read. A constant is the wrong
+# shape for this number -- the LayerZero fee is quoted per call and moves with
+# gas and token price -- so it is only ever the fallback, and a finding that
+# used it says so.
+FALLBACK_PUSH_FEE_WEI = 10**19  # 10 native: an order of magnitude, not a budget
 
 
 def _int_env(name: str, default: int) -> int:
@@ -142,7 +144,7 @@ def check_operator_requirements(config: Config) -> list:
         except Exception as e:
             missing.append("{} RPC unreachable: {}".format(source.name, e))
             continue
-        _check_source(missing, source_w3, target_w3, source)
+        _check_source(missing, source_w3, target_w3, source, config.target_core_helper)
 
     return missing
 
@@ -193,7 +195,11 @@ def _available_pairs(config: Config) -> str:
 
 
 def _check_source(
-    missing: list, source_w3: Web3, target_w3: Web3, source: SourceConfig
+    missing: list,
+    source_w3: Web3,
+    target_w3: Web3,
+    source: SourceConfig,
+    target_core_helper: str,
 ) -> None:
     if not source.executor_private_key:
         missing.append(
@@ -204,11 +210,19 @@ def _check_source(
     operator = Account.from_key(source.executor_private_key).address
 
     oracle_update = getattr(source, "oracle_update", None)
-    updater = (
-        Account.from_key(oracle_update.updater_private_key).address
-        if oracle_update and oracle_update.updater_private_key
-        else None
-    )
+    updater = None
+    if oracle_update:
+        if oracle_update.updater_private_key:
+            updater = Account.from_key(oracle_update.updater_private_key).address
+        else:
+            # Declared but unresolved is a missing environment variable, not a
+            # source that does not write the oracle. Skipping it here is how the
+            # docstring's "six roles" quietly becomes five.
+            missing.append(
+                "{}: oracle-update is configured but its key is empty -- set "
+                "ORACLE_UPDATER_PK, or TAPP_APP_ID to derive one in the "
+                "TEE".format(source.name)
+            )
 
     for deployment in source.deployments:
         label = "{}/{}".format(source.name, deployment.name)
@@ -236,7 +250,10 @@ def _check_source(
             operator,
             "{} operator".format(label),
         )
-        for role in ("PUSH_ROLE", "REDEEM_ROLE", "DEPOSIT_ROLE"):
+        # CLAIM_ROLE belongs with the rest. TargetCore.claim is onlyRole(CLAIM_ROLE)
+        # and nothing else; claimer() is the address that call is forwarded to, not
+        # a second way to be authorised -- holding it grants no permission at all.
+        for role in ("PUSH_ROLE", "REDEEM_ROLE", "DEPOSIT_ROLE", "CLAIM_ROLE"):
             _check_named_role(
                 missing,
                 target_w3,
@@ -246,29 +263,54 @@ def _check_source(
                 operator,
                 "{} operator".format(label),
             )
-        _check_claim_permission(missing, target_w3, deployment, operator, label)
+
+    # Both floors are dominated by a LayerZero fee, not by gas. pushToTarget is a
+    # SourceCore call paying on the source chain; pushToSource is a TargetCore call
+    # paying on the target chain -- so each chain needs its own quote, and neither
+    # is reliably the larger. Read them live: a hardcoded floor was 80x short of
+    # the source-chain fee within weeks of being written.
+    deployment = source.deployments[0] if source.deployments else None
+    source_fee, source_note = _push_fee(
+        source_w3,
+        source.source_core_helper,
+        "SourceHelper",
+        "quotePushToTarget",
+        deployment.source_core if deployment else None,
+    )
+    target_fee, target_note = _push_fee(
+        target_w3,
+        target_core_helper,
+        "TargetHelper",
+        "quotePushToSource",
+        deployment.target_core if deployment else None,
+    )
 
     _check_balance(
         missing,
         source_w3,
         operator,
         "{} operator".format(source.name),
-        _int_env("OPERATOR_MIN_BALANCE_WEI", DEFAULT_SOURCE_MIN_BALANCE_WEI),
+        source_fee + _int_env("OPERATOR_MIN_BALANCE_WEI", DEFAULT_SOURCE_GAS_WEI),
+        "one pushToTarget{}".format(source_note),
     )
     _check_balance(
         missing,
         target_w3,
         operator,
         "target-chain operator",
-        _int_env("TARGET_OPERATOR_MIN_BALANCE_WEI", DEFAULT_TARGET_MIN_BALANCE_WEI),
+        target_fee
+        + _int_env("TARGET_OPERATOR_MIN_BALANCE_WEI", DEFAULT_TARGET_GAS_WEI),
+        "one pushToSource{}".format(target_note),
     )
     if updater and updater != operator:
+        # The updater only writes the oracle -- no cross-chain fee to cover.
         _check_balance(
             missing,
             source_w3,
             updater,
             "{} oracle updater".format(source.name),
             oracle_update.min_balance_wei,
+            "oracle writes",
         )
 
 
@@ -335,34 +377,8 @@ def _check_role(
         )
 
 
-def _check_claim_permission(
-    missing: list, w3: Web3, deployment: Deployment, operator: str, label: str
-) -> None:
-    """TargetCore.claim is gated twice over -- a role and a single named
-    claimer -- and either one is enough. Checking only the role would report a
-    working deployment as broken."""
-    try:
-        core = get_contract(w3, deployment.target_core, "TargetCore")
-        if core.functions.claimer().call() == operator:
-            return
-        role = core.functions.CLAIM_ROLE().call()
-        if core.functions.hasRole(role, operator).call():
-            return
-    except Exception as e:
-        missing.append(
-            "could not check claim permission on TargetCore {}: {}".format(
-                deployment.target_core, e
-            )
-        )
-        return
-    missing.append(
-        "{} operator cannot claim on TargetCore {} -- grant CLAIM_ROLE or set it "
-        "as claimer() from the Safe".format(label, deployment.target_core)
-    )
-
-
 def _check_balance(
-    missing: list, w3: Web3, address: str, who: str, minimum: int
+    missing: list, w3: Web3, address: str, who: str, minimum: int, what: str
 ) -> None:
     try:
         balance = w3.eth.get_balance(address)
@@ -371,9 +387,26 @@ def _check_balance(
         return
     if balance < minimum:
         missing.append(
-            "{} {} has {} wei, below the {} wei floor -- send it gas".format(
-                who, address, balance, minimum
-            )
+            "{} {} has {} wei, short of the {} wei needed to cover {} plus gas "
+            "-- send it more".format(who, address, balance, minimum, what)
+        )
+
+
+def _push_fee(w3: Web3, helper: str, abi: str, fn: str, core):
+    """The live LayerZero fee for one push, and a note when it had to be guessed.
+
+    The bot pays this as msg.value -- operator_bot calls these same two views --
+    so it is the number a balance has to clear, and it is not a constant.
+    """
+    if not core:
+        return FALLBACK_PUSH_FEE_WEI, " (assumed: no deployment to quote)"
+    try:
+        contract = get_contract(w3, helper, abi)
+        fee = getattr(contract.functions, fn)(Web3.to_checksum_address(core)).call()
+        return fee, ""
+    except Exception as e:
+        return FALLBACK_PUSH_FEE_WEI, " (assumed: {}.{} unreadable: {})".format(
+            abi, fn, e
         )
 
 

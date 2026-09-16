@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config.read_config import read_config
 from web3_scripts.operator_bot import parse_deployments
+import tapp.signer as signer
 
 REPO = os.path.join(os.path.dirname(__file__), "..")
 COMPOSE = os.path.join(REPO, "docker-compose.yml")
@@ -52,6 +53,36 @@ class TestTheShippedDeploymentsValue(unittest.TestCase):
                 pair,
                 "{!r} is a bare source name, not SOURCE:DEPLOYMENT".format(pair),
             )
+
+
+class TestTheShippedKeyMaterial(unittest.TestCase):
+    """A typo in TAPP_KEY_MATERIAL silently changes the bot's address.
+
+    That is the one outcome the whole design exists to avoid: the address is
+    half the KMS derivation input, and a different one arrives with no gas and
+    none of the six roles. It costs a re-fund and six re-grants to undo, and
+    nothing about it looks wrong until the startup gate refuses.
+    """
+
+    def material_from_compose(self) -> str:
+        with open(COMPOSE) as f:
+            found = re.findall(
+                r"^\s*TAPP_KEY_MATERIAL:\s*[\"']?([0-9a-fA-F]+)", f.read(), re.M
+            )
+        self.assertEqual(
+            len(found), 1, "expected one TAPP_KEY_MATERIAL, got {}".format(found)
+        )
+        return found[0]
+
+    def test_it_matches_the_signer_default(self):
+        self.assertEqual(self.material_from_compose(), signer._DEFAULT_MATERIAL)
+
+    def test_it_is_the_hex_of_the_label(self):
+        # Decodes to something meaningful, so a mangled hex string cannot pass
+        # merely by matching a mangled default.
+        self.assertEqual(
+            bytes.fromhex(self.material_from_compose()), b"mellow-operator"
+        )
 
 
 if __name__ == "__main__":
