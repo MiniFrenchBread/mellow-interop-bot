@@ -17,12 +17,24 @@
 # on-chain reference value goes stale, and `verify-app` reports `compose✗` until
 # `update-onchain` is run.
 
+# Where this app's data lives (tapp-server >= 0.8.0). The default is already
+# `encrypted`, but declaring it makes the choice reviewable: the mode is part of
+# the compose, so it is hashed, registered on-chain and measured like the rest.
+#
+# `encrypted` puts the named volume below on a LUKS volume whose passphrase the
+# KMS derives under the "fde" namespace -- stored nowhere, re-derived by any
+# registered node, and therefore still readable after a reboot. The alternatives
+# (`plain`, `ram`, `scratch`) all give up either confidentiality or persistence,
+# and the state here wants both: losing it silently forfeits a reward cycle.
+x-tapp:
+  data: encrypted
+
 services:
   bot:
     # Pin by digest, not by tag. The image hash is measured and registered on
     # chain, so a tag that moves underneath the deployment turns into a
     # verification failure at the next attestation rather than an upgrade.
-    image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:8dea0b50beb6fd24c5c3bd9697298806fcd21977b59a8904bd1db682c74b6473
+    image: ghcr.io/minifrenchbread/mellow-interop-bot@sha256:ec86e1bb9a9d818f46698d3646d0301b8915fdb11c93a2dc2f00b42644e6f4ff
     restart: unless-stopped
 
     # Non-root, plus the socket's group. The tapp socket is 0660 and root-owned,
@@ -35,13 +47,16 @@ services:
       # --app-id passed to start-app: the key is derived from it.
       #
       # The KMS derives from (app_id, material) alone -- a node's registered
-      # signer only gates access -- so every node of an app gets the same key.
-      # A box with shell access must therefore never be registered under the
-      # production app id: anyone with sudo there could read the production key
-      # off the tapp socket, and that key cannot be rotated without changing the
-      # address, which means re-funding it and re-running the Safe grants.
-      # Hence a separate id for any node that is not a hardened, no-SSH image.
-      TAPP_APP_ID: mellow-interop-bot-dev
+      # signer only gates access -- so every node of an app holds the same key.
+      # A box with shell access must therefore never be registered under this
+      # id: anyone with root there could read the key off the tapp socket, and
+      # it cannot be rotated without changing the address, which means
+      # re-funding it and re-running every Safe grant. This id belongs on a
+      # hardened, no-SSH image only; anything else gets a suffixed one.
+      #
+      # It is also half the KMS derivation input, so changing it changes the
+      # bot's address.
+      TAPP_APP_ID: mellow-interop-bot
       TAPP_SOCKET: /run/tapp/tapp.sock
       # hex("mellow-operator"). Namespaces the KMS derivation. Changing it
       # changes the bot's address, stranding its gas and voiding its roles.
