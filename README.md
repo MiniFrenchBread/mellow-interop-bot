@@ -313,7 +313,10 @@ Each floor is a live LayerZero quote plus a gas allowance, because the fee
 dominates and is not a constant — `quotePushToTarget` on the source chain reads
 in whole tokens today. The allowance defaults to 0.1 native / 0.02 ETH and is
 overridable with `OPERATOR_MIN_BALANCE_WEI` and `TARGET_OPERATOR_MIN_BALANCE_WEI`;
-the quote itself is not, since guessing it is the mistake.
+the quote itself is not, since guessing it is the mistake. When the quote
+cannot be read at all, the gate says so rather than inventing a figure —
+an unreadable quote is a broken helper or RPC, not a shortfall, and
+reporting it as one sends you to top up against a number nobody measured.
 
 ### Working on the tapp path locally
 

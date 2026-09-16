@@ -245,7 +245,11 @@ class TestThePushFeeIsPartOfTheFloor(Harness):
         (line,) = [m for m in self.check() if "pushToTarget" in m]
         self.assertIn(str(8 * 10**18 + 10**17), line)
 
-    def test_an_unreadable_quote_falls_back_and_says_so(self):
+    def test_an_unreadable_quote_is_reported_as_unknown_not_guessed(self):
+        """No invented figure. A hardcoded fee is the bug this check exists to
+        fix, and one hidden in an error branch is worse -- it only runs when
+        something is already wrong, and it turns "I cannot tell" into a
+        shortfall the operator will try to top up against."""
         real = self.fake_contract
 
         def boom(w3, address, name):
@@ -254,9 +258,11 @@ class TestThePushFeeIsPartOfTheFloor(Harness):
             return real(w3, address, name)
 
         vc.get_contract = boom
-        self.balances[self.operator] = 10**18
+        self.balances[self.operator] = 10**30  # richer than any plausible floor
         (line,) = [m for m in self.check() if "pushToTarget" in m]
-        self.assertIn("assumed", line)
+        self.assertIn("cannot size", line)
+        self.assertIn("unreadable", line)
+        self.assertNotIn("wei, short of", line)
 
 
 class TestUnreachableIsNotGranted(Harness):
@@ -279,7 +285,16 @@ class TestUnreachableIsNotGranted(Harness):
         vc.get_contract = boom
         missing = self.check()
         self.assertTrue(missing)
-        self.assertTrue(all("could not" in m for m in missing if "gas" not in m))
+        # Every finding says it could not determine something, rather than
+        # asserting a fact it never established.
+        self.assertTrue(
+            all(
+                ("could not" in m) or ("cannot size" in m)
+                for m in missing
+                if "send it more" not in m
+            ),
+            missing,
+        )
 
 
 class TestDeployments(Harness):

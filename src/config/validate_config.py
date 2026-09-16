@@ -100,18 +100,6 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
 DEFAULT_SOURCE_GAS_WEI = 10**17  # 0.1 native
 DEFAULT_TARGET_GAS_WEI = 2 * 10**16  # 0.02 ETH
 
-# What one push costs when the quote cannot be read. A constant is the wrong
-# shape for this number -- the LayerZero fee is quoted per call and moves with
-# gas and token price -- so it is only ever the fallback, and a finding that
-# used it says so.
-#
-# Per chain, because the two are three orders of magnitude apart: a source-side
-# push quotes in whole 0G, a target-side one in thousandths of an ETH. Sharing
-# one constant meant an unreadable target quote demanded 10 ETH, which no
-# override could lower.
-FALLBACK_SOURCE_PUSH_FEE_WEI = 10**19  # 10 native
-FALLBACK_TARGET_PUSH_FEE_WEI = 2 * 10**15  # 0.002 ETH
-
 
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -276,39 +264,40 @@ def _check_source(
     # is reliably the larger. Read them live: a hardcoded floor was 80x short of
     # the source-chain fee within weeks of being written.
     deployment = source.deployments[0] if source.deployments else None
-    source_fee, source_note = _push_fee(
+    source_fee, source_why = _push_fee(
         source_w3,
         source.source_core_helper,
         "SourceHelper",
         "quotePushToTarget",
         deployment.source_core if deployment else None,
-        FALLBACK_SOURCE_PUSH_FEE_WEI,
     )
-    target_fee, target_note = _push_fee(
+    target_fee, target_why = _push_fee(
         target_w3,
         target_core_helper,
         "TargetHelper",
         "quotePushToSource",
         deployment.target_core if deployment else None,
-        FALLBACK_TARGET_PUSH_FEE_WEI,
     )
 
-    _check_balance(
+    _check_funding(
         missing,
         source_w3,
         operator,
         "{} operator".format(source.name),
-        source_fee + _int_env("OPERATOR_MIN_BALANCE_WEI", DEFAULT_SOURCE_GAS_WEI),
-        "one pushToTarget{}".format(source_note),
+        source_fee,
+        source_why,
+        _int_env("OPERATOR_MIN_BALANCE_WEI", DEFAULT_SOURCE_GAS_WEI),
+        "one pushToTarget",
     )
-    _check_balance(
+    _check_funding(
         missing,
         target_w3,
         operator,
         "target-chain operator",
-        target_fee
-        + _int_env("TARGET_OPERATOR_MIN_BALANCE_WEI", DEFAULT_TARGET_GAS_WEI),
-        "one pushToSource{}".format(target_note),
+        target_fee,
+        target_why,
+        _int_env("TARGET_OPERATOR_MIN_BALANCE_WEI", DEFAULT_TARGET_GAS_WEI),
+        "one pushToSource",
     )
     if updater and updater != operator:
         # The updater only writes the oracle -- no cross-chain fee to cover.
@@ -385,6 +374,32 @@ def _check_role(
         )
 
 
+def _check_funding(
+    missing: list,
+    w3: Web3,
+    address: str,
+    who: str,
+    fee,
+    why,
+    gas_allowance: int,
+    what: str,
+) -> None:
+    """Balance against a live quote -- or the reason the quote is unknown.
+
+    Two different findings on purpose. "You are short" is fixed by sending
+    funds; "I cannot read the quote" is fixed by looking at the helper address
+    or the RPC. Reporting the second as the first would send an operator to top
+    up against a figure nobody measured.
+    """
+    if fee is None:
+        missing.append(
+            "cannot size {}'s funding: {} -- the LayerZero fee for {} is what "
+            "the balance has to clear, and it is not guessable".format(who, why, what)
+        )
+        return
+    _check_balance(missing, w3, address, who, fee + gas_allowance, what)
+
+
 def _check_balance(
     missing: list, w3: Web3, address: str, who: str, minimum: int, what: str
 ) -> None:
@@ -400,20 +415,27 @@ def _check_balance(
         )
 
 
-def _push_fee(w3: Web3, helper: str, abi: str, fn: str, core, fallback: int):
-    """The live LayerZero fee for one push, and a note when it had to be guessed.
+def _push_fee(w3: Web3, helper: str, abi: str, fn: str, core):
+    """The live LayerZero fee for one push, or None with the reason it is unknown.
 
     The bot pays this as msg.value -- operator_bot calls these same two views --
-    so it is the number a balance has to clear, and it is not a constant.
+    so it is the number a balance has to clear, and it is not a constant: it is
+    quoted per call and moves with gas and token price.
+
+    Which is why there is no fallback figure. Inventing one reproduces the bug
+    this check exists to fix -- a hardcoded fee that rotted until it was 89x
+    short -- and buries it in a branch that only runs when something is already
+    wrong. An unreadable quote means "I cannot tell you what this costs"; saying
+    so is more useful than a number nobody measured.
     """
     if not core:
-        return fallback, " (assumed: no deployment to quote)"
+        return None, "there is no deployment to quote against"
     try:
         contract = get_contract(w3, helper, abi)
         fee = getattr(contract.functions, fn)(Web3.to_checksum_address(core)).call()
-        return fee, ""
+        return fee, None
     except Exception as e:
-        return fallback, " (assumed: {}.{} unreadable: {})".format(abi, fn, e)
+        return None, "{}.{} at {} is unreadable: {}".format(abi, fn, helper, e)
 
 
 def validate_all_safe_globals(w3: Web3, source: SourceConfig):
