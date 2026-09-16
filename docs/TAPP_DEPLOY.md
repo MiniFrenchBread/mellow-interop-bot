@@ -3,10 +3,13 @@
 An operator runbook. Read `README.md` § "Running on 0G Tapp" first for what the
 deployment *is*; this is what to type and what to expect.
 
-Written against **tapp-server 0.8.0**. Match your `tapp-cli` to the server's
-`get-tapp-info` version — a MAJOR.MINOR mismatch warns on connect, and the
-flags below (`--tls-pin`, node-level `get-evidence`, `x-tapp`) do not exist on
-older servers.
+Written against **tapp-server 0.8.0**. `--tls-pin`, node-level `get-evidence`
+and the `x-tapp` compose key all need 0.8.0 at both ends; check your `tapp-cli`
+against the server's `get-tapp-info` version.
+
+Do not rely on the CLI to tell you. It warns only when the server's MAJOR
+differs or its MINOR is *older* than the CLI expects — a CLI older than the
+server, the direction you will actually hit, says nothing.
 
 The short version of why any of this exists: the bot's signing key is derived
 inside the TEE and never written down, so there is no key to install. What
@@ -25,19 +28,36 @@ that serve the *same* service:
 | `50052` | TLS | **use this.** Its key derives from the node's common signer, and the node's own attestation commits to that key — so the channel can be pinned to the TEE with no CA in the loop. |
 | `50051` | plaintext | works, and shouldn't be reachable. `start-app` payloads — the compose, `bot.env`, every mounted file — cross it in the clear. Close it in the cloud firewall. |
 
-Bootstrap the pin from attestation, then use it for everything:
+Learn the pin, then use it for everything:
 
 ```bash
 export TAPP=https://<host>:50052
-# --insecure only here: before the pin there is nothing trustworthy to compare.
 # Omitting --app-id asks for the NODE's evidence (server >= 0.8.0).
-export PIN=$(tapp-cli -s $TAPP --insecure get-evidence \
+export PIN=$(tapp-cli -s $TAPP --insecure get-evidence --nonce $(openssl rand -hex 16) \
   | grep -oE '"tls_public_key":"0x[0-9a-f]+"' | grep -oE '0x[0-9a-f]+')
 tapp-cli -s $TAPP --tls-pin $PIN get-tapp-info
 ```
 
-**Re-fetch `PIN` after any reboot.** It is derived per boot, so a stale one is
-indistinguishable from an interception — which is the point.
+**That first fetch is trust-on-first-use, not attestation.** `get-evidence`
+retrieves a quote; it does not check one. Over `--insecure`, an active on-path
+attacker can terminate the connection, return its own evidence carrying its own
+key hash, and every `--tls-pin` call afterwards pins to the attacker. The
+`--nonce` only rules out a replayed *cached* quote, not a substituted one.
+
+Two things narrow it, neither free:
+
+- Do the first fetch from somewhere you would already trust with the key, and
+  treat a pin that changes without a reboot as an incident.
+- Once an app exists, `verify-app --app-id <app-id>` (direct mode) submits the
+  evidence to the attestation service and prints the attested TLS key hash —
+  compare it against the pin you have been using. This closes the loop **after
+  the fact**: it cannot run at claim time, because it needs an app that does not
+  exist yet, and it needs a reachable attestation service, which has not been
+  true in our testing.
+
+**Re-fetch `PIN` after any reboot** — it is derived per boot. So a changed pin is
+ambiguous by itself: reboot, or interception. Check the node's uptime before
+assuming the boring one.
 
 Three RPCs never cross either port: `GetSecretResource`, `GetAppSecretKey` and
 `GetAppTlsCert` are served only on the node's Unix socket. Key material does not
@@ -53,7 +73,7 @@ Two of these steps cost gas. Everything else is gRPC.
 | 2 | `start-app --register-onchain` — measure | gRPC `StartApp{measure_only=true}` | Uploads the files, pulls the image, computes `compose_hash` / `volumes_hash` / `image_hash`. Containers do **not** start. |
 | 3 | — signer lookup | gRPC `GetAppKey` | Reads this node's ephemeral signer for the app id. |
 | 4 | — chain read | `getAppInfo`, `getNodeList` | Decides which of the writes below is needed. |
-| 5 | — registration | **transaction** | `registerApp` (first time, stakes `minStakeAmount()`) / `updateNode` (signer changed — stake and slot preserved) / `addNode` (several nodes) / nothing (signer already listed). |
+| 5 | — registration | **transaction** | `registerApp` (first time, stakes whatever `--stake-wei` says; `minStakeAmount()` is the floor) / `updateNode` (signer changed — stake and slot preserved) / `addNode` (several nodes) / nothing (signer already listed). |
 | 6 | — start | gRPC `StartApp` | Uploads the files again, writes the compose, `docker compose pull` + `up -d`. |
 | 7 | `get-task-status` | gRPC | Poll until `Completed`. Step 6 is async. |
 | 8 | Bot fetches its key | gRPC `GetSecretResource` over the Unix socket | **No signature** — reaching the socket is the authorization. |
@@ -63,8 +83,8 @@ Two of these steps cost gas. Everything else is gRPC.
 | 12 | Bot derives its key | local | `keccak256("mellow-interop-bot/operator/v1" ‖ secret)`. Never leaves the process. |
 | 13 | Bot preflight | `eth_call` + `eth_getBalance` | Read-only against SourceCore / TargetCore on both chains. **No transaction.** |
 
-So: **one transaction on a first deployment** (`registerApp`, 1 0G stake), **one
-more** whenever the node's signer has changed (`updateNode`, no additional
+So: **one transaction on a first deployment** (`registerApp`, staking at least the
+registry's `minStakeAmount()`), **one more** whenever the node's signer has changed (`updateNode`, no additional
 stake), and **none at all** for an ordinary redeploy.
 
 Steps 2 and 6 each upload the files listed under `volumes:` — that is the only
@@ -78,8 +98,8 @@ server has TLS configured.
 - `tapp-cli` built from the tag matching the server (`tapp-cli --version` must
   match `get-tapp-info`'s `Version`).
 - One private key that is **all three at once**: the tapp-server owner, the
-  app's on-chain owner, and funded on 0G Galileo (1 0G stake + gas). There is no
-  owner transfer — `registerApp` writes it permanently.
+  app's on-chain owner, and funded on the network you are deploying to (stake +
+  gas). There is no owner transfer — `registerApp` writes it permanently.
 - `bot.env` next to the compose, from `bot.env.example`. No `*_PK` entries.
 - The image published and pinned **by digest** in `docker-compose.yml`. Built by
   CI, not locally — see `.github/workflows/build-image.yml`.
@@ -133,38 +153,48 @@ tapp-cli -s $TAPP --tls-pin $PIN claim-config \
 #    --stake-wei must be >= the registry's minStakeAmount(); read it, do not guess.
 tapp-cli -s $TAPP --tls-pin $PIN start-app -f docker-compose.yml --app-id <app-id> \
   --register-onchain --rpc-url $RPC --contract $REG \
-  --stake-wei $(cast call $REG "minStakeAmount()(uint256)" --rpc-url $RPC)
+  --stake-wei $(cast call $REG "minStakeAmount()(uint256)" --rpc-url $RPC | cut -d' ' -f1)
 
 # 3. Wait, then read the address the bot derived.
 tapp-cli -s $TAPP --tls-pin $PIN get-task-status --task-id <id>
 tapp-cli -s $TAPP --tls-pin $PIN get-app-logs --app-id <app-id> -n 50
 ```
 
-`--kbs-urls` is omitted because the KMS cluster is baked into the CVM image.
-It is also discoverable on chain, if you ever need to check it:
-`getNodeList("0g-kms")` → each node's `getNode(...).teeUrl`, then swap the tapp
-port `:50051` for the KMS port `:9443`.
+The cluster is discoverable on chain too, if the baked list and the table above
+ever disagree: `getNodeList("0g-kms")` → each node's `getNode(...).teeUrl` →
+swap the tapp port `:50051` for the KMS port `:9443`.
 
-The verifier address and pin above are 0G infrastructure, not ours, and an
-address written into a runbook rots quietly. Re-derive them rather than trusting
-this file if anything looks wrong — the symptom of a stale pin is the misleading
-KMS error described under "Recovering from a tapp-server restart":
+The verifier is 0G's infrastructure, not ours, and its key is a Let's Encrypt
+one that rotates on renewal — so `$SCANPIN` is derived above rather than written
+down. The symptom of a stale pin is the misleading KMS error described under
+"Recovering from a tapp-server restart". Sanity-check the verifier itself with:
 
 ```bash
-# the pin is the sha256 of the verifier's attested TLS public key
-echo | openssl s_client -connect <verifier-host>:443 2>/dev/null \
-  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der \
-  | openssl dgst -sha256
-# and the KMS pins it serves, in curl's --pinnedpubkey format
-curl -sk https://<verifier-host>/api/apps/0g-kms/cert
+curl -sk $SCAN/api/health            # the chain id must match the table above
+curl -sk $SCAN/api/apps/0g-kms/cert  # the pins it vouches for
 ```
 
 Expect a compose lint warning about the `/run/tapp/tapp.sock` bind mount. It is
 a false positive — a socket stores nothing — and the app starts anyway.
 
-Expect the key fetch to fail for a while on a first deployment: the KMS's view
-of the chain lags a fresh registration and answers `401 ... not in on-chain
-signer list`. The bot retries indefinitely and says so; this is not a fault.
+Expect the KMS to refuse for a while after a fresh registration — its view of
+the chain lags, and it answers `401 ... not in on-chain signer list`.
+
+What that does depends on who asked, and the two differ:
+
+- The **bot** retries indefinitely and says so. Not a fault.
+- **tapp-server itself** fetches the FDE volume key before any container starts,
+  because the compose declares `x-tapp: {data: encrypted}`. On refusal it fails
+  the start rather than fall back to plaintext storage — deliberately, since
+  "starting the app on the wrong storage would be a silent downgrade":
+
+  ```
+  KMS refused the volume key: … — the app's data volume cannot be opened.
+  Is this node registered on-chain for the app (start-app --register-onchain)?
+  ```
+
+So step 3's task can come back **Failed**, not `Completed`. Wait, then re-run
+`start-app`; do not keep polling a task that has already finished failing.
 
 ---
 
@@ -197,7 +227,7 @@ Two consequences worth internalising:
 tapp-cli -s $TAPP --tls-pin $PIN stop-app  --app-id <app-id>
 tapp-cli -s $TAPP --tls-pin $PIN start-app -f docker-compose.yml --app-id <app-id> \
   --register-onchain --rpc-url $RPC --contract $REG \
-  --stake-wei $(cast call $REG "minStakeAmount()(uint256)" --rpc-url $RPC)
+  --stake-wei $(cast call $REG "minStakeAmount()(uint256)" --rpc-url $RPC | cut -d' ' -f1)
 tapp-cli -s $TAPP --tls-pin $PIN update-onchain --app-id <app-id> --rpc-url $RPC --contract $REG
 ```
 
@@ -260,9 +290,19 @@ KMS request failed: KMS https://<node>:9443 unreachable: error sending request
 
 The node is reachable. The pin is missing. In that order:
 
+Recovery happens in a fresh shell, so re-export everything first. An unset
+`$SCAN` does not fail loudly: it word-splits, clap reads the literal
+`--scan-pubkey` as the value of `--scan-url`, and you get a puzzling
+`scan_url must be https` instead of "you forgot a variable".
+
 ```bash
+export TAPP=https://<host>:50052 RPC=… REG=… KBS="…" SCAN=…
+export SCANPIN=$(echo | openssl s_client -connect tappscan.0g.ai:443 -servername tappscan.0g.ai 2>/dev/null \
+  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -r | cut -d' ' -f1)
+export TAPP_PRIVATE_KEY="$(tr -d '[:space:]' < ~/.config/tapp/owner.key)"
+
 # 0. The TLS pin is per boot. The old one is now wrong.
-export PIN=$(tapp-cli -s $TAPP --insecure get-evidence \
+export PIN=$(tapp-cli -s $TAPP --insecure get-evidence --nonce $(openssl rand -hex 16) \
   | grep -oE '"tls_public_key":"0x[0-9a-f]+"' | grep -oE '0x[0-9a-f]+')
 
 # 1. Restore the KMS cluster AND the verifier. Both, in one call -- an image that
@@ -276,7 +316,7 @@ tapp-cli -s $TAPP --tls-pin $PIN update-trust-anchors \
 # 2. Re-register the app. This also replaces the stale on-chain signer.
 tapp-cli -s $TAPP --tls-pin $PIN start-app -f docker-compose.yml --app-id <app-id> \
   --register-onchain --rpc-url $RPC --contract $REG \
-  --stake-wei $(cast call $REG "minStakeAmount()(uint256)" --rpc-url $RPC)
+  --stake-wei $(cast call $REG "minStakeAmount()(uint256)" --rpc-url $RPC | cut -d' ' -f1)
 ```
 
 Do not reach for `update-node-onchain` first: the app is no longer in the

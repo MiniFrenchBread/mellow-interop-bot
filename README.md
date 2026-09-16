@@ -224,7 +224,7 @@ After anything that restarts tapp-server, the node's registered signer is stale
 and the fetch fails until it is re-registered:
 
 ```bash
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> update-node-onchain \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> update-node-onchain \
   --app-id mellow-interop-bot --rpc-url <0G RPC> --contract 0x<TappRegistry>
 ```
 
@@ -257,22 +257,22 @@ The outline:
 
 ```bash
 # 1. Claim the node, pointing it at the chain, the KMS cluster and a verifier.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> claim-config \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> claim-config \
   --chain-rpc-url <0G RPC> --chain-contract 0x<TappRegistry> \
   --kbs-urls "https://kms-1:9443,https://kms-2:9443" \
   --scan-url https://<scan> --scan-pubkey 0x<sha256>
 
 # 2. Log in to the registry holding the bot image.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> docker-login -r ghcr.io -u <user> -p <pat>
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> docker-login -r ghcr.io -u <user> -p <pat>
 
 # 3. Register on chain and start. Idempotent, and re-registers a stale signer.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> start-app \
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> start-app \
   -f docker-compose.yml --app-id mellow-interop-bot \
   --register-onchain --rpc-url <0G RPC> --contract 0x<TappRegistry> \
-  --stake-wei 1000000000000000000
+  --stake-wei <minStakeAmount()>  # read it from the registry, see docs/TAPP_DEPLOY.md
 
 # 4. Read the address it derived. It also announces itself on Telegram.
-tapp-cli -s http://<tapp>:50051 -k 0x<owner> get-app-logs --app-id mellow-interop-bot -n 50
+tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> get-app-logs --app-id mellow-interop-bot -n 50
 ```
 
 The bot then holds before its first cycle, listing what it still needs, until

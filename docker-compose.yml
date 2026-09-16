@@ -1,9 +1,13 @@
 # Deployment descriptor for 0G Tapp.
 #
-#   tapp-cli -s http://<tapp>:50051 -k 0x<owner> start-app \
+#   tapp-cli -s https://<tapp>:50052 --tls-pin 0x<pin> start-app \
 #     -f docker-compose.yml --app-id mellow-interop-bot \
 #     --register-onchain --rpc-url <0G RPC> --contract 0x<TappRegistry> \
-#     --stake-wei 1000000000000000000
+#     --stake-wei <minStakeAmount()>
+#
+# The TLS port, not the plaintext one: this file and bot.env are uploaded by
+# that command. Full procedure, including where the pin comes from and why the
+# stake is read rather than typed, in docs/TAPP_DEPLOY.md.
 #
 # Two things about this file are load-bearing and easy to get wrong.
 #
@@ -93,8 +97,10 @@ services:
       - ./bot.env:/app/bot.env:ro
       # Named, not a bind mount. Docker seeds a named volume from the image
       # directory and its ownership, which is what a non-root container needs;
-      # a bind mount arrives root-owned and unwritable. Holds only
-      # "task -> last run" timestamps, so the CVM's unencrypted /data is fine.
+      # a bind mount arrives root-owned and unwritable. A plainly-declared named
+      # volume is also what the server redirects into the encrypted volume
+      # declared by x-tapp above -- an external one, or one with a driver, opts
+      # out and stays on the plaintext disk.
       - mellow-state:/state
 
 volumes:
