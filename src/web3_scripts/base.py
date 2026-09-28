@@ -40,6 +40,10 @@ except ImportError:
 
 
 BLOCK_GAP = 10000
+# Every oracle read is taken this far behind the latest block. It also sets a
+# floor under the scheduler's post-ascend gap: a shorter gap reads a block from
+# before the distribution. MIN_POST_ASCEND_GAP_SECONDS in read_config.py must
+# stay above it, and a test holds the two together.
 SECURE_INTERVAL = 15
 ORACLE_VALUE_TOLERANCE = 10**9  # 1 gwei
 

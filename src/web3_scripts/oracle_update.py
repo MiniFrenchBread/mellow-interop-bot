@@ -303,3 +303,220 @@ def _note_expiry(result: OracleUpdateResult, threshold_seconds: int) -> None:
                 format_remaining_time(result.remaining_time)
             )
         )
+
+
+# -- resync ------------------------------------------------------------------
+#
+# The heartbeat is the oracle's only scheduled write, eight hours apart, and
+# nothing between two writes reconciled it with the value it is meant to track.
+# Anything that moves that value in between -- a deposit priced against the
+# stale figure just after a distribution, or W0G sent straight to the SourceCore
+# -- left rebalancing refusing until the next write.
+#
+# A resync is asked for by whatever tripped over the gap, and writes only if the
+# gap is really there. It is not a second heartbeat: it never writes an
+# unchanged value, and it never runs on a schedule of its own.
+
+RESYNC_NOOP = "noop"
+RESYNC_WAIT = "wait"
+RESYNC_WRITE = "write"
+RESYNC_REFUSE = "refuse"
+
+# Oracle.ValueSet(uint256 indexed value, uint256 indexed timestamp)
+VALUE_SET_TOPIC = "0x" + Web3.keccak(
+    text="ValueSet(uint256,uint256)"
+).hex().removeprefix("0x")
+# How far back to look for the write before the current one: about 23 days at
+# 0G's roughly one-second blocks, a little past maxAge (21 days). Beyond that
+# the oracle would have expired, so nothing older can be the value it replaced.
+# Should blocks get faster, this reaches less far back; a lookup that finds
+# nothing only means a fall is refused, never that one is let through.
+VALUE_SET_LOOKBACK_BLOCKS = 2_000_000
+VALUE_SET_CHUNK_BLOCKS = 50_000
+
+
+@dataclass
+class ResyncResult:
+    name: str
+    action: str
+    old_value: int = 0
+    new_value: int = 0
+    floor: int = 0
+    reason: str = ""
+    tx_hash: str = ""
+
+
+def resync_floor(current: int, previous) -> int:
+    """The lowest value a resync may write.
+
+    A deposit priced against a stale oracle takes shares at that stale price, so
+    it dilutes the share price toward it and never below it. After a write, the
+    only stale price anyone could have paid is the one that write replaced --
+    `previous`. So a fall that stops at `previous` is explained by that, and a
+    fall past it is not; that one is a loss and goes to a person.
+
+    min() because the last write could itself have been a fall, in which case no
+    stale price below the current one exists and nothing lower is explained.
+    """
+    if previous is None:
+        return current
+    return min(current, previous)
+
+
+def resync_action(
+    old_value: int,
+    new_value: int,
+    floor: int,
+    max_deviation_bps: int,
+    tolerance: int = ORACLE_VALUE_TOLERANCE,
+) -> tuple:
+    """What a resync should do with a reading, as (action, reason).
+
+    The heartbeat's decrease guard is not reused: it refuses any fall past
+    rounding, and the fall a stale-priced deposit causes is exactly what a
+    resync exists to write. The deviation guard is kept unchanged.
+    """
+    if abs(new_value - old_value) <= tolerance:
+        return RESYNC_NOOP, "already in line"
+    if exceeds_deviation(old_value, new_value, max_deviation_bps):
+        return (
+            RESYNC_REFUSE,
+            "would move the value by {:.2f} bps (limit {} bps)".format(
+                deviation_bps(old_value, new_value), max_deviation_bps
+            ),
+        )
+    if new_value < floor:
+        return RESYNC_REFUSE, (
+            "would lower the value to {}, below the {} it replaced -- more than a "
+            "deposit at the stale price can account for".format(new_value, floor)
+        )
+    return RESYNC_WRITE, ""
+
+
+def value_before(values_newest_first, current: int):
+    """The value the oracle held before it was set to `current`.
+
+    Takes ValueSet values newest first. Events newer than the one that set
+    `current` are skipped -- the oracle is read a few seconds behind the chain,
+    so a write can land after the read -- and so are repeats of `current`,
+    because an unchanged heartbeat is not the write that replaced a stale price.
+    None when the history does not reach back that far.
+    """
+    seen_current = False
+    for value in values_newest_first:
+        if value == current:
+            seen_current = True
+        elif seen_current:
+            return value
+    return None
+
+
+def previous_oracle_value(w3, oracle_address: str, current: int):
+    """Read `value_before` from the oracle's ValueSet history, newest first."""
+    latest = w3.eth.block_number
+    oldest = max(0, latest - VALUE_SET_LOOKBACK_BLOCKS)
+    newest_first = []
+    high = latest
+    while high >= oldest:
+        low = max(oldest, high - VALUE_SET_CHUNK_BLOCKS + 1)
+        logs = w3.eth.get_logs(
+            {
+                "address": Web3.to_checksum_address(oracle_address),
+                "topics": [VALUE_SET_TOPIC],
+                "fromBlock": low,
+                "toBlock": high,
+            }
+        )
+        ordered = sorted(logs, key=lambda log: (log["blockNumber"], log["logIndex"]))
+        newest_first.extend(
+            int(log["topics"][1].hex(), 16) for log in reversed(ordered)
+        )
+        found = value_before(newest_first, current)
+        if found is not None:
+            return found
+        high = low - 1
+    return None
+
+
+def resync_oracle(
+    source,
+    deployment,
+    target_rpc: str,
+    target_core_helper: str,
+    oracle_expiry_threshold_seconds: int,
+    tx: dict = None,
+) -> ResyncResult:
+    """Bring one deployment's oracle back in line with its value, if it drifted."""
+    config = getattr(source, "oracle_update", None)
+    if config is None or not config.updater_private_key:
+        raise Exception(
+            "Source {} has no oracle-update key; set ORACLE_UPDATER_PK".format(
+                source.name
+            )
+        )
+
+    validation = run_oracle_validation(
+        source_core_address=deployment.source_core,
+        target_core_address=deployment.target_core,
+        source_rpc=source.rpc,
+        target_rpc=target_rpc,
+        source_core_helper=source.source_core_helper,
+        target_core_helper=target_core_helper,
+        oracle_expiry_threshold_seconds=oracle_expiry_threshold_seconds,
+        oracle_recent_update_threshold_seconds=0,
+    )
+    old_value = validation.oracle_value
+    new_value = validation.actual_value
+    result = ResyncResult(
+        name=deployment.name,
+        action=RESYNC_NOOP,
+        old_value=old_value,
+        new_value=new_value,
+    )
+
+    if validation.transfer_in_progress:
+        # Same reason the heartbeat waits: mid-transfer the sum is wrong.
+        result.action, result.reason = RESYNC_WAIT, "OFT transfer in flight"
+        return result
+
+    source_w3 = get_w3(source.rpc)
+    previous = None
+    if new_value < old_value - ORACLE_VALUE_TOLERANCE:
+        # Only a fall needs the history, and it is the one read that scans.
+        previous = previous_oracle_value(
+            source_w3, validation.oracle_address, old_value
+        )
+    result.floor = resync_floor(old_value, previous)
+    result.action, result.reason = resync_action(
+        old_value, new_value, result.floor, config.max_deviation_bps
+    )
+
+    if result.action == RESYNC_NOOP:
+        return result
+    if result.action == RESYNC_REFUSE:
+        print_colored(
+            "{}: resync refused: {}".format(deployment.name, result.reason), "red"
+        )
+        return result
+
+    oracle = get_contract(source_w3, validation.oracle_address, "Oracle")
+    outcome = send_and_confirm(
+        oracle.functions.setValue(new_value),
+        0,
+        config.updater_private_key,
+        w3=source_w3,
+        label=SET_VALUE_LABEL,
+        **(tx or source.tx.as_kwargs()),
+    )
+    result.tx_hash = outcome.tx_hash
+    print_colored(
+        "{}: resync setValue({}) confirmed in {} (was {}, {:+.4f} bps)".format(
+            deployment.name,
+            new_value,
+            outcome.tx_hash,
+            old_value,
+            signed_deviation_bps(old_value, new_value),
+        ),
+        "green",
+    )
+    return result

@@ -22,6 +22,10 @@ from web3_scripts import (
     run_oracle_validation,
     format_remaining_time,
     update_oracle,
+    RESYNC_REFUSE,
+    RESYNC_WAIT,
+    RESYNC_WRITE,
+    resync_oracle,
 )
 from safe_global import PendingTransactionInfo, ProposalPosted, propose_tx_if_needed
 from process_lock import LockHeld, ProcessLock
@@ -60,6 +64,11 @@ class OracleRunSummary:
     notified: bool = True
     skip_reasons: list = field(default_factory=list)
     written: int = 0
+    # Deployments a guard refused, and whether this run's alert went out. The
+    # scheduler needs both to pace a refusal: it is retried every cycle, and
+    # announcing each retry turned one refusal into a message every five minutes.
+    refused: int = 0
+    announced: bool = False
 
 
 @dataclass
@@ -151,8 +160,13 @@ async def run_oracle_update(
     source_name: Optional[str] = None,
     should_stop=None,
     on_stuck=None,
+    announce: bool = True,
 ) -> OracleRunSummary:
     """Refresh every oracle, and tell someone only when a person is needed.
+
+    `announce=False` holds back the alert of a run that wrote nothing -- a
+    refusal the scheduler has already announced and is only retrying. Anything
+    that accompanies a write is still sent; so is everything printed locally.
 
     Returns whether every announcement it tried to send got through, so a caller
     that a human is watching can say otherwise. Never raises for a delivery
@@ -229,6 +243,11 @@ async def run_oracle_update(
         written=sum(
             1 for _, result in results if result is not None and result.written
         ),
+        refused=sum(
+            1
+            for _, result in results
+            if result is not None and result.alerts and not result.written
+        ),
     )
 
     # A deployment that failed outright counts too. Only alerts were considered
@@ -289,6 +308,10 @@ async def run_oracle_update(
         print_colored("Would send:\n" + message, "yellow")
         return summary
 
+    if not announce and not summary.written:
+        print_colored("Still needs attention (already announced):\n" + message, "red")
+        return summary
+
     ok, _sent = await _best_effort(
         "send the oracle alert",
         send_message(
@@ -304,6 +327,71 @@ async def run_oracle_update(
             "red",
         )
     summary.notified = ok
+    summary.announced = ok
+    return summary
+
+
+@dataclass
+class ResyncSummary:
+    """What a resync did across every deployment.
+
+    `pending` means the question is still open -- a transfer in flight, or a
+    deployment that could not be read -- so the scheduler asks again next cycle.
+    `refusals` are carried into the alert of whatever keeps tripping over the gap.
+    Failures are listed there too: a resync that keeps failing leaves the gap
+    open exactly as a refusal does, and the alert should say which it was.
+    """
+
+    written: int = 0
+    pending: bool = False
+    refusals: list = field(default_factory=list)
+
+
+def run_oracle_resync(config: Config, should_stop=None, on_stuck=None) -> ResyncSummary:
+    """Bring every oracle back in line with its value where it drifted.
+
+    Never raises and never sends Telegram. It runs because something else is
+    already refusing, and that something already reports on its own cadence; a
+    refusal here is added to that report rather than announced separately.
+    """
+    summary = ResyncSummary()
+    for source in selected_sources(config, None):
+        for deployment in source.deployments:
+            try:
+                result = resync_oracle(
+                    source=source,
+                    deployment=deployment,
+                    target_rpc=config.target_rpc,
+                    target_core_helper=config.target_core_helper,
+                    oracle_expiry_threshold_seconds=config.oracle_expiry_threshold_seconds,
+                    tx=_tx_options(source, should_stop, on_stuck),
+                )
+            except Exception as e:
+                summary.pending = True
+                masked_error = mask_source_sensitive_data(str(e), source)
+                masked_error = mask_url_credentials(masked_error, config.target_rpc)
+                print_colored(
+                    "Could not resync the oracle for {}/{}: {}".format(
+                        source.name, deployment.name, masked_error
+                    ),
+                    "yellow",
+                )
+                summary.refusals.append(
+                    "{}/{}: failed: {}".format(
+                        source.name, deployment.name, masked_error
+                    )
+                )
+                continue
+            if result.action == RESYNC_WRITE:
+                summary.written += 1
+            elif result.action == RESYNC_WAIT:
+                summary.pending = True
+            elif result.action == RESYNC_REFUSE:
+                summary.refusals.append(
+                    "{}/{}: refused: {}".format(
+                        source.name, deployment.name, result.reason
+                    )
+                )
     return summary
 
 

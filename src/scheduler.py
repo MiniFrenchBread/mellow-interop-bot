@@ -35,7 +35,7 @@ from process_lock import LockHeld, ProcessLock, resolve_lock_path
 from telegram_bot import send_message
 from web3_scripts import get_w3, print_colored
 from web3_scripts.ascend import run_ascend
-from web3_scripts.operator_bot import run_all as run_rebalance
+from web3_scripts.operator_bot import ORACLE_VALUE_INCORRECT, run_all as run_rebalance
 from web3_scripts.withdrawal_queue import handle_epochs
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.json"
@@ -46,8 +46,12 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 # oracle_update sits between ascend and rebalance rather than after both.
 # Rebalancing refuses whenever the oracle disagrees with the computed value, and
 # ascend is the thing that makes them disagree -- so with rebalance running
-# first, the pass immediately after every reward distribution was guaranteed to
-# refuse. Refreshing the oracle in between removes that.
+# first, the pass after every reward distribution refused against a value
+# nobody had yet written. Writing it first puts the new value on chain before
+# rebalance looks, but not yet in what rebalance reads: every read is taken
+# SECURE_INTERVAL behind the chain, so this cycle's rebalance still sees the old
+# value and declines. It is retried one cycle later, where the read has caught
+# up (see task_rebalance), rather than at its next two-hour slot.
 TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 
 # A task that owes a run whenever the task it depends on has run more recently
@@ -177,6 +181,17 @@ class Scheduler:
         # three consecutive failures six weeks apart -- long enough that the
         # failure alert would never fire.
         self.retry_after = {task: 0.0 for task in TASK_ORDER}
+        # Set when rebalancing finds the oracle out of line with the vault's
+        # value, and answered on the next cycle by a resync. In memory only: if
+        # the process restarts first, the next rebalance finds the same gap and
+        # asks again. `resync_refusals` holds why the last resync declined to
+        # write or failed, so the rebalance alert can say what is blocking it.
+        self.resync_requested = False
+        self.resync_refusals: list = []
+        # When a refusal of the oracle write was last announced. A refused write
+        # is retried every cycle, and announcing each retry sent the same alert
+        # every five minutes; it is now repeated once per oracle interval.
+        self.refusal_announced_at = 0.0
 
     # -- persisted schedule ------------------------------------------------
 
@@ -293,7 +308,7 @@ class Scheduler:
             * self.config.scheduler.interval(task)
         )
 
-    def record_skip(self, task: str, reason: str) -> None:
+    def record_skip(self, task: str, reason: str, alert: bool = True) -> None:
         """Track a task that ran but declined to act.
 
         Rebalancing refuses whenever the oracle is stale or a cross-chain
@@ -303,6 +318,9 @@ class Scheduler:
 
         Judged by how long the run has lasted, not how many attempts it took --
         see SKIP_ALERT_AFTER_SECONDS.
+
+        `alert=False` keeps the count without speaking, for a run that is
+        already announced through its own channel on its own cadence.
         """
         now = self._now()
         self.skips[task] += 1
@@ -310,7 +328,7 @@ class Scheduler:
             self.skipping_since[task] = now
 
         threshold = self.skip_alert_after(task)
-        if not threshold:
+        if not threshold or not alert:
             return
         elapsed = now - self.skipping_since[task]
         # Repeats like record_failure does; a task stuck refusing to act has to
@@ -348,7 +366,14 @@ class Scheduler:
                 tx=self.tx_options(source.tx),
             )
 
-    def task_rebalance(self) -> None:
+    def task_rebalance(self):
+        """Rebalance, and ask for a resync when the oracle is what stops it.
+
+        Returns False -- declined, due again next cycle -- when the oracle
+        disagrees with the vault's value. Otherwise that refusal waited out the
+        two-hour interval and, since only the next eight-hourly write corrected
+        the oracle, stood until then.
+        """
         # force_withdrawal is passed explicitly so a stray FORCE_WITHDRAWAL in
         # the environment cannot make an unattended run pull the entire target
         # position back every two hours.
@@ -363,10 +388,22 @@ class Scheduler:
             or []
         )
         reasons = [reason for _, reason in results if reason]
+        oracle_off = ORACLE_VALUE_INCORRECT in reasons
+        if oracle_off:
+            # Answered next cycle, not now: every read is taken a few seconds
+            # behind the chain, so a resync in this cycle would not see a write
+            # made moments ago -- this very refusal is often that.
+            self.resync_requested = True
         if reasons and len(reasons) == len(results):
-            self.record_skip("rebalance", "; ".join(sorted(set(reasons))))
+            reason = "; ".join(sorted(set(reasons)))
+            if oracle_off and self.resync_refusals:
+                reason += " (resync {})".format("; ".join(self.resync_refusals))
+            self.record_skip("rebalance", reason)
         else:
             self.clear_skips("rebalance")
+        if oracle_off:
+            return False
+        return None
 
     def task_oracle_update(self) -> bool:
         """Refresh the oracle. Returns whether it actually wrote anything.
@@ -377,6 +414,16 @@ class Scheduler:
         """
         from main import run_oracle_update
 
+        # A refused write stays due and is retried every cycle. Its alert is not:
+        # once said, it is repeated once per oracle interval -- the cadence the
+        # write itself would have had -- rather than on every retry.
+        now = self._now()
+        announce = (
+            not self.refusal_announced_at
+            or now - self.refusal_announced_at
+            >= self.config.scheduler.interval("oracle_update")
+        )
+
         # The raising variant, not main(): main() swallows everything so the
         # scheduler could never see this task fail.
         summary = asyncio.run(
@@ -384,6 +431,7 @@ class Scheduler:
                 self.config,
                 should_stop=lambda: self.stopping,
                 on_stuck=lambda text: self.notify("⚠️ " + text),
+                announce=announce,
             )
         )
 
@@ -404,9 +452,15 @@ class Scheduler:
             # marking the dependency it owes as paid, and clearing the window
             # that would have alerted. That is the one kind of "did not write"
             # which will not resolve on its own.
+            if summary.announced:
+                self.refusal_announced_at = now
+            # A pure refusal already speaks through its own alert, paced above;
+            # the skip alert would repeat it every half hour. A skip -- a
+            # transfer in flight -- has no alert of its own, so it keeps this one.
             self.record_skip(
                 "oracle_update",
                 "; ".join(sorted(set(summary.skip_reasons))) or "nothing written",
+                alert=bool(summary.skip_reasons) or not summary.refused,
             )
             # Declining to act is not acting. Saying so keeps the task due, so
             # it tries again next cycle and writes as soon as the transfer
@@ -419,8 +473,35 @@ class Scheduler:
             # the gap the dependency rule exists to close.
             return False
 
+        self.refusal_announced_at = 0.0
+        self.resync_refusals = []
         self.clear_skips("oracle_update")
         return True
+
+    def run_resync(self) -> None:
+        """Answer a resync request. Isolated like a task, but not one: it has no
+        schedule, no last_run and no failure count of its own -- rebalancing,
+        which asked, is what goes on reporting until the gap is closed."""
+        from main import run_oracle_resync
+
+        print("[oracle_update] resync: rebalancing found the oracle out of line")
+        try:
+            summary = run_oracle_resync(
+                self.config,
+                should_stop=lambda: self.stopping,
+                on_stuck=lambda text: self.notify("⚠️ " + text),
+            )
+        except Exception as e:
+            # Kept, so the next cycle asks again.
+            print_colored(
+                "[oracle_update] resync failed: {}".format(
+                    mask_all_sensitive_config_data(str(e), self.config)
+                ),
+                "yellow",
+            )
+            return
+        self.resync_refusals = summary.refusals
+        self.resync_requested = summary.pending
 
     def task_handle_epoch(self) -> None:
         for source in self.config.sources:
@@ -515,8 +596,17 @@ class Scheduler:
                         task, format_duration(remaining)
                     )
                 )
+                # In oracle_update's slot so it lands before rebalance, which
+                # asked for it. Only when the heartbeat is not running anyway,
+                # and never during a retry backoff, which `continue`s above.
+                if task == "oracle_update" and self.resync_requested:
+                    self.run_resync()
                 continue
 
+            if task == "oracle_update":
+                # The heartbeat rereads and rewrites the value itself; a resync
+                # alongside it would only race it for the same write.
+                self.resync_requested = False
             print("[{}] running...".format(task))
             try:
                 acted = self.handler(task)()
@@ -545,6 +635,9 @@ class Scheduler:
                 self.retry_after[task] = self._now() + self.retry_delay(task)
 
             if task == "ascend":
+                # Long enough for the oracle's lagged read to land after the
+                # distribution, and no longer: deposits in this gap price
+                # against the old share price. See DEFAULT_POST_ASCEND_GAP_SECONDS.
                 gap = self.config.scheduler.post_ascend_gap_seconds
                 print("[ascend] settling for {}s".format(gap))
                 self._sleep(gap)
