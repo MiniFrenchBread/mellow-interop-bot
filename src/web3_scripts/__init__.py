@@ -12,4 +12,10 @@ from .oracle_update import (
     exceeds_deviation,
     is_decrease,
     update_oracle,
+    RESYNC_NOOP,
+    RESYNC_REFUSE,
+    RESYNC_WAIT,
+    RESYNC_WRITE,
+    ResyncResult,
+    resync_oracle,
 )

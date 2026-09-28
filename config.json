@@ -7,7 +7,7 @@
   "oracle-recent-update-threshold-seconds": "${ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS:0}",
   "scheduler": {
     "loop-sleep-seconds": "${LOOP_SLEEP_SECONDS:300}",
-    "post-ascend-gap-seconds": "${POST_ASCEND_GAP_SECONDS:60}",
+    "post-ascend-gap-seconds": "${POST_ASCEND_GAP_SECONDS:20}",
     "lock-file": "${SCHEDULER_LOCK_FILE:.scheduler.lock}",
     "state-file": "${SCHEDULER_STATE_FILE:.scheduler-state.json}",
     "alert-after-failures": "${ALERT_AFTER_FAILURES:3}",

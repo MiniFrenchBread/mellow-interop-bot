@@ -14,7 +14,18 @@ DEFAULT_TX_FEE_BUMP_PERCENT = 115
 DEFAULT_TX_FEE_CAP_GWEI = 4
 
 DEFAULT_LOOP_SLEEP_SECONDS = 300
-DEFAULT_POST_ASCEND_GAP_SECONDS = 60
+# The wait between ascend and the oracle write that follows it. Every second of
+# it is a second in which deposits price against the pre-distribution share
+# price, so it is kept short -- but not below the oracle's read lag. The value
+# is read at a block SECURE_INTERVAL (15s, web3_scripts/base.py) before the
+# latest, so a gap that does not clear it reads a block from before the
+# distribution and writes the old price back, leaving the new one unpriced for
+# a full interval. The default leaves five seconds of margin over that lag.
+DEFAULT_POST_ASCEND_GAP_SECONDS = 20
+# Kept as a literal rather than imported: base.py pulls in the transaction
+# stack, and this module is also loaded by path where that import fails. A test
+# binds the two so neither can move without the other.
+MIN_POST_ASCEND_GAP_SECONDS = 16
 DEFAULT_LOCK_FILE = ".scheduler.lock"
 DEFAULT_STATE_FILE = ".scheduler-state.json"
 DEFAULT_ALERT_AFTER_FAILURES = 3
@@ -557,10 +568,12 @@ def _create_scheduler_config(
         loop_sleep_seconds=int(
             scheduler_dict.get("loop_sleep_seconds", DEFAULT_LOOP_SLEEP_SECONDS)
         ),
-        post_ascend_gap_seconds=int(
+        post_ascend_gap_seconds=_at_least(
+            "post-ascend-gap-seconds",
             scheduler_dict.get(
                 "post_ascend_gap_seconds", DEFAULT_POST_ASCEND_GAP_SECONDS
-            )
+            ),
+            MIN_POST_ASCEND_GAP_SECONDS,
         ),
         lock_file=scheduler_dict.get("lock_file") or DEFAULT_LOCK_FILE,
         state_file=scheduler_dict.get("state_file") or DEFAULT_STATE_FILE,

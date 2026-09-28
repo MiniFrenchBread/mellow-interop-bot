@@ -54,6 +54,11 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
   load-bearing: ascend moves the vault's value, rebalance refuses while the oracle disagrees with
   the computed value, so refreshing the oracle in between is what stops every post-distribution
   rebalance from being skipped.
+  Between heartbeats, a rebalance that finds the oracle out of line declines (due again next
+  cycle) and requests a **resync**, which runs in `oracle_update`'s slot on the next cycle and
+  writes only if the gap is real. Next cycle rather than now, because every read is taken
+  `SECURE_INTERVAL` behind the chain and would not see a write made moments ago. See "Between
+  heartbeats: resync" in `README.md`.
   Task intervals come from `scheduler.tasks` in `config.json`, falling back to built-in
   defaults. Omitting a task does **not** stop it — it runs on its default — and no interval
   value means "off" (a non-positive one is rejected, because it would otherwise make the task
@@ -152,6 +157,7 @@ so a default there would enter public history.
 | `OG_EXECUTOR_PK` | Overrides `OPERATOR_PK` for the OG source, signing **both** legs of its rebalance — the target-chain calls included | `OPERATOR_PK` |
 | `OG_RECEIPT_TIMEOUT` / `TARGET_RECEIPT_TIMEOUT` | Seconds to wait before raising the fee and re-signing. Not a budget: a send runs until the chain settles it | 60 / 600 |
 | `ASCEND_INTERVAL_SECONDS` / `REBALANCE_INTERVAL_SECONDS` / `ORACLE_UPDATE_INTERVAL_SECONDS` / `HANDLE_EPOCH_INTERVAL_SECONDS` | Task intervals. Keep ascend **≤** oracle-update, or most writes record a value nothing has changed | 28800 / 7200 / 28800 / 300 |
+| `POST_ASCEND_GAP_SECONDS` | Wait between ascend and the oracle write. Deposits in it price against the old share price, so keep it short; it must exceed `SECURE_INTERVAL` (15s) or the write reads a pre-distribution block. ≤15 is rejected | 20 |
 | `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
@@ -195,6 +201,15 @@ proposers for one Safe.
   runs until the chain settles it and no two operations can be in flight on one nonce.
 - The guards refuse rather than write, and a refusal **does not self-heal** — ascend keeps adding
   rewards, so the gap widens daily, and rebalance starts refusing too. `maxAge` is the deadline.
+  The refused write is retried every cycle; its alert is sent once and then once per
+  `oracle_update` interval (`refusal_announced_at`), and a pure refusal does not also raise the
+  half-hourly skip alert. Before this, one refusal produced a message every five minutes.
+- A resync is not a second heartbeat: it never writes an unchanged value and has no schedule.
+  It uses the deviation guard as-is but not the decrease guard, because the fall a stale-priced
+  deposit causes is what it exists to write. The floor instead is the value the last write
+  replaced (read from `ValueSet` events): a deposit at a stale price dilutes toward that price and
+  never below it, so a fall past it is a loss and is refused. It sends no Telegram; a refusal is
+  appended to rebalance's skip alert.
 - Safe transaction proposals: the bot first checks for an existing queued transaction with matching calldata before proposing a new one, to avoid duplicates.
 - Safe nonces do not advance for queued-but-unexecuted proposals, so a proposal carrying a newer
   oracle value lands on the same nonce as the pending one and voids it when executed. That is the

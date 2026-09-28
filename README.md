@@ -18,6 +18,7 @@ All environment variables can be optional.
 - `ORACLE_DECREASE_TOLERANCE_WEI` - Refuse to write a value that fell by more than this. Below it, a dip is rounding noise (default: `1000000000`).
 - `ORACLE_UPDATER_MIN_BALANCE_WEI` - Warn when the updater's gas balance drops below this. It still writes; the point is warning while there is runway (default: `100000000000000000`).
 - `ORACLE_EXPIRY_THRESHOLD_SECONDS` - How close to expiry counts as urgent. No longer triggers the write — the heartbeat is unconditional — but it decides how loudly a refusal is described (default: `172800`).
+- `POST_ASCEND_GAP_SECONDS` - Wait between a reward distribution and the oracle write that prices it. Deposits in that wait take shares at the old price, so it is kept short; it must exceed the oracle's 15s read lag, or the write reads a block from before the distribution and puts the old price back. Values of 15 or less are rejected (default: `20`).
 - `ORACLE_RECENT_UPDATE_THRESHOLD_SECONDS` - Threshold in seconds to determine if an oracle was recently updated. When an oracle was updated within this timeframe, the bot sends a confirmation message to notify that the oracle has been updated (default: `0`).
 - `TELEGRAM_OWNER_NICKNAMES` - Comma-separated telegram nicknames of safe signers. Supports two formats: simple nicknames (`@josh,@anna,@dexter`) or `nickname:address` pairs (`@josh:0x123...,@anna:0xabc...`). Nicknames are mentioned in proposal messages when their confirmation is needed.
 - `TARGET_RPC` - Target blockchain RPC endpoint (see default in `config.json`).
@@ -135,6 +136,42 @@ A refusal **does not fix itself, and gets worse**: ascend keeps adding rewards,
 so the gap widens every day. Rebalancing also starts refusing once the oracle
 disagrees with the computed value. `maxAge` is the deadline — after that the
 vault is frozen until someone acts.
+
+A refusal is announced once, then again once per `oracle-update` interval while
+it lasts. The write itself is retried every cycle; its alert is not.
+
+### Between heartbeats: resync
+
+The vault is priced against the oracle (`totalAssets = totalSupply × oracle`),
+so anything that moves the vault's real value between two writes leaves the two
+apart until the next one. Two things do:
+
+- **A deposit in the window after a reward distribution.** Rewards raise the
+  real share price at once, and the oracle catches up only once the write that
+  follows lands. A deposit in between takes shares at the old price, which
+  dilutes the share price toward it. The window is the settling gap
+  (`POST_ASCEND_GAP_SECONDS`, 20s) plus the write; the gap cannot go below the
+  oracle's 15s read lag without reading a block from before the distribution.
+- **W0G sent straight to the SourceCore**, which raises the value without
+  minting anything.
+
+Either used to leave rebalancing refusing until the next write, up to eight
+hours.
+
+Now, when rebalancing finds the oracle out of line, it declines and retries on
+the next cycle, and asks for a **resync** in between. A resync re-reads the value
+and writes only if the gap is really there:
+
+| Reading | Resync |
+|---|---|
+| within 1 gwei | nothing — this is most often a read taken seconds before the last write |
+| transfer in flight | waits for the next cycle |
+| higher (a donation) | writes, if within the deviation guard |
+| lower, but not below the value the last write replaced | writes — a deposit at the stale price cannot take the price lower than that |
+| lower than that, or past the deviation guard | refuses; the rebalance skip alert names the reason |
+
+A resync sends no Telegram of its own. Rebalancing is what is blocked, and its
+skip alert already speaks on its own cadence.
 
 ### When a guard refuses
 

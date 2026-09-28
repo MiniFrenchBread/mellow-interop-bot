@@ -16,6 +16,10 @@ LAYER_ZERO_DUST = 1000_000_000_000
 LAYER_ZERO_FINALIZATION_TIMEOUT = 1800
 LAYER_ZERO_POLL_INTERVAL = 60
 
+# Returned when the oracle disagrees with the vault's value. The scheduler keys
+# on it to ask for a resync, so the text lives in one place.
+ORACLE_VALUE_INCORRECT = "oracle value is incorrect"
+
 
 class LayerZeroFinalizationTimeout(Exception):
     pass
@@ -96,7 +100,7 @@ def run(
 
     if oracle_validation_result.incorrect_value:
         print_colored("Oracle value is incorrect", "red")
-        return "oracle value is incorrect"
+        return ORACLE_VALUE_INCORRECT
 
     # Settings are per chain because the chains behave nothing alike: 0G confirms
     # in about a second, while inclusion on the target chain depends on fee
