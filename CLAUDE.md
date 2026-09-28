@@ -51,14 +51,16 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
   one failure cannot stop the others, and repeated failures or repeated guard-skips raise a
   Telegram alert.
   `TASK_ORDER` is `ascend -> oracle_update -> rebalance -> handle_epoch`, and the order is
-  load-bearing: ascend moves the vault's value, rebalance refuses while the oracle disagrees with
-  the computed value, so refreshing the oracle in between is what stops every post-distribution
-  rebalance from being skipped.
-  Between heartbeats, a rebalance that finds the oracle out of line declines (due again next
-  cycle) and requests a **resync**, which runs in `oracle_update`'s slot on the next cycle and
-  writes only if the gap is real. Next cycle rather than now, because every read is taken
-  `SECURE_INTERVAL` behind the chain and would not see a write made moments ago. See "Between
-  heartbeats: resync" in `README.md`.
+  load-bearing: ascend moves the vault's value, and rebalance refuses while the oracle disagrees
+  with the computed value, so the oracle is written before rebalance looks. That alone does not
+  let the rebalance in the same cycle act: it reads `SECURE_INTERVAL` behind the chain, sees the
+  pre-write value, and declines.
+  A rebalance that finds the oracle out of line declines (due again next cycle) and requests a
+  **resync**, which runs in `oracle_update`'s slot on the next cycle and writes only if the gap
+  is real. Next cycle rather than now, because a read taken now would not see a write made
+  moments ago. This fires one cycle after every heartbeat -- finding the oracle in line and
+  writing nothing, after which rebalance acts -- and between heartbeats when something really
+  moved the value. See "Between heartbeats: resync" in `README.md`.
   Task intervals come from `scheduler.tasks` in `config.json`, falling back to built-in
   defaults. Omitting a task does **not** stop it — it runs on its default — and no interval
   value means "off" (a non-positive one is rejected, because it would otherwise make the task

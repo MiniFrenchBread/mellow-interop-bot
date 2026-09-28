@@ -173,6 +173,12 @@ and writes only if the gap is really there:
 A resync sends no Telegram of its own. Rebalancing is what is blocked, and its
 skip alert already speaks on its own cadence.
 
+It also runs one cycle after every heartbeat, as a no-op. The rebalance in the
+heartbeat's own cycle reads a block from before the write, so it always sees the
+old value and declines; the resync on the next cycle finds the oracle in line,
+writes nothing, and rebalance acts. Before this, that rebalance waited out its
+two-hour interval instead.
+
 ### When a guard refuses
 
 1. Look at the reading. This broadcasts nothing:

@@ -46,8 +46,12 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 # oracle_update sits between ascend and rebalance rather than after both.
 # Rebalancing refuses whenever the oracle disagrees with the computed value, and
 # ascend is the thing that makes them disagree -- so with rebalance running
-# first, the pass immediately after every reward distribution was guaranteed to
-# refuse. Refreshing the oracle in between removes that.
+# first, the pass after every reward distribution refused against a value
+# nobody had yet written. Writing it first puts the new value on chain before
+# rebalance looks, but not yet in what rebalance reads: every read is taken
+# SECURE_INTERVAL behind the chain, so this cycle's rebalance still sees the old
+# value and declines. It is retried one cycle later, where the read has caught
+# up (see task_rebalance), rather than at its next two-hour slot.
 TASK_ORDER = ("ascend", "oracle_update", "rebalance", "handle_epoch")
 
 # A task that owes a run whenever the task it depends on has run more recently
@@ -181,7 +185,7 @@ class Scheduler:
         # value, and answered on the next cycle by a resync. In memory only: if
         # the process restarts first, the next rebalance finds the same gap and
         # asks again. `resync_refusals` holds why the last resync declined to
-        # write, so the rebalance alert can say what is actually blocking it.
+        # write or failed, so the rebalance alert can say what is blocking it.
         self.resync_requested = False
         self.resync_refusals: list = []
         # When a refusal of the oracle write was last announced. A refused write
@@ -393,9 +397,7 @@ class Scheduler:
         if reasons and len(reasons) == len(results):
             reason = "; ".join(sorted(set(reasons)))
             if oracle_off and self.resync_refusals:
-                reason += " (resync refused: {})".format(
-                    "; ".join(self.resync_refusals)
-                )
+                reason += " (resync {})".format("; ".join(self.resync_refusals))
             self.record_skip("rebalance", reason)
         else:
             self.clear_skips("rebalance")

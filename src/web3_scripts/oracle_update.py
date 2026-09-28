@@ -326,8 +326,11 @@ RESYNC_REFUSE = "refuse"
 VALUE_SET_TOPIC = "0x" + Web3.keccak(
     text="ValueSet(uint256,uint256)"
 ).hex().removeprefix("0x")
-# How far back to look for the write before the current one. Anything older
-# than maxAge (21 days) could not still be the value the oracle is priced on.
+# How far back to look for the write before the current one: about 23 days at
+# 0G's roughly one-second blocks, a little past maxAge (21 days). Beyond that
+# the oracle would have expired, so nothing older can be the value it replaced.
+# Should blocks get faster, this reaches less far back; a lookup that finds
+# nothing only means a fall is refused, never that one is let through.
 VALUE_SET_LOOKBACK_BLOCKS = 2_000_000
 VALUE_SET_CHUNK_BLOCKS = 50_000
 

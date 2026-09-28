@@ -17,6 +17,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+from hexbytes import HexBytes
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config.read_config import (
@@ -40,6 +42,7 @@ from web3_scripts.oracle_update import (
     RESYNC_WAIT,
     RESYNC_WRITE,
     OracleUpdateResult,
+    previous_oracle_value,
     resync_action,
     resync_floor,
     resync_oracle,
@@ -211,6 +214,79 @@ class TestValueBefore(unittest.TestCase):
         self.assertIsNone(value_before([BEFORE], WRITTEN))
 
 
+class FakeChain:
+    """Answers get_logs from a list of (block, log_index, value) ValueSet events."""
+
+    def __init__(self, head, events):
+        self.events = events
+        self.queries = []
+        self.eth = SimpleNamespace(block_number=head, get_logs=self._get_logs)
+
+    def _get_logs(self, flt):
+        self.queries.append((flt["fromBlock"], flt["toBlock"]))
+        # A scan that stops advancing would otherwise hang the suite, not fail it.
+        assert len(self.queries) < 100, "the scan is not terminating"
+        assert flt["topics"] == [oracle_update.VALUE_SET_TOPIC]
+        return [
+            {
+                "blockNumber": block,
+                "logIndex": index,
+                "topics": [
+                    HexBytes(oracle_update.VALUE_SET_TOPIC),
+                    HexBytes(value.to_bytes(32, "big")),
+                ],
+            }
+            for block, index, value in self.events
+            if flt["fromBlock"] <= block <= flt["toBlock"]
+        ]
+
+
+class TestPreviousOracleValue(unittest.TestCase):
+    """The one chain-facing read the resync adds, driven through the real code:
+    chunked newest-first scanning, and decoding the value from the topics."""
+
+    def setUp(self):
+        for name, value in (
+            ("VALUE_SET_CHUNK_BLOCKS", 50_000),
+            ("VALUE_SET_LOOKBACK_BLOCKS", 120_000),
+        ):
+            self.addCleanup(setattr, oracle_update, name, getattr(oracle_update, name))
+            setattr(oracle_update, name, value)
+
+    def lookup(self, events, head=200_000, current=WRITTEN):
+        chain = FakeChain(head, events)
+        return previous_oracle_value(chain, ORACLE, current), chain
+
+    def test_found_across_a_chunk_edge(self):
+        # Chunks are [150001, 200000] then [100001, 150000].
+        found, chain = self.lookup([(150_000, 0, BEFORE), (150_001, 0, WRITTEN)])
+
+        self.assertEqual(found, BEFORE)
+        self.assertEqual(chain.queries, [(150_001, 200_000), (100_001, 150_000)])
+
+    def test_stops_scanning_once_found(self):
+        found, chain = self.lookup([(160_000, 0, BEFORE), (190_000, 0, WRITTEN)])
+
+        self.assertEqual(found, BEFORE)
+        self.assertEqual(len(chain.queries), 1)
+
+    def test_orders_writes_within_one_block(self):
+        found, _ = self.lookup([(180_000, 2, WRITTEN), (180_000, 1, BEFORE)])
+
+        self.assertEqual(found, BEFORE)
+
+    def test_nothing_within_the_lookback(self):
+        """Contiguous ranges back to the limit and no further, then None --
+        which makes a resync refuse any fall rather than guess."""
+        found, chain = self.lookup([(10, 0, BEFORE), (190_000, 0, WRITTEN)])
+
+        self.assertIsNone(found)
+        self.assertEqual(
+            chain.queries,
+            [(150_001, 200_000), (100_001, 150_000), (80_000, 100_000)],
+        )
+
+
 class TestAction(unittest.TestCase):
     def test_in_line_is_left_alone(self):
         self.assertEqual(
@@ -316,13 +392,15 @@ class TestRunOracleResync(unittest.TestCase):
 
     def test_a_failure_keeps_it_open_and_does_not_raise(self):
         self._returns(RuntimeError("rpc down"))
-        self.assertTrue(main.run_oracle_resync(config(source())).pending)
+        summary = main.run_oracle_resync(config(source()))
+        self.assertTrue(summary.pending)
+        self.assertEqual(summary.refusals, ["OG/OG: failed: rpc down"])
 
     def test_a_refusal_is_reported_by_name(self):
         self._returns((RESYNC_REFUSE, "would lower the value"))
         summary = main.run_oracle_resync(config(source()))
         self.assertFalse(summary.pending)
-        self.assertEqual(summary.refusals, ["OG/OG: would lower the value"])
+        self.assertEqual(summary.refusals, ["OG/OG: refused: would lower the value"])
 
 
 class FakeClock:
@@ -376,7 +454,9 @@ class TestRebalanceAsksForAResync(SchedulerCase):
 
     def test_a_refused_resync_is_named_in_the_rebalance_alert(self):
         self._reasons(ORACLE_VALUE_INCORRECT)
-        self.scheduler.resync_refusals = ["OG/OG: would lower the value below X"]
+        self.scheduler.resync_refusals = [
+            "OG/OG: refused: would lower the value below X"
+        ]
 
         for _ in range(80):  # well past the six-hour threshold, five minutes apart
             self.scheduler.task_rebalance()
@@ -384,7 +464,7 @@ class TestRebalanceAsksForAResync(SchedulerCase):
 
         self.assertTrue(self.alerts)
         self.assertIn(
-            "resync refused: OG/OG: would lower the value below X", self.alerts[0]
+            "(resync OG/OG: refused: would lower the value below X)", self.alerts[0]
         )
 
 

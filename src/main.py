@@ -338,6 +338,8 @@ class ResyncSummary:
     `pending` means the question is still open -- a transfer in flight, or a
     deployment that could not be read -- so the scheduler asks again next cycle.
     `refusals` are carried into the alert of whatever keeps tripping over the gap.
+    Failures are listed there too: a resync that keeps failing leaves the gap
+    open exactly as a refusal does, and the alert should say which it was.
     """
 
     written: int = 0
@@ -374,6 +376,11 @@ def run_oracle_resync(config: Config, should_stop=None, on_stuck=None) -> Resync
                     ),
                     "yellow",
                 )
+                summary.refusals.append(
+                    "{}/{}: failed: {}".format(
+                        source.name, deployment.name, masked_error
+                    )
+                )
                 continue
             if result.action == RESYNC_WRITE:
                 summary.written += 1
@@ -381,7 +388,9 @@ def run_oracle_resync(config: Config, should_stop=None, on_stuck=None) -> Resync
                 summary.pending = True
             elif result.action == RESYNC_REFUSE:
                 summary.refusals.append(
-                    "{}/{}: {}".format(source.name, deployment.name, result.reason)
+                    "{}/{}: refused: {}".format(
+                        source.name, deployment.name, result.reason
+                    )
                 )
     return summary
 
