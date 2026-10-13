@@ -25,6 +25,23 @@
       "fee-cap-gwei": "${TARGET_FEE_CAP_GWEI:4}"
     }
   },
+  "daily-report": {
+    "beacon-api": "${ZG_BEACON_API:}",
+    "restaking-states": "0xd5AB0eD30D65f01EC6d6A4BaCA6E466F395334b6",
+    "operator": "0xc0412361882961570d79CE535cB26Fc71bf363A7",
+    "service-account": "0xB2718399641eC548D02C736852C7eeCc7B532be8",
+    "validators": [
+      { "index": "0", "rewarder": "0x8163e79a5ade5a453e129f36b957fef15a3736b5", "vault": "0x0f1197c871A857982532Bd4069023434E6Bcf191" },
+      { "index": "1", "rewarder": "0xb3c5650c74100f96400a9d1ac71e9d0df324f567", "vault": "0x3eFE40551A996e30e880D8c622E76EE194C3f0CF" },
+      { "index": "3", "rewarder": "0x73d346e827435b88e0bf46ed6efa7e09e546b388", "vault": "0x641A4f5993A8fc86fb1F26F448Ac0C0390B096B5" }
+    ],
+    "logs": {
+      "bot": "${BOT_LOG:/data/bot.log}",
+      "restaking": "${RESTAKING_LOG:/data/restaking.log}",
+      "monitor": "${MONITOR_LOG:/data/monitor.log}",
+      "vault-monitor": "${VAULT_MONITOR_LOG:/data/vault-monitor.log}"
+    }
+  },
   "target-rpc": "${TARGET_RPC:}",
   "target-core-helper": "0xb417a4a14047281608F83414f2770987ca0ca8F5",
   "sources": [

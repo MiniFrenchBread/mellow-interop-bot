@@ -211,6 +211,43 @@ two-hour interval instead.
    being available at all once the key moves somewhere a person cannot reach —
    prefer `oracle-propose`.
 
+## Daily report
+
+`src/daily_report.py` posts one message a day to the Telegram group: the
+problems first, then the numbers they were judged on. It reads and never
+writes -- no key, no transaction, no process lock -- so it runs beside the
+scheduler, on the host whose logs it reads.
+
+```bash
+python ./src/daily_report.py --dry-run          # print, send nothing
+python ./src/daily_report.py --hours 72         # widen the window
+python ./src/daily_report.py                    # post
+```
+
+What it checks, and what it flags:
+
+| Area | Flagged when |
+|---|---|
+| bot, restaking service, monitor, vault-monitor | a process is down, or its log has gone quiet |
+| oracle | fewer heartbeats than the schedule owes; the latest step outside 0.5-2 bps; the share price more than 5 bps off the oracle |
+| bot log | a task failed (yellow if it later recovered), a write was refused, a transaction needed a fee bump, a resync wrote, refused, or ran outside the cycle after a heartbeat |
+| operator account | its nonce on either chain is ahead of the last one the bot logged -- something else signed with the key |
+| gas | operator below 20 OG / 0.05 ETH, restaking service below 2 OG |
+| source ratio | outside 0-10%, the band rebalance holds it in |
+| restaking stake | a validator's Symbiotic `activeStake`, 0G `RestakingStates` balance and CL restaking balance differ, or the CL has a restaking validator the config does not list |
+| target value | it differs from stake plus in-flight Mellow withdrawals |
+| service logs | warnings (502s counted apart), failed restaking transactions, failed vault-monitor checks |
+
+Addresses are under `daily-report` in `config.json`. The beacon API and the
+log paths come from the environment: `ZG_BEACON_API` (required),
+`BOT_LOG`, `RESTAKING_LOG`, `MONITOR_LOG`, `VAULT_MONITOR_LOG`.
+
+Run it from cron at a fixed time, for example:
+
+```
+7 10 * * * cd /data/mellow-interop-bot && ./.venv/bin/python src/daily_report.py >> /data/daily-report.log 2>&1
+```
+
 ### Running with Docker
 
 1. Build the container:

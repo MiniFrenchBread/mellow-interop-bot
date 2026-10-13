@@ -1,0 +1,51 @@
+[
+  {
+    "type": "function",
+    "name": "subvaultsCount",
+    "stateMutability": "view",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "function",
+    "name": "subvaultAt",
+    "stateMutability": "view",
+    "inputs": [
+      {
+        "name": "index",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "tuple",
+        "internalType": "struct IMultiVaultStorage.Subvault",
+        "components": [
+          {
+            "name": "protocol",
+            "type": "uint8",
+            "internalType": "enum IMultiVaultStorage.Protocol"
+          },
+          {
+            "name": "vault",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "withdrawalQueue",
+            "type": "address",
+            "internalType": "address"
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,15 @@
+[
+  {
+    "type": "function",
+    "name": "activeStake",
+    "stateMutability": "view",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  }
+]
