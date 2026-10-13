@@ -1,0 +1,43 @@
+[
+  {
+    "type": "function",
+    "name": "getBalances",
+    "stateMutability": "view",
+    "inputs": [
+      {
+        "name": "rewarder",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "balances",
+        "type": "tuple[]",
+        "internalType": "struct IRestakingStates.Balance[]",
+        "components": [
+          {
+            "name": "domain",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
+            "name": "collateral",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "amount",
+            "type": "uint256",
+            "internalType": "uint256"
+          }
+        ]
+      }
+    ]
+  }
+]

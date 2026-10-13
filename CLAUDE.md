@@ -40,7 +40,7 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
   - `multi_send_call.py` -- Encodes multiple calls into a single `multiSend(bytes)` call for Safe contracts (supports versions 1.3.0, 1.4.1, 1.5.0).
   - `common.py` -- Shared data structures (`PendingTransactionInfo`, `ThresholdWithOwners`), validation helpers, retry utility.
 - **`src/telegram_bot/`** -- Telegram message sending with Markdown formatting and dry-run support.
-- **`abi/`** -- JSON ABI files for smart contracts: `Oracle`, `SourceCore`, `TargetCore`, `SourceHelper`, `TargetHelper`, `Safe`, `SafeMultiSend`, `Rewarder`, `AscendRouter`, `WithdrawalQueue`.
+- **`abi/`** -- JSON ABI files for smart contracts: `Oracle`, `SourceCore`, `TargetCore`, `SourceHelper`, `TargetHelper`, `Safe`, `SafeMultiSend`, `Rewarder`, `AscendRouter`, `WithdrawalQueue`; and, for the daily report only, `SymbioticVault`, `RestakingStates`, `MellowMultiVault`, `MellowWithdrawalQueue`.
 
 ### Scheduler and CLI
 
@@ -69,6 +69,11 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
 - **`src/cli.py`** -- One-shot entry points for the same code paths: `ascend` (with `--dry-run`),
   `handle-epoch`, `oracle` (with `--dry-run` / `--force`), `oracle-propose` (with `--value` /
   `--dry-run`), `rebalance`, `validate-config`.
+- **`src/daily_report.py`** -- Daily Telegram health report, run from cron on the bot's host. Read-only:
+  no key, no lock. Collection (logs, `ps`, chain, beacon API) is separate from `evaluate` (the rules)
+  and `render`, which are pure and tested on synthetic logs. The operator-nonce check reads the chain
+  before the bot log, so a transaction sent in between can only put the log ahead -- only a chain
+  nonce ahead of the log means something other than the bot signed. See "Daily report" in `README.md`.
 - **`src/process_lock.py`** -- Single-holder lock shared by the scheduler, the CLI and the
   standalone `main.py`. One account signs every broadcast transaction, so two processes running at
   once would collide over its nonce.
@@ -162,6 +167,8 @@ so a default there would enter public history.
 | `POST_ASCEND_GAP_SECONDS` | Wait between ascend and the oracle write. Deposits in it price against the old share price, so keep it short; it must exceed `SECURE_INTERVAL` (15s) or the write reads a pre-distribution block. ≤15 is rejected | 20 |
 | `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
+| `ZG_BEACON_API` | 0G beacon API, read by the daily report for CL restaking balances | (required for daily_report) |
+| `BOT_LOG` / `RESTAKING_LOG` / `MONITOR_LOG` / `VAULT_MONITOR_LOG` | Logs the daily report reads | `/data/*.log` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
 | `FORCE_WITHDRAWAL` | Standalone `operator_bot.py` only: pull the **entire** target-chain position back. The scheduler passes `False` explicitly so a stray export cannot trigger it unattended | 0 |
 | `SOURCE_RATIO_D3` | Target source asset ratio (per mille) | 50 |
