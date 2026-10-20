@@ -77,7 +77,8 @@
         {
           "name": "OG",
           "source-core": "0x4B3c2f55fa67679b382c979A082Df1B32079B4cB",
-          "target-core": "0xd46E464c82643e6937838A94d40FD8D014A2EA26"
+          "target-core": "0xd46E464c82643e6937838A94d40FD8D014A2EA26",
+          "oracle-updater": "0xa57e348Afb83153cE2aB27210FFB35c9860B3A42"
         }
       ],
       "safe-global": {

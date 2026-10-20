@@ -13,7 +13,7 @@ A cross-chain oracle monitoring and validation bot that tracks oracle states acr
 
 All environment variables can be optional.
 
-- `ORACLE_UPDATER_PK` - Private key that writes `Oracle.setValue`. Must hold `SET_VALUE_ROLE` on the SourceCore (granted from the Safe; see "Oracle updates"). Configured separately from `OPERATOR_PK` so the roles can be split — it is the only key that can move the share price. Pointing both at one account works and is a fine way to start; it just means one nonce sequence shared between the oracle write and everything else.
+- `ORACLE_UPDATER_PK` - Private key that writes the oracle, through the deployment's `oracle-updater` contract (see "Oracle updates"). Must hold `UPDATER_ROLE` on that OracleUpdater, which in turn holds `SET_VALUE_ROLE` on the SourceCore. Configured separately from `OPERATOR_PK` so the roles can be split — it is the only key that can move the share price. Pointing both at one account works and is a fine way to start; it just means one nonce sequence shared between the oracle write and everything else.
 - `ORACLE_MAX_DEVIATION_BPS` - Refuse to write a value more than this far from the one on chain (default: `100`, i.e. 1%).
 - `ORACLE_DECREASE_TOLERANCE_WEI` - Refuse to write a value that fell by more than this. Below it, a dip is rounding noise (default: `1000000000`).
 - `ORACLE_UPDATER_MIN_BALANCE_WEI` - Warn when the updater's gas balance drops below this. It still writes; the point is warning while there is runway (default: `100000000000000000`).
@@ -102,10 +102,11 @@ There are some chain-specific variables, like: `BSC_SAFE_API_KEY`, `FRAX_SAFE_PR
     python ./src/cli.py validate-config
     ```
 
-    `validate-config` checks that `ORACLE_UPDATER_PK`'s address actually holds
-    `SET_VALUE_ROLE`. Run it after any key change — granting the role is a
-    manual multisig step, and without it every write reverts with
-    `Oracle: forbidden`.
+    `validate-config` checks that each deployment's `oracle-updater` points at
+    its SourceCore, that `ORACLE_UPDATER_PK`'s address holds `UPDATER_ROLE` on
+    it, and that the OracleUpdater holds `SET_VALUE_ROLE` on the SourceCore.
+    Run it after any key or role change — the grants are manual multisig steps,
+    and a missing one makes every write revert.
 
 5. Optionally, run tests:
 
@@ -115,10 +116,22 @@ There are some chain-specific variables, like: `BSC_SAFE_API_KEY`, `FRAX_SAFE_PR
 
 ## Oracle updates
 
-The oracle is written directly by a dedicated account (`ORACLE_UPDATER_PK`) on
-every `oracle-update` tick, whether or not the value has changed — the write
-refreshes `lastUpdated`, and `getValue()` reverts once `maxAge` passes, which
-stops deposits, withdrawals and rebalancing.
+The oracle is written by a dedicated account (`ORACLE_UPDATER_PK`) on every
+`oracle-update` tick, whether or not the value has changed — the write refreshes
+`lastUpdated`, and `getValue()` reverts once `maxAge` passes, which stops
+deposits, withdrawals and rebalancing.
+
+The account does not hold the oracle's role itself. It calls `setValue` on the
+deployment's **OracleUpdater** (`oracle-updater` in `config.json`; contract in
+`0g-restaking-contracts`, `src/ascend/OracleUpdater.sol`), which holds
+`SET_VALUE_ROLE` and forwards a value only if it lies in
+`[oracle.value(), maxValue()]` — never lower than the oracle, never higher than
+the share price the vault's W0G on 0G backs (`(W0G in SourceCore + W0G locked in
+the OFT adapter) / aOG supply`). That is what limits a leaked key. The bot sends
+a reading a hair under the oracle as the oracle's own value, and a reading over
+`maxValue()` as `maxValue()` (with a Telegram note when the gap is more than
+rounding). **Lowering the value is only possible from the Safe** — see
+`cli.py oracle-propose` below.
 
 `ascend` runs on the same interval, and must not run less often: the vault's
 assets only move when ascend transfers rewards into it, so the share price
@@ -131,6 +144,7 @@ to. Both **refuse to write** and raise a Telegram alert:
 |---|---|---|
 | deviation | `ORACLE_MAX_DEVIATION_BPS=100` (1%) | the new value is more than 1% from the one on chain |
 | decrease | `ORACLE_DECREASE_TOLERANCE_WEI=1e9` | the value fell by more than rounding |
+| NAV | — | the OracleUpdater's `maxValue()` is below the oracle value |
 
 A refusal **does not fix itself, and gets worse**: ascend keeps adding rewards,
 so the gap widens every day. Rebalancing also starts refusing once the oracle
@@ -146,14 +160,14 @@ The vault is priced against the oracle (`totalAssets = totalSupply × oracle`),
 so anything that moves the vault's real value between two writes leaves the two
 apart until the next one. Two things do:
 
-- **A deposit in the window after a reward distribution.** Rewards raise the
-  real share price at once, and the oracle catches up only once the write that
-  follows lands. A deposit in between takes shares at the old price, which
-  dilutes the share price toward it. The window is the settling gap
-  (`POST_ASCEND_GAP_SECONDS`, 20s) plus the write; the gap cannot go below the
-  oracle's 15s read lag without reading a block from before the distribution.
-- **W0G sent straight to the SourceCore**, which raises the value without
-  minting anything.
+- **A reward distribution or W0G sent straight to the SourceCore** between two
+  heartbeats, which raises the value without minting anything.
+- **A deposit in the window after a reward distribution** used to be the other:
+  it takes shares at the old price and dilutes the share price toward it, and
+  a heartbeat that read the value before such a deposit wrote a figure the
+  vault no longer backed. Writes now go through the OracleUpdater, which caps
+  them at the NAV of the block they land in, so the oracle can no longer end up
+  above the vault's value this way.
 
 Either used to leave rebalancing refusing until the next write, up to eight
 hours.
@@ -166,9 +180,10 @@ and writes only if the gap is really there:
 |---|---|
 | within 1 gwei | nothing — this is most often a read taken seconds before the last write |
 | transfer in flight | waits for the next cycle |
-| higher (a donation) | writes, if within the deviation guard |
-| lower, but not below the value the last write replaced | writes — a deposit at the stale price cannot take the price lower than that |
-| lower than that, or past the deviation guard | refuses; the rebalance skip alert names the reason |
+| higher (a donation) | writes, if within the deviation guard, capped at `maxValue()` |
+| higher, but `maxValue()` is not | refuses — the chain does not back the rise |
+| lower | refuses — only the Safe can lower the oracle; the rebalance skip alert names the reason |
+| past the deviation guard | refuses |
 
 A resync sends no Telegram of its own. Rebalancing is what is blocked, and its
 skip alert already speaks on its own cadence.
@@ -206,10 +221,12 @@ two-hour interval instead.
 
 3. **If the reading is wrong**, fix the RPC or the helper. Do not force it.
 
-4. `cli.py oracle --force` skips both guards and writes with the bot's own key.
-   It requires stopping the scheduler (it takes the lock), and it will stop
-   being available at all once the key moves somewhere a person cannot reach —
-   prefer `oracle-propose`.
+4. `cli.py oracle --force` skips the deviation guard and writes with the bot's
+   own key, through the OracleUpdater. It cannot lower the value or exceed
+   `maxValue()` — the contract refuses both — so a fall always goes through
+   `oracle-propose`. It requires stopping the scheduler (it takes the lock), and
+   it will stop being available at all once the key moves somewhere a person
+   cannot reach — prefer `oracle-propose`.
 
 ## Daily report
 

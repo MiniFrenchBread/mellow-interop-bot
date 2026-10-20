@@ -16,7 +16,10 @@ from config.read_config import Deployment, OracleUpdateConfig, SourceConfig
 vc = importlib.import_module("config.validate_config")
 
 KEY = "0x" + "11" * 32
+KEY_ADDRESS = "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A"
 SOURCE_CORE = "0x" + "22" * 20
+UPDATER = "0x" + "44" * 20
+SET_VALUE_ROLE_HEX = "a9146fff3103c7a809874c345ee6b6c99f1d8c7b9043121571b2a4f2bb2557a0"
 
 
 def source(**overrides) -> SourceConfig:
@@ -26,7 +29,10 @@ def source(**overrides) -> SourceConfig:
         source_core_helper="0x" + "11" * 20,
         deployments=(
             Deployment(
-                name="OG", source_core=SOURCE_CORE, target_core="0x" + "33" * 20
+                name="OG",
+                source_core=SOURCE_CORE,
+                target_core="0x" + "33" * 20,
+                oracle_updater=UPDATER,
             ),
         ),
         oracle_update=OracleUpdateConfig(updater_private_key=KEY),
@@ -35,25 +41,36 @@ def source(**overrides) -> SourceConfig:
     return SourceConfig(**fields)
 
 
-class FakeCore:
-    def __init__(self, granted):
-        self.granted = granted
+class FakeAccessControl:
+    """A contract answering `hasRole` from a set of (role hex, account) grants."""
+
+    def __init__(self, grants, source_core=SOURCE_CORE):
+        self.grants = set(grants)
         self.asked = []
+        self._source_core = source_core
 
     @property
     def functions(self):
         return self
 
     def hasRole(self, role, account):
-        self.asked.append((role, account))
-        return SimpleNamespace(call=lambda: self.granted)
+        self.asked.append((role.hex(), account))
+        return SimpleNamespace(call=lambda: (role.hex(), account) in self.grants)
+
+    def sourceCore(self):
+        return SimpleNamespace(call=lambda: self._source_core)
+
+
+UPDATER_ROLE_HEX = vc.UPDATER_ROLE.hex()
+ALL_GRANTED = {(SET_VALUE_ROLE_HEX, UPDATER)}
+KEY_GRANTED = {(UPDATER_ROLE_HEX, KEY_ADDRESS)}
 
 
 class TestTheRoleCheck(unittest.TestCase):
-    """Granting the role is a manual multisig step done outside this repo.
+    """The grants are manual multisig steps done outside this repo.
 
-    Forgetting it produces a bot that starts cleanly and then fails every eight
-    hours with "Oracle: forbidden", so it is worth one line at deploy time.
+    Forgetting one produces a bot that starts cleanly and then fails every eight
+    hours, so it is worth one line at deploy time.
     """
 
     def setUp(self):
@@ -62,13 +79,20 @@ class TestTheRoleCheck(unittest.TestCase):
     def tearDown(self):
         vc.get_contract = self._get_contract
 
-    def _with_role(self, granted):
-        core = FakeCore(granted)
-        vc.get_contract = lambda *_a, **_k: core
-        return core
+    def _chain(self, core_grants=ALL_GRANTED, updater_grants=KEY_GRANTED, **kwargs):
+        core = FakeAccessControl(core_grants)
+        updater = FakeAccessControl(updater_grants, **kwargs)
+        vc.get_contract = lambda _w3, _address, name: (
+            updater if name == "OracleUpdater" else core
+        )
+        return core, updater
 
-    def test_a_missing_grant_raises(self):
-        self._with_role(False)
+    def test_everything_granted_passes(self):
+        self._chain()
+        vc.validate_oracle_updater(None, source())
+
+    def test_a_missing_oracle_grant_raises_with_the_remedy(self):
+        self._chain(core_grants=set())
 
         with self.assertRaises(Exception) as caught:
             vc.validate_oracle_updater(None, source())
@@ -78,38 +102,56 @@ class TestTheRoleCheck(unittest.TestCase):
         # The remedy has to be in the message. Whoever hits this is mid-deploy
         # and needs the call to hand, not a pointer to go and derive it.
         self.assertIn("grantRole", message)
-        self.assertIn(SOURCE_CORE, message)
+        self.assertIn(UPDATER, message)
 
-    def test_a_granted_role_passes(self):
-        self._with_role(True)
+    def test_a_key_without_the_updater_role_raises(self):
+        self._chain(updater_grants=set())
 
-        vc.validate_oracle_updater(None, source())
+        with self.assertRaisesRegex(Exception, "does not hold UPDATER_ROLE"):
+            vc.validate_oracle_updater(None, source())
 
-    def test_the_role_asked_about_is_the_one_the_oracle_checks(self):
-        """keccak256("ORACLE:SET_VALUE_ROLE") -- a typo here would pass a check
-        against a role nothing enforces, which is worse than no check."""
-        core = self._with_role(True)
+    def test_an_updater_for_another_vault_raises(self):
+        self._chain(source_core="0x" + "99" * 20)
 
-        vc.validate_oracle_updater(None, source())
+        with self.assertRaisesRegex(Exception, "writes the oracle of"):
+            vc.validate_oracle_updater(None, source())
 
-        role, _account = core.asked[0]
-        self.assertEqual(
-            role.hex(),
-            "a9146fff3103c7a809874c345ee6b6c99f1d8c7b9043121571b2a4f2bb2557a0",
+    def test_no_updater_address_raises(self):
+        self._chain()
+        bare = source(
+            deployments=(
+                Deployment(
+                    name="OG", source_core=SOURCE_CORE, target_core="0x" + "33" * 20
+                ),
+            )
         )
 
-    def test_it_checks_the_address_derived_from_the_key(self):
-        core = self._with_role(True)
+        with self.assertRaisesRegex(Exception, "no oracle-updater address"):
+            vc.validate_oracle_updater(None, bare)
+
+    def test_the_roles_asked_about_are_the_ones_the_contracts_check(self):
+        """A typo in either hash would pass a check against a role nothing
+        enforces, which is worse than no check."""
+        core, updater = self._chain()
 
         vc.validate_oracle_updater(None, source())
 
-        _role, account = core.asked[0]
-        self.assertEqual(account, "0x19E7E376E7C213B7E7e7e46cc70A5dD086DAff2A")
+        self.assertIn((SET_VALUE_ROLE_HEX, UPDATER), core.asked)
+        self.assertEqual(updater.asked, [(UPDATER_ROLE_HEX, KEY_ADDRESS)])
+        self.assertEqual(
+            UPDATER_ROLE_HEX,
+            "73e573f9566d61418a34d5de3ff49360f9c51fec37f7486551670290f6285dab",
+        )
+
+    def test_a_key_still_holding_the_direct_role_passes_with_a_note(self):
+        """Between the Safe's grant and its revoke both hold the role."""
+        self._chain(core_grants=ALL_GRANTED | {(SET_VALUE_ROLE_HEX, KEY_ADDRESS)})
+        vc.validate_oracle_updater(None, source())
 
     def test_no_key_configured_is_skipped_not_failed(self):
         """Most sources have no oracle-update section; failing them would make
         validate-config unusable for everything else."""
-        self._with_role(False)
+        self._chain(core_grants=set(), updater_grants=set())
 
         vc.validate_oracle_updater(None, source(oracle_update=None))
 

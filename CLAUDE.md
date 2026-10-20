@@ -15,7 +15,7 @@ This bot is the operational automation layer for the Mellow interop protocol.
 3. Compute the "secure value" (source + target TVL / total supply)
 4. Skip if an OFT transfer is in flight -- the two sides are counted at different points, so their sum is wrong until it settles
 5. Run the guards; refuse and alert if the value would move too far or fall
-6. Otherwise call `Oracle.setValue(newValue)` with `ORACLE_UPDATER_PK` and wait for the receipt
+6. Otherwise call `OracleUpdater.setValue(newValue)` (the deployment's `oracle-updater`) with `ORACLE_UPDATER_PK` and wait for the receipt. The OracleUpdater holds the oracle's `SET_VALUE_ROLE` and only forwards values in `[oracle.value(), maxValue()]`, `maxValue()` being the share price the W0G in the SourceCore plus its OFT adapter backs; the bot clamps to that band before sending. Lowering the oracle is the Safe's alone (`cli.py oracle-propose`)
 7. Send Telegram **only** when a person is needed -- a refusal, a failure, or a low gas balance. A successful heartbeat is silent
 
 Safe multisig proposals still exist but are no longer on any schedule: `cli.py oracle-propose` is the manual recovery path when a guard refuses. See "Oracle updates" in `README.md`.
@@ -30,7 +30,7 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
 - **`src/web3_scripts/`** -- On-chain interaction logic.
   - `base.py` -- Shared Web3 utilities: `get_w3()`, `get_contract()` (loads ABI from `./abi/`), `execute()` (build+sign+send transactions with EIP-1559 gas), `get_block_before_timestamp()` (binary search for block by timestamp).
   - `oracle_script.py` -- Core oracle validation with retry/backoff. Reads source/target nonces (detects in-flight OFT transfers), oracle value/timestamp/maxAge, computes `secure_value = (sourceValue + targetValue) * 1e18 / totalSupply`, checks expiry and value correctness. Read-only.
-  - `oracle_update.py` -- The heartbeat. Validates via `oracle_script`, applies the deviation and decrease guards, then writes `Oracle.setValue`. Guard arithmetic (`exceeds_deviation`, `is_decrease`) is separated out so it is testable without any chain access.
+  - `oracle_update.py` -- The heartbeat. Validates via `oracle_script`, applies the deviation and decrease guards, bounds the value to the OracleUpdater's band (`bounded_write`), then writes `OracleUpdater.setValue`. The resync only ever raises the value. Guard arithmetic (`exceeds_deviation`, `is_decrease`) is separated out so it is testable without any chain access.
   - `operator_script.py` -- Read-only analysis of vault asset ratios. Determines if rebalancing actions are needed (redeem, claim, pushToSource, pushToTarget, deposit).
   - `operator_bot.py` -- Automated version of operator_script that actually executes rebalancing transactions using an operator private key, with LayerZero finalization waiting.
 - **`src/safe_global/`** -- Safe multisig transaction management.

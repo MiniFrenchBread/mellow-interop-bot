@@ -19,6 +19,13 @@ deposit and withdrawal. The guards refuse instead of writing, and refusing is
 survivable: `maxAge` is weeks, which is ample time for a person to look. The
 recovery path is deliberately a different authority -- see `cli.py
 oracle-propose`.
+
+The write does not go to the oracle itself but through the deployment's
+OracleUpdater contract, which holds the oracle's SET_VALUE_ROLE in this key's
+place and enforces two bounds on chain: never below the value the oracle holds,
+never above the share price the vault's W0G on this chain backs (`maxValue()`).
+Those bounds are what limit a leaked key; the guards here only refuse earlier
+and say why. Lowering the value is the Safe's alone.
 """
 
 try:
@@ -133,6 +140,60 @@ def is_decrease(old_value: int, new_value: int, tolerance_wei: int) -> bool:
     return old_value - new_value > tolerance_wei
 
 
+def oracle_updater_address(deployment) -> str:
+    """The OracleUpdater a deployment writes through, or raise.
+
+    Raised rather than falling back to the oracle: once the key's direct role is
+    revoked that fallback can only fail, and before then it would quietly skip
+    the on-chain bounds this contract exists to apply.
+    """
+    address = getattr(deployment, "oracle_updater", None)
+    if not address:
+        raise Exception(
+            "Deployment {} has no oracle-updater address configured".format(
+                deployment.name
+            )
+        )
+    return address
+
+
+def bounded_write(old_value: int, new_value: int, max_value: int, tolerance: int):
+    """What to send through the OracleUpdater, as (value, refusal, note).
+
+    The contract accepts exactly `[old_value, max_value]`. A reading a little
+    under the oracle -- rounding, within `tolerance` -- is sent as the oracle's
+    own value, which still refreshes it. A reading over `max_value` is sent as
+    `max_value`: that figure is read from the chain moments before the send,
+    later than the reading, and a deposit priced at the stale oracle in between
+    is exactly what pulls it below. A gap past `tolerance` is noted, because the
+    Ethereum leg being worth more than the W0G locked against it has no ordinary
+    cause.
+    """
+    if max_value < old_value:
+        return (
+            0,
+            "the on-chain NAV {} is below the oracle value {}; only the Safe "
+            "can lower it (cli.py oracle-propose)".format(max_value, old_value),
+            "",
+        )
+    if is_decrease(old_value, new_value, tolerance):
+        return (
+            0,
+            "would lower the value by {} wei, {} -> {}; only the Safe can lower "
+            "it (cli.py oracle-propose)".format(
+                old_value - new_value, old_value, new_value
+            ),
+            "",
+        )
+    value = min(max(new_value, old_value), max_value)
+    note = ""
+    if new_value - max_value > tolerance:
+        note = "reading {} is above the on-chain NAV {}; wrote the NAV".format(
+            new_value, max_value
+        )
+    return value, "", note
+
+
 def update_oracle(
     source,
     deployment,
@@ -199,35 +260,49 @@ def update_oracle(
         )
         return result
 
-    if not force:
-        if exceeds_deviation(old_value, new_value, config.max_deviation_bps):
-            result.alerts.append(
-                "refused: {} would move the value by {:.2f} bps (limit {} bps), "
-                "{} -> {}".format(
-                    deployment.name,
-                    result.deviation_bps,
-                    config.max_deviation_bps,
-                    old_value,
-                    new_value,
-                )
+    updater_address = oracle_updater_address(deployment)
+    source_w3 = get_w3(source.rpc)
+    updater = get_contract(source_w3, updater_address, "OracleUpdater")
+    # `force` reaches only the deviation guard. The floor and the NAV bound are
+    # enforced by the OracleUpdater, so forcing past them could only buy a
+    # revert.
+    value, refusal, note = bounded_write(
+        old_value,
+        new_value,
+        updater.functions.maxValue().call(),
+        config.decrease_tolerance_wei,
+    )
+    if refusal:
+        result.alerts.append("refused: {} {}".format(deployment.name, refusal))
+    elif not force and exceeds_deviation(
+        old_value, new_value, config.max_deviation_bps
+    ):
+        result.alerts.append(
+            "refused: {} would move the value by {:.2f} bps (limit {} bps), "
+            "{} -> {}".format(
+                deployment.name,
+                result.deviation_bps,
+                config.max_deviation_bps,
+                old_value,
+                new_value,
             )
-        elif is_decrease(old_value, new_value, config.decrease_tolerance_wei):
-            result.alerts.append(
-                "refused: {} would lower the value by {} wei, {} -> {}".format(
-                    deployment.name, old_value - new_value, old_value, new_value
-                )
-            )
+        )
 
-        if result.alerts:
-            # Said here as well as in Telegram: this run left the oracle
-            # unwritten, and nothing will change that without a person.
-            print_colored(result.alert, "red")
-            _note_expiry(result, oracle_expiry_threshold_seconds)
-            return result
+    if result.alerts:
+        # Said here as well as in Telegram: this run left the oracle
+        # unwritten, and nothing will change that without a person.
+        print_colored(result.alert, "red")
+        _note_expiry(result, oracle_expiry_threshold_seconds)
+        return result
+
+    if note:
+        # Written, and said, because it is the one case where the value sent is
+        # not the value read.
+        result.alerts.append("{}: {}".format(deployment.name, note))
+        print_colored(result.alerts[-1], "yellow")
+    result.new_value = value
 
     tx_options = tx or source.tx.as_kwargs()
-    source_w3 = get_w3(source.rpc)
-    oracle = get_contract(source_w3, validation.oracle_address, "Oracle")
     sender = Account.from_key(config.updater_private_key).address
     balance = source_w3.eth.get_balance(sender)
     if balance < config.min_balance_wei:
@@ -245,8 +320,8 @@ def update_oracle(
         print(
             "{}: would call setValue({}) on {} (was {}, {:+.2f} bps){}".format(
                 deployment.name,
-                new_value,
-                validation.oracle_address,
+                value,
+                updater_address,
                 old_value,
                 result.signed_deviation_bps if old_value else 0.0,
                 result.forced_note,
@@ -255,7 +330,7 @@ def update_oracle(
         return result
 
     outcome = send_and_confirm(
-        oracle.functions.setValue(new_value),
+        updater.functions.setValue(value),
         0,
         config.updater_private_key,
         w3=source_w3,
@@ -267,7 +342,7 @@ def update_oracle(
     print_colored(
         "{}: setValue({}) confirmed in {} (was {}, {:+.2f} bps){}".format(
             deployment.name,
-            new_value,
+            value,
             outcome.tx_hash,
             old_value,
             result.signed_deviation_bps if old_value else 0.0,
@@ -309,30 +384,24 @@ def _note_expiry(result: OracleUpdateResult, threshold_seconds: int) -> None:
 #
 # The heartbeat is the oracle's only scheduled write, eight hours apart, and
 # nothing between two writes reconciled it with the value it is meant to track.
-# Anything that moves that value in between -- a deposit priced against the
-# stale figure just after a distribution, or W0G sent straight to the SourceCore
-# -- left rebalancing refusing until the next write.
+# W0G sent straight to the SourceCore, or a distribution landing between two
+# heartbeats, left rebalancing refusing until the next write.
 #
 # A resync is asked for by whatever tripped over the gap, and writes only if the
 # gap is really there. It is not a second heartbeat: it never writes an
 # unchanged value, and it never runs on a schedule of its own.
+#
+# It only ever raises the value. Lowering it is the Safe's: the OracleUpdater
+# refuses anything below the current value. The fall a resync used to write --
+# a deposit priced at the stale oracle landing between the heartbeat's read and
+# its write -- no longer happens, because the OracleUpdater caps every write at
+# the NAV of the block it lands in, and a deposit at a price at or below the NAV
+# cannot pull the NAV under that price.
 
 RESYNC_NOOP = "noop"
 RESYNC_WAIT = "wait"
 RESYNC_WRITE = "write"
 RESYNC_REFUSE = "refuse"
-
-# Oracle.ValueSet(uint256 indexed value, uint256 indexed timestamp)
-VALUE_SET_TOPIC = "0x" + Web3.keccak(
-    text="ValueSet(uint256,uint256)"
-).hex().removeprefix("0x")
-# How far back to look for the write before the current one: about 23 days at
-# 0G's roughly one-second blocks, a little past maxAge (21 days). Beyond that
-# the oracle would have expired, so nothing older can be the value it replaced.
-# Should blocks get faster, this reaches less far back; a lookup that finds
-# nothing only means a fall is refused, never that one is let through.
-VALUE_SET_LOOKBACK_BLOCKS = 2_000_000
-VALUE_SET_CHUNK_BLOCKS = 50_000
 
 
 @dataclass
@@ -341,43 +410,28 @@ class ResyncResult:
     action: str
     old_value: int = 0
     new_value: int = 0
-    floor: int = 0
     reason: str = ""
     tx_hash: str = ""
-
-
-def resync_floor(current: int, previous) -> int:
-    """The lowest value a resync may write.
-
-    A deposit priced against a stale oracle takes shares at that stale price, so
-    it dilutes the share price toward it and never below it. After a write, the
-    only stale price anyone could have paid is the one that write replaced --
-    `previous`. So a fall that stops at `previous` is explained by that, and a
-    fall past it is not; that one is a loss and goes to a person.
-
-    min() because the last write could itself have been a fall, in which case no
-    stale price below the current one exists and nothing lower is explained.
-    """
-    if previous is None:
-        return current
-    return min(current, previous)
 
 
 def resync_action(
     old_value: int,
     new_value: int,
-    floor: int,
     max_deviation_bps: int,
     tolerance: int = ORACLE_VALUE_TOLERANCE,
 ) -> tuple:
-    """What a resync should do with a reading, as (action, reason).
+    """What a resync should do with a reading, before the NAV is consulted.
 
-    The heartbeat's decrease guard is not reused: it refuses any fall past
-    rounding, and the fall a stale-priced deposit causes is exactly what a
-    resync exists to write. The deviation guard is kept unchanged.
+    Returns (action, reason); RESYNC_WRITE here still goes through
+    `bounded_write`.
     """
     if abs(new_value - old_value) <= tolerance:
         return RESYNC_NOOP, "already in line"
+    if new_value < old_value:
+        return RESYNC_REFUSE, (
+            "would lower the value to {}, below the oracle's {}; only the Safe "
+            "can lower it (cli.py oracle-propose)".format(new_value, old_value)
+        )
     if exceeds_deviation(old_value, new_value, max_deviation_bps):
         return (
             RESYNC_REFUSE,
@@ -385,57 +439,7 @@ def resync_action(
                 deviation_bps(old_value, new_value), max_deviation_bps
             ),
         )
-    if new_value < floor:
-        return RESYNC_REFUSE, (
-            "would lower the value to {}, below the {} it replaced -- more than a "
-            "deposit at the stale price can account for".format(new_value, floor)
-        )
     return RESYNC_WRITE, ""
-
-
-def value_before(values_newest_first, current: int):
-    """The value the oracle held before it was set to `current`.
-
-    Takes ValueSet values newest first. Events newer than the one that set
-    `current` are skipped -- the oracle is read a few seconds behind the chain,
-    so a write can land after the read -- and so are repeats of `current`,
-    because an unchanged heartbeat is not the write that replaced a stale price.
-    None when the history does not reach back that far.
-    """
-    seen_current = False
-    for value in values_newest_first:
-        if value == current:
-            seen_current = True
-        elif seen_current:
-            return value
-    return None
-
-
-def previous_oracle_value(w3, oracle_address: str, current: int):
-    """Read `value_before` from the oracle's ValueSet history, newest first."""
-    latest = w3.eth.block_number
-    oldest = max(0, latest - VALUE_SET_LOOKBACK_BLOCKS)
-    newest_first = []
-    high = latest
-    while high >= oldest:
-        low = max(oldest, high - VALUE_SET_CHUNK_BLOCKS + 1)
-        logs = w3.eth.get_logs(
-            {
-                "address": Web3.to_checksum_address(oracle_address),
-                "topics": [VALUE_SET_TOPIC],
-                "fromBlock": low,
-                "toBlock": high,
-            }
-        )
-        ordered = sorted(logs, key=lambda log: (log["blockNumber"], log["logIndex"]))
-        newest_first.extend(
-            int(log["topics"][1].hex(), 16) for log in reversed(ordered)
-        )
-        found = value_before(newest_first, current)
-        if found is not None:
-            return found
-        high = low - 1
-    return None
 
 
 def resync_oracle(
@@ -446,7 +450,7 @@ def resync_oracle(
     oracle_expiry_threshold_seconds: int,
     tx: dict = None,
 ) -> ResyncResult:
-    """Bring one deployment's oracle back in line with its value, if it drifted."""
+    """Bring one deployment's oracle back up in line with its value, if it lags."""
     config = getattr(source, "oracle_update", None)
     if config is None or not config.updater_private_key:
         raise Exception(
@@ -479,29 +483,43 @@ def resync_oracle(
         result.action, result.reason = RESYNC_WAIT, "OFT transfer in flight"
         return result
 
-    source_w3 = get_w3(source.rpc)
-    previous = None
-    if new_value < old_value - ORACLE_VALUE_TOLERANCE:
-        # Only a fall needs the history, and it is the one read that scans.
-        previous = previous_oracle_value(
-            source_w3, validation.oracle_address, old_value
-        )
-    result.floor = resync_floor(old_value, previous)
     result.action, result.reason = resync_action(
-        old_value, new_value, result.floor, config.max_deviation_bps
+        old_value, new_value, config.max_deviation_bps
     )
-
     if result.action == RESYNC_NOOP:
         return result
+
+    if result.action == RESYNC_WRITE:
+        source_w3 = get_w3(source.rpc)
+        updater = get_contract(
+            source_w3, oracle_updater_address(deployment), "OracleUpdater"
+        )
+        max_value = updater.functions.maxValue().call()
+        value, refusal, note = bounded_write(
+            old_value, new_value, max_value, ORACLE_VALUE_TOLERANCE
+        )
+        if not refusal and value - old_value <= ORACLE_VALUE_TOLERANCE:
+            # The reading is above the oracle but the NAV is not: there is no
+            # rise the chain backs, and writing the oracle's own value back
+            # would close nothing.
+            refusal = "the on-chain NAV {} does not back a rise from {} to {}".format(
+                max_value, old_value, new_value
+            )
+        if refusal:
+            result.action, result.reason = RESYNC_REFUSE, refusal
+
     if result.action == RESYNC_REFUSE:
         print_colored(
             "{}: resync refused: {}".format(deployment.name, result.reason), "red"
         )
         return result
 
-    oracle = get_contract(source_w3, validation.oracle_address, "Oracle")
+    if note:
+        result.reason = note
+        print_colored("{}: {}".format(deployment.name, note), "yellow")
+    result.new_value = value
     outcome = send_and_confirm(
-        oracle.functions.setValue(new_value),
+        updater.functions.setValue(value),
         0,
         config.updater_private_key,
         w3=source_w3,
@@ -512,10 +530,10 @@ def resync_oracle(
     print_colored(
         "{}: resync setValue({}) confirmed in {} (was {}, {:+.4f} bps)".format(
             deployment.name,
-            new_value,
+            value,
             outcome.tx_hash,
             old_value,
-            signed_deviation_bps(old_value, new_value),
+            signed_deviation_bps(old_value, value),
         ),
         "green",
     )

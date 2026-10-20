@@ -153,6 +153,9 @@ class Deployment:
     source_core: str
     target_core: str
     safe_global: Optional[SafeGlobal] = None
+    # The OracleUpdater contract the heartbeat and resync write through. Holds
+    # the oracle's SET_VALUE_ROLE in place of the updater key.
+    oracle_updater: Optional[str] = None
 
 
 def _ensure_safe_global_fields(
@@ -625,6 +628,7 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
                 source_core=dep["source_core"],
                 target_core=dep["target_core"],
                 safe_global=deployment_safe_global,
+                oracle_updater=dep.get("oracle_updater") or None,
             )
 
         deployments = tuple(
