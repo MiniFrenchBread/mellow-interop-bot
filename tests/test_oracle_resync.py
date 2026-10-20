@@ -8,6 +8,10 @@ that value in between and left rebalancing refusing until the next write:
   distribution, before the write that prices it. It takes shares at the old
   price and dilutes the share price below the value just written;
 - W0G sent straight to the SourceCore, which raises the value without minting.
+
+Writes now go through the OracleUpdater, which refuses any fall and caps every
+write at the NAV of its block, so the first can no longer happen and a resync
+only ever raises the value.
 """
 
 import asyncio
@@ -17,7 +21,6 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from hexbytes import HexBytes
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -42,22 +45,22 @@ from web3_scripts.oracle_update import (
     RESYNC_WAIT,
     RESYNC_WRITE,
     OracleUpdateResult,
-    previous_oracle_value,
     resync_action,
-    resync_floor,
     resync_oracle,
-    value_before,
 )
 import main
 import scheduler as scheduler_module
 
 ORACLE = "0x" + "8f" * 20
+UPDATER = "0x" + "55" * 20
 KEY = "0x" + "11" * 32
 DAY = 86400
 
-# 2026-09-28, the incident this was written for. The heartbeat wrote WRITTEN
-# over BEFORE; a deposit priced at BEFORE had already landed in the seconds
-# between the oracle's read and its write, leaving the vault worth DILUTED.
+# 2026-09-28, the incident the resync was first written for. The heartbeat
+# wrote WRITTEN over BEFORE; a deposit priced at BEFORE had already landed in
+# the seconds between the oracle's read and its write, leaving the vault worth
+# DILUTED. Writing through the OracleUpdater caps the write at the NAV of the
+# block it lands in, so that write would now have been DILUTED.
 BEFORE = 1119071245324487369
 WRITTEN = 1119188080110290876
 DILUTED = 1119188056500925596
@@ -95,7 +98,10 @@ def source(**overrides) -> SourceConfig:
 
 
 DEPLOYMENT = Deployment(
-    name="OG", source_core="0x" + "22" * 20, target_core="0x" + "33" * 20
+    name="OG",
+    source_core="0x" + "22" * 20,
+    target_core="0x" + "33" * 20,
+    oracle_updater=UPDATER,
 )
 
 
@@ -121,37 +127,36 @@ def config(*sources, telegram=False, **scheduler_kwargs) -> Config:
 class Harness:
     """Stands in for every chain call resync_oracle makes."""
 
-    def __init__(self, test, reading, previous=None):
+    def __init__(self, test, reading, nav=10**19):
         self.sends = []
-        self.history_reads = 0
-        self._previous = previous
+        self.contracts = []
+        self.nav = nav
         for name, replacement in (
             ("run_oracle_validation", lambda **_kwargs: reading),
             ("get_w3", lambda _rpc: SimpleNamespace()),
-            ("get_contract", lambda *_a, **_k: self._oracle()),
+            ("get_contract", self._contract),
             ("send_and_confirm", self._send),
-            ("previous_oracle_value", self._history),
         ):
             original = getattr(oracle_update, name)
             setattr(oracle_update, name, replacement)
             test.addCleanup(setattr, oracle_update, name, original)
 
-    def _oracle(self):
+    def _contract(self, _w3, address, name):
+        self.contracts.append((address, name))
         return SimpleNamespace(
-            functions=SimpleNamespace(setValue=lambda value: ("setValue", value))
+            functions=SimpleNamespace(
+                setValue=lambda value: ("setValue", value),
+                maxValue=lambda: SimpleNamespace(call=lambda: self.nav),
+            )
         )
-
-    def _history(self, _w3, _oracle, _current):
-        self.history_reads += 1
-        return self._previous
 
     def _send(self, contract_function, value, key, **kwargs):
         self.sends.append(contract_function[1])
         return SimpleNamespace(tx_hash="0xabc")
 
 
-def resync(test, reading, previous=None):
-    harness = Harness(test, reading, previous)
+def resync(test, reading, nav=10**19):
+    harness = Harness(test, reading, nav)
     result = resync_oracle(
         source=source(),
         deployment=DEPLOYMENT,
@@ -185,152 +190,53 @@ class TestSettlingGap(unittest.TestCase):
         self.assertEqual(parsed.post_ascend_gap_seconds, MIN_POST_ASCEND_GAP_SECONDS)
 
 
-class TestFloor(unittest.TestCase):
-    def test_it_is_the_value_the_last_write_replaced(self):
-        self.assertEqual(resync_floor(WRITTEN, BEFORE), BEFORE)
-
-    def test_after_a_fall_nothing_lower_is_explained(self):
-        """If the last write lowered the value, no stale price below the
-        current one ever existed for a deposit to have paid."""
-        self.assertEqual(resync_floor(BEFORE, WRITTEN), BEFORE)
-
-    def test_without_history_no_fall_is_allowed(self):
-        self.assertEqual(resync_floor(WRITTEN, None), WRITTEN)
-
-
-class TestValueBefore(unittest.TestCase):
-    def test_the_write_before_the_current_one(self):
-        self.assertEqual(value_before([WRITTEN, BEFORE, 1], WRITTEN), BEFORE)
-
-    def test_writes_newer_than_the_read_are_skipped(self):
-        """The oracle is read a few seconds behind the chain."""
-        self.assertEqual(value_before([7, WRITTEN, BEFORE], WRITTEN), BEFORE)
-
-    def test_an_unchanged_heartbeat_is_not_the_replacing_write(self):
-        self.assertEqual(value_before([WRITTEN, WRITTEN, BEFORE], WRITTEN), BEFORE)
-
-    def test_no_history_far_enough_back(self):
-        self.assertIsNone(value_before([WRITTEN], WRITTEN))
-        self.assertIsNone(value_before([BEFORE], WRITTEN))
-
-
-class FakeChain:
-    """Answers get_logs from a list of (block, log_index, value) ValueSet events."""
-
-    def __init__(self, head, events):
-        self.events = events
-        self.queries = []
-        self.eth = SimpleNamespace(block_number=head, get_logs=self._get_logs)
-
-    def _get_logs(self, flt):
-        self.queries.append((flt["fromBlock"], flt["toBlock"]))
-        # A scan that stops advancing would otherwise hang the suite, not fail it.
-        assert len(self.queries) < 100, "the scan is not terminating"
-        assert flt["topics"] == [oracle_update.VALUE_SET_TOPIC]
-        return [
-            {
-                "blockNumber": block,
-                "logIndex": index,
-                "topics": [
-                    HexBytes(oracle_update.VALUE_SET_TOPIC),
-                    HexBytes(value.to_bytes(32, "big")),
-                ],
-            }
-            for block, index, value in self.events
-            if flt["fromBlock"] <= block <= flt["toBlock"]
-        ]
-
-
-class TestPreviousOracleValue(unittest.TestCase):
-    """The one chain-facing read the resync adds, driven through the real code:
-    chunked newest-first scanning, and decoding the value from the topics."""
-
-    def setUp(self):
-        for name, value in (
-            ("VALUE_SET_CHUNK_BLOCKS", 50_000),
-            ("VALUE_SET_LOOKBACK_BLOCKS", 120_000),
-        ):
-            self.addCleanup(setattr, oracle_update, name, getattr(oracle_update, name))
-            setattr(oracle_update, name, value)
-
-    def lookup(self, events, head=200_000, current=WRITTEN):
-        chain = FakeChain(head, events)
-        return previous_oracle_value(chain, ORACLE, current), chain
-
-    def test_found_across_a_chunk_edge(self):
-        # Chunks are [150001, 200000] then [100001, 150000].
-        found, chain = self.lookup([(150_000, 0, BEFORE), (150_001, 0, WRITTEN)])
-
-        self.assertEqual(found, BEFORE)
-        self.assertEqual(chain.queries, [(150_001, 200_000), (100_001, 150_000)])
-
-    def test_stops_scanning_once_found(self):
-        found, chain = self.lookup([(160_000, 0, BEFORE), (190_000, 0, WRITTEN)])
-
-        self.assertEqual(found, BEFORE)
-        self.assertEqual(len(chain.queries), 1)
-
-    def test_orders_writes_within_one_block(self):
-        found, _ = self.lookup([(180_000, 2, WRITTEN), (180_000, 1, BEFORE)])
-
-        self.assertEqual(found, BEFORE)
-
-    def test_nothing_within_the_lookback(self):
-        """Contiguous ranges back to the limit and no further, then None --
-        which makes a resync refuse any fall rather than guess."""
-        found, chain = self.lookup([(10, 0, BEFORE), (190_000, 0, WRITTEN)])
-
-        self.assertIsNone(found)
-        self.assertEqual(
-            chain.queries,
-            [(150_001, 200_000), (100_001, 150_000), (80_000, 100_000)],
-        )
-
-
 class TestAction(unittest.TestCase):
     def test_in_line_is_left_alone(self):
         self.assertEqual(
-            resync_action(WRITTEN, WRITTEN + ORACLE_VALUE_TOLERANCE, BEFORE, 100)[0],
+            resync_action(WRITTEN, WRITTEN + ORACLE_VALUE_TOLERANCE, 100)[0],
             RESYNC_NOOP,
         )
 
     def test_a_rise_is_written(self):
-        self.assertEqual(
-            resync_action(WRITTEN, WRITTEN + 10**12, WRITTEN, 100)[0], RESYNC_WRITE
-        )
+        self.assertEqual(resync_action(WRITTEN, WRITTEN + 10**12, 100)[0], RESYNC_WRITE)
 
-    def test_a_fall_down_to_the_floor_is_written(self):
-        self.assertEqual(resync_action(WRITTEN, BEFORE, BEFORE, 100)[0], RESYNC_WRITE)
-
-    def test_a_fall_past_the_floor_is_refused(self):
-        action, reason = resync_action(WRITTEN, BEFORE - 1, BEFORE, 100)
+    def test_any_fall_is_refused(self):
+        action, reason = resync_action(WRITTEN, DILUTED, 100)
         self.assertEqual(action, RESYNC_REFUSE)
-        self.assertIn("below", reason)
+        self.assertIn("oracle-propose", reason)
 
     def test_the_deviation_guard_still_applies(self):
-        action, reason = resync_action(WRITTEN, WRITTEN * 102 // 100, WRITTEN, 100)
+        action, reason = resync_action(WRITTEN, WRITTEN * 102 // 100, 100)
         self.assertEqual(action, RESYNC_REFUSE)
         self.assertIn("bps", reason)
 
 
 class TestResyncOracle(unittest.TestCase):
-    def test_the_incident_is_written_not_refused(self):
-        """The heartbeat's decrease guard would refuse this 23.6 gwei fall; it
-        is the fall a stale-priced deposit causes, so a resync writes it."""
-        result, harness = resync(self, validation(WRITTEN, DILUTED), previous=BEFORE)
-
-        self.assertEqual(result.action, RESYNC_WRITE)
-        self.assertEqual(harness.sends, [DILUTED])
-        self.assertEqual(result.floor, BEFORE)
-
-    def test_a_donation_is_written(self):
+    def test_a_donation_is_written_through_the_updater(self):
         """W0G sent straight to the SourceCore raises the value without minting;
         a rise within the deviation guard is written back."""
         result, harness = resync(self, validation(WRITTEN, WRITTEN + 10**12))
 
         self.assertEqual(result.action, RESYNC_WRITE)
         self.assertEqual(harness.sends, [WRITTEN + 10**12])
-        self.assertEqual(harness.history_reads, 0, "only a fall needs the history")
+        self.assertEqual(harness.contracts, [(UPDATER, "OracleUpdater")])
+
+    def test_a_rise_past_the_nav_writes_the_nav(self):
+        nav = WRITTEN + 10**11
+        result, harness = resync(self, validation(WRITTEN, WRITTEN + 10**12), nav=nav)
+
+        self.assertEqual(result.action, RESYNC_WRITE)
+        self.assertEqual(harness.sends, [nav])
+        self.assertEqual(result.new_value, nav)
+
+    def test_a_rise_the_nav_does_not_back_is_refused(self):
+        result, harness = resync(
+            self, validation(WRITTEN, WRITTEN + 10**12), nav=WRITTEN
+        )
+
+        self.assertEqual(result.action, RESYNC_REFUSE)
+        self.assertIn("does not back", result.reason)
+        self.assertEqual(harness.sends, [])
 
     def test_in_line_writes_nothing(self):
         """What a rebalance refusal right after a heartbeat looks like: the
@@ -342,23 +248,19 @@ class TestResyncOracle(unittest.TestCase):
 
     def test_a_transfer_in_flight_waits(self):
         result, harness = resync(
-            self, validation(WRITTEN, DILUTED, transfer_in_progress=True), BEFORE
+            self, validation(WRITTEN, WRITTEN + 10**12, transfer_in_progress=True)
         )
 
         self.assertEqual(result.action, RESYNC_WAIT)
         self.assertEqual(harness.sends, [])
 
-    def test_a_loss_is_refused(self):
-        result, harness = resync(self, validation(WRITTEN, BEFORE - 10**12), BEFORE)
+    def test_the_old_incident_is_now_refused(self):
+        """A fall is the Safe's to write; the bot can only say so."""
+        result, harness = resync(self, validation(WRITTEN, DILUTED))
 
         self.assertEqual(result.action, RESYNC_REFUSE)
         self.assertEqual(harness.sends, [])
-
-    def test_a_fall_with_no_history_is_refused(self):
-        result, harness = resync(self, validation(WRITTEN, DILUTED), previous=None)
-
-        self.assertEqual(result.action, RESYNC_REFUSE)
-        self.assertEqual(harness.sends, [])
+        self.assertEqual(harness.contracts, [], "a fall needs no chain read")
 
 
 class TestRunOracleResync(unittest.TestCase):

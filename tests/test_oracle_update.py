@@ -10,6 +10,7 @@ from config.read_config import Deployment, OracleUpdateConfig, SourceConfig, TxC
 from web3_scripts import oracle_update
 from web3_scripts.oracle_update import (
     SET_VALUE_LABEL,
+    bounded_write,
     exceeds_deviation,
     is_decrease,
     update_oracle,
@@ -17,6 +18,7 @@ from web3_scripts.oracle_update import (
 from web3_scripts.oracle_script import OracleValidationResult
 
 ORACLE = "0x" + "8f" * 20
+UPDATER = "0x" + "55" * 20
 ONE = 10**18
 KEY = "0x" + "11" * 32
 
@@ -53,7 +55,10 @@ def source(**overrides) -> SourceConfig:
 
 
 DEPLOYMENT = Deployment(
-    name="OG", source_core="0x" + "22" * 20, target_core="0x" + "33" * 20
+    name="OG",
+    source_core="0x" + "22" * 20,
+    target_core="0x" + "33" * 20,
+    oracle_updater=UPDATER,
 )
 
 
@@ -64,13 +69,15 @@ class Harness:
     about a guard is not quietly also a test about gas.
     """
 
-    def __init__(self, test, result, balance=10**19):
+    def __init__(self, test, result, balance=10**19, nav=10 * ONE):
         self.sends = []
+        self.contracts = []
         self.balance = balance
+        self.nav = nav
         self._patches = []
         self._patch(test, "run_oracle_validation", lambda **_kwargs: result)
         self._patch(test, "get_w3", lambda _rpc: self._w3())
-        self._patch(test, "get_contract", lambda *_a, **_k: self._oracle())
+        self._patch(test, "get_contract", self._contract)
         self._patch(test, "send_and_confirm", self._send)
 
     def _patch(self, test, name, replacement):
@@ -81,9 +88,13 @@ class Harness:
     def _w3(self):
         return SimpleNamespace(eth=SimpleNamespace(get_balance=lambda _a: self.balance))
 
-    def _oracle(self):
+    def _contract(self, _w3, address, name):
+        self.contracts.append((address, name))
         return SimpleNamespace(
-            functions=SimpleNamespace(setValue=lambda value: ("setValue", value))
+            functions=SimpleNamespace(
+                setValue=lambda value: ("setValue", value),
+                maxValue=lambda: SimpleNamespace(call=lambda: self.nav),
+            )
         )
 
     def _send(self, contract_function, value, key, **kwargs):
@@ -242,14 +253,16 @@ class TestGuardsRefuseToWrite(unittest.TestCase):
         self.assertEqual(harness.sends, [])
         self.assertIn("lower the value", result.alert)
 
-    def test_a_decrease_within_tolerance_is_written(self):
+    def test_a_decrease_within_tolerance_refreshes_the_current_value(self):
         """Three separate reads wobble in the last digits; freezing the oracle
-        on rounding noise would be a self-inflicted outage."""
+        on rounding noise would be a self-inflicted outage. The OracleUpdater
+        refuses any fall, so the oracle's own value is what refreshes it."""
         harness = Harness(self, validation(oracle_value=ONE, actual_value=ONE - 10**8))
 
         result = self._run(harness)
 
         self.assertTrue(result.written)
+        self.assertEqual(harness.written_values, [ONE])
 
     def test_a_refusal_says_how_long_is_left(self):
         """The third identical alert has to read differently from the first."""
@@ -266,13 +279,132 @@ class TestGuardsRefuseToWrite(unittest.TestCase):
 
         self.assertIn("ALREADY EXPIRED", result.alert)
 
-    def test_force_writes_past_both_guards(self):
+    def test_force_writes_past_the_deviation_guard(self):
         harness = Harness(self, validation(oracle_value=ONE, actual_value=2 * ONE))
 
         result = self._run(harness, force=True)
 
         self.assertTrue(result.written)
         self.assertEqual(harness.written_values, [2 * ONE])
+
+    def test_force_does_not_write_a_decrease(self):
+        """The OracleUpdater would revert it; lowering is the Safe's."""
+        harness = Harness(self, validation(oracle_value=ONE, actual_value=ONE // 2))
+
+        result = self._run(harness, force=True)
+
+        self.assertFalse(result.written)
+        self.assertEqual(harness.sends, [])
+        self.assertIn("oracle-propose", result.alert)
+
+    def test_force_does_not_write_past_the_nav(self):
+        harness = Harness(
+            self, validation(oracle_value=ONE, actual_value=2 * ONE), nav=ONE - 1
+        )
+
+        result = self._run(harness, force=True)
+
+        self.assertFalse(result.written)
+        self.assertIn("below the oracle value", result.alert)
+
+
+class TestTheOracleUpdater(unittest.TestCase):
+    """Writes go through the OracleUpdater, inside the bounds it enforces."""
+
+    def _run(self, harness, deployment=DEPLOYMENT):
+        return update_oracle(
+            source=source(),
+            deployment=deployment,
+            target_rpc="https://target.invalid",
+            target_core_helper="0x" + "44" * 20,
+            oracle_expiry_threshold_seconds=172800,
+        )
+
+    def test_the_write_goes_to_the_updater(self):
+        harness = Harness(self, validation(actual_value=ONE + 10**13))
+
+        self._run(harness)
+
+        self.assertEqual(harness.contracts, [(UPDATER, "OracleUpdater")])
+        self.assertEqual(harness.written_values, [ONE + 10**13])
+
+    def test_a_reading_above_the_nav_writes_the_nav_quietly(self):
+        """A deposit at the stale price between the read and the send pulls the
+        NAV under the reading; the NAV is the later figure. That is ordinary, so
+        it is logged, not sent to Telegram."""
+        nav = ONE + 10**13
+        harness = Harness(self, validation(actual_value=nav + 10**12), nav=nav)
+
+        result = self._run(harness)
+
+        self.assertTrue(result.written)
+        self.assertEqual(harness.written_values, [nav])
+        self.assertEqual(result.new_value, nav)
+        self.assertEqual(result.alert, "")
+
+    def test_a_reading_at_the_nav_says_nothing(self):
+        harness = Harness(self, validation(actual_value=ONE + 10**13), nav=ONE + 10**13)
+
+        result = self._run(harness)
+
+        self.assertTrue(result.written)
+        self.assertEqual(result.alert, "")
+
+    def test_a_nav_below_the_oracle_is_refused(self):
+        """Nothing the OracleUpdater accepts exists: the vault lost value, and
+        only the Safe can lower the oracle."""
+        harness = Harness(self, validation(actual_value=ONE), nav=ONE - 10**12)
+
+        result = self._run(harness)
+
+        self.assertFalse(result.written)
+        self.assertEqual(harness.sends, [])
+        self.assertIn("oracle-propose", result.alert)
+
+    def test_no_updater_configured_raises(self):
+        harness = Harness(self, validation())
+        bare = Deployment(
+            name="OG", source_core="0x" + "22" * 20, target_core="0x" + "33" * 20
+        )
+
+        with self.assertRaisesRegex(Exception, "no oracle-updater address"):
+            self._run(harness, deployment=bare)
+        self.assertEqual(harness.sends, [])
+
+
+class TestBoundedWrite(unittest.TestCase):
+    """The value sent, away from any chain access."""
+
+    TOL = 10**9
+
+    def test_inside_the_band_is_sent_as_read(self):
+        self.assertEqual(
+            bounded_write(ONE, ONE + 5, ONE + 10, self.TOL), (ONE + 5, "", "")
+        )
+
+    def test_rounding_under_the_oracle_sends_the_oracle_value(self):
+        self.assertEqual(bounded_write(ONE, ONE - self.TOL, 2 * ONE, self.TOL)[0], ONE)
+
+    def test_a_fall_past_tolerance_is_refused(self):
+        value, refusal, _note = bounded_write(
+            ONE, ONE - self.TOL - 1, 2 * ONE, self.TOL
+        )
+        self.assertIn("lower the value", refusal)
+
+    def test_above_the_nav_sends_the_nav(self):
+        value, refusal, note = bounded_write(ONE, ONE + 2 * self.TOL, ONE + 1, self.TOL)
+        self.assertEqual((value, refusal), (ONE + 1, ""))
+        self.assertIn("NAV", note)
+
+    def test_a_rounding_gap_over_the_nav_is_not_noted(self):
+        self.assertEqual(
+            bounded_write(ONE, ONE + self.TOL, ONE, self.TOL), (ONE, "", "")
+        )
+
+    def test_a_nav_under_the_oracle_is_refused(self):
+        self.assertIn(
+            "below the oracle value", bounded_write(ONE, ONE, ONE - 1, self.TOL)[1]
+        )
 
 
 class TestTransferInFlight(unittest.TestCase):

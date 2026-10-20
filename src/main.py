@@ -31,7 +31,7 @@ from safe_global import PendingTransactionInfo, ProposalPosted, propose_tx_if_ne
 from process_lock import LockHeld, ProcessLock
 from dataclasses import dataclass, field
 
-from web3_scripts.base import print_colored
+from web3_scripts.base import get_contract, get_w3, print_colored
 
 # Resolved from this file rather than the working directory: the scheduler calls
 # main() in-process, so a scheduler started from anywhere but the repo root would
@@ -495,6 +495,54 @@ def compose_oracle_update_message(
     return message
 
 
+def _warn_above_nav(oracle_validation_results, value_override) -> None:
+    """Say so when a proposed value sits above the OracleUpdater's `maxValue()`.
+
+    The Safe can write it -- it holds the role directly -- but the heartbeat
+    writes through the OracleUpdater, which cannot refresh a value above the NAV.
+    Once such a value lands, every heartbeat refuses until the NAV catches up or
+    the Safe writes again, and the oracle expires after `maxAge` if nobody does.
+
+    Advisory only: nothing here may stop a proposal, which is the recovery path.
+    """
+    try:
+        plans = plan_oracle_proposals(
+            oracle_validation_results, force=True, value_override=value_override
+        )
+    except Exception as e:
+        print_colored(
+            "Could not check the proposed values against maxValue(): {}".format(e),
+            "yellow",
+        )
+        return
+    for plan in plans:
+        deployments = {d.name: d for d in plan.source.deployments}
+        for name, (_oracle_address, args) in zip(plan.deployment_names, plan.calls):
+            deployment = deployments.get(name)
+            if deployment is None or not deployment.oracle_updater:
+                continue
+            try:
+                updater = get_contract(
+                    get_w3(plan.source.rpc), deployment.oracle_updater, "OracleUpdater"
+                )
+                max_value = updater.functions.maxValue().call()
+            except Exception as e:
+                print_colored(
+                    "{}/{}: could not read the OracleUpdater's maxValue(): {}".format(
+                        plan.source.name, name, e
+                    ),
+                    "yellow",
+                )
+                continue
+            if args[0] > max_value:
+                print_colored(
+                    "{}/{}: proposed value {} is above the OracleUpdater's maxValue() "
+                    "{}; once written, the heartbeat cannot refresh it until the NAV "
+                    "catches up".format(plan.source.name, name, args[0], max_value),
+                    "red",
+                )
+
+
 async def run_oracle_propose(
     config: Config,
     value_override: Optional[int] = None,
@@ -517,6 +565,8 @@ async def run_oracle_propose(
             "Could not validate any of {} oracle deployment(s); nothing to "
             "propose".format(len(oracle_validation_results))
         )
+
+    _warn_above_nav(oracle_validation_results, value_override)
 
     if dry_run:
         # The same planning the real run does, stopping short of the one step

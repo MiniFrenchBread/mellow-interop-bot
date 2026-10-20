@@ -56,15 +56,20 @@ def validate_source(target_w3: Web3, source: SourceConfig):
 # that a wrong or unreachable oracle address cannot make this check pass by
 # accident.
 SET_VALUE_ROLE = Web3.keccak(text="ORACLE:SET_VALUE_ROLE")
+# keccak256("UPDATER_ROLE"), the role OracleUpdater.setValue checks. Hard-coded
+# for the same reason.
+UPDATER_ROLE = Web3.keccak(text="UPDATER_ROLE")
 
 
 def validate_oracle_updater(w3: Web3, source: SourceConfig):
     """Check the heartbeat key can actually write the oracle.
 
-    Granting the role is a separate, manual multisig step, and forgetting it
-    produces a bot that starts cleanly and then fails every eight hours with
-    "Oracle: forbidden". Checking it here turns that into one line at deploy
-    time.
+    The key writes through each deployment's OracleUpdater, so three things have
+    to line up, and each is granted separately: the updater contract points at
+    this deployment's SourceCore, the key holds UPDATER_ROLE on it, and the
+    updater holds SET_VALUE_ROLE on the SourceCore. Forgetting any one produces a
+    bot that starts cleanly and then fails every eight hours. Checking them here
+    turns that into one line at deploy time.
     """
     config = getattr(source, "oracle_update", None)
     if config is None:
@@ -80,17 +85,54 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
             f"empty; set ORACLE_UPDATER_PK"
         )
 
-    updater = Account.from_key(config.updater_private_key).address
+    key = Account.from_key(config.updater_private_key).address
     for deployment in source.deployments:
+        label = f"{source.name}/{deployment.name}"
+        if not deployment.oracle_updater:
+            raise Exception(f"{label} has no oracle-updater address configured")
+        updater = get_contract(w3, deployment.oracle_updater, "OracleUpdater")
         core = get_contract(w3, deployment.source_core, "SourceCore")
-        if not core.functions.hasRole(SET_VALUE_ROLE, updater).call():
+
+        updater_core = updater.functions.sourceCore().call()
+        if updater_core.lower() != deployment.source_core.lower():
             raise Exception(
-                f"Oracle updater {updater} does not hold SET_VALUE_ROLE on "
-                f"{deployment.source_core} ({source.name}/{deployment.name}). "
-                f"Grant it from the Safe: "
-                f"grantRole({SET_VALUE_ROLE.to_0x_hex()}, {updater})"
+                f"OracleUpdater {deployment.oracle_updater} writes the oracle of "
+                f"{updater_core}, not {deployment.source_core} ({label})"
             )
-        print(f"Oracle updater {updater} can write {deployment.name}'s oracle")
+        if not updater.functions.hasRole(UPDATER_ROLE, key).call():
+            raise Exception(
+                f"Oracle updater key {key} does not hold UPDATER_ROLE on "
+                f"OracleUpdater {deployment.oracle_updater} ({label})"
+            )
+        if not core.functions.hasRole(SET_VALUE_ROLE, deployment.oracle_updater).call():
+            raise Exception(
+                f"OracleUpdater {deployment.oracle_updater} does not hold "
+                f"SET_VALUE_ROLE on {deployment.source_core} ({label}). Grant it "
+                f"from the Safe: grantRole({SET_VALUE_ROLE.to_0x_hex()}, "
+                f"{deployment.oracle_updater})"
+            )
+        oracle = get_contract(w3, core.functions.oracle().call(), "Oracle")
+        current = oracle.functions.value().call()
+        max_value = updater.functions.maxValue().call()
+        if max_value < current:
+            # Nothing the OracleUpdater accepts exists, so every heartbeat will
+            # refuse until the NAV catches up or the Safe lowers the oracle.
+            raise Exception(
+                f"OracleUpdater {deployment.oracle_updater} maxValue() {max_value} "
+                f"is below the oracle value {current} ({label}); no heartbeat can "
+                f"write until the Safe lowers the oracle or the NAV catches up"
+            )
+        print(
+            f"Oracle updater {key} can write {deployment.name}'s oracle through {deployment.oracle_updater}"
+        )
+        if core.functions.hasRole(SET_VALUE_ROLE, key).call():
+            # Not a failure: it is the state between the Safe's grant and its
+            # revoke. Said so the revoke is not forgotten.
+            print(
+                f"Note: {key} still holds SET_VALUE_ROLE on "
+                f"{deployment.source_core} directly; revoke it from the Safe once "
+                f"writes through the OracleUpdater are confirmed"
+            )
 
 
 def validate_all_safe_globals(w3: Web3, source: SourceConfig):

@@ -231,9 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help=(
-            "Write even if the deviation or decrease guard would refuse. Only "
-            "after checking the reading with --dry-run; prefer oracle-propose, "
-            "which puts the value in front of the Safe signers instead."
+            "Write even if the deviation guard would refuse. Cannot lower the "
+            "value or exceed the OracleUpdater's maxValue(); the contract "
+            "refuses both. Only after checking the reading with --dry-run; "
+            "prefer oracle-propose, which puts the value in front of the Safe "
+            "signers instead."
         ),
     )
 
