@@ -328,9 +328,10 @@ class TestTheOracleUpdater(unittest.TestCase):
         self.assertEqual(harness.contracts, [(UPDATER, "OracleUpdater")])
         self.assertEqual(harness.written_values, [ONE + 10**13])
 
-    def test_a_reading_above_the_nav_writes_the_nav_and_says_so(self):
+    def test_a_reading_above_the_nav_writes_the_nav_quietly(self):
         """A deposit at the stale price between the read and the send pulls the
-        NAV under the reading; the NAV is the later figure."""
+        NAV under the reading; the NAV is the later figure. That is ordinary, so
+        it is logged, not sent to Telegram."""
         nav = ONE + 10**13
         harness = Harness(self, validation(actual_value=nav + 10**12), nav=nav)
 
@@ -339,7 +340,7 @@ class TestTheOracleUpdater(unittest.TestCase):
         self.assertTrue(result.written)
         self.assertEqual(harness.written_values, [nav])
         self.assertEqual(result.new_value, nav)
-        self.assertIn("above the on-chain NAV", result.alert)
+        self.assertEqual(result.alert, "")
 
     def test_a_reading_at_the_nav_says_nothing(self):
         harness = Harness(self, validation(actual_value=ONE + 10**13), nav=ONE + 10**13)

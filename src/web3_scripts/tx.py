@@ -20,7 +20,12 @@ from typing import List, Optional
 
 from eth_account import Account
 from web3 import Web3
-from web3.exceptions import TransactionIndexingInProgress, TransactionNotFound
+from eth_abi import decode as abi_decode
+from web3.exceptions import (
+    ContractCustomError,
+    TransactionIndexingInProgress,
+    TransactionNotFound,
+)
 
 DEFAULT_RECEIPT_TIMEOUT = 180
 DEFAULT_FEE_BUMP_PERCENT = 115
@@ -80,7 +85,62 @@ REVERT_HINTS = ("execution reverted", "reverted")
 
 
 class TxReverted(Exception):
-    """Simulation showed the call cannot succeed. Not retryable."""
+    """Simulation showed the call cannot succeed. Not retryable.
+
+    `custom_error` is (name, {argument: value}) when the revert carried a custom
+    error the called contract's ABI declares, so a caller can act on it.
+    """
+
+    def __init__(self, message: str, custom_error: Optional[tuple] = None):
+        super().__init__(message)
+        self.custom_error = custom_error
+
+
+def decode_custom_error(abi: list, data) -> Optional[tuple]:
+    """(name, {argument: value}) for revert data matching one of `abi`'s errors.
+
+    web3 raises a custom-error revert with only its raw hex, which says nothing
+    to whoever reads the alert it ends up in; the contract's own ABI is what can
+    name it.
+    """
+    if not isinstance(data, str) or not data.startswith("0x") or len(data) < 10:
+        return None
+    selector, payload = data[2:10], bytes.fromhex(data[10:])
+    for entry in abi or []:
+        if entry.get("type") != "error":
+            continue
+        types = [arg["type"] for arg in entry.get("inputs", [])]
+        signature = "{}({})".format(entry["name"], ",".join(types))
+        if Web3.keccak(text=signature).hex().removeprefix("0x")[:8] != selector:
+            continue
+        try:
+            values = abi_decode(types, payload)
+        except Exception:
+            return None
+        names = [arg.get("name") or str(i) for i, arg in enumerate(entry["inputs"])]
+        return entry["name"], dict(zip(names, values))
+    return None
+
+
+def format_custom_error(error: tuple) -> str:
+    name, args = error
+    return "{}({})".format(
+        name,
+        ", ".join(
+            "{}={}".format(
+                key, "0x" + value.hex() if isinstance(value, bytes) else value
+            )
+            for key, value in args.items()
+        ),
+    )
+
+
+def _custom_error(contract_function, exc: Exception) -> Optional[tuple]:
+    if not isinstance(exc, ContractCustomError):
+        return None
+    return decode_custom_error(
+        getattr(contract_function, "contract_abi", None), exc.data
+    )
 
 
 class TxNotConfirmed(Exception):
@@ -309,7 +369,15 @@ def estimate_gas(contract_function, sender: str, value: int) -> int:
     try:
         estimated = contract_function.estimate_gas({"from": sender, "value": value})
     except Exception as e:
-        if is_revert(e):
+        error = _custom_error(contract_function, e)
+        if error is not None:
+            raise TxReverted(
+                "Call reverted during gas estimation: {}".format(
+                    format_custom_error(error)
+                ),
+                custom_error=error,
+            )
+        if is_revert(e) or isinstance(e, ContractCustomError):
             raise TxReverted("Call reverted during gas estimation: {}".format(e))
         raise Exception("Gas estimation failed: {}".format(e))
     return estimated * GAS_BUFFER_PERCENT // 100

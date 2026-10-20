@@ -129,9 +129,12 @@ deployment's **OracleUpdater** (`oracle-updater` in `config.json`; contract in
 the share price the vault's W0G on 0G backs (`(W0G in SourceCore + W0G locked in
 the OFT adapter) / aOG supply`). That is what limits a leaked key. The bot sends
 a reading a hair under the oracle as the oracle's own value, and a reading over
-`maxValue()` as `maxValue()` (with a Telegram note when the gap is more than
-rounding). **Lowering the value is only possible from the Safe** — see
-`cli.py oracle-propose` below.
+`maxValue()` as `maxValue()` (logged, not alerted: a deposit at the stale price
+between the read and the send is the usual cause). If such a deposit lands
+after `maxValue()` was read, the send reverts with `OracleUpdaterValueAboveNav`
+and is retried once at the NAV the revert reports. **Lowering the value is only
+possible from the Safe** — see `cli.py oracle-propose` below, which warns when a
+proposed value is above `maxValue()`, since the heartbeat could not refresh it.
 
 `ascend` runs on the same interval, and must not run less often: the vault's
 assets only move when ascend transfers rewards into it, so the share price

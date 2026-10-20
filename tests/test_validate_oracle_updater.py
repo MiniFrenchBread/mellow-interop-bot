@@ -44,10 +44,12 @@ def source(**overrides) -> SourceConfig:
 class FakeAccessControl:
     """A contract answering `hasRole` from a set of (role hex, account) grants."""
 
-    def __init__(self, grants, source_core=SOURCE_CORE):
+    def __init__(self, grants, source_core=SOURCE_CORE, value=10**18, max_value=10**18):
         self.grants = set(grants)
         self.asked = []
         self._source_core = source_core
+        self._value = value
+        self._max_value = max_value
 
     @property
     def functions(self):
@@ -59,6 +61,17 @@ class FakeAccessControl:
 
     def sourceCore(self):
         return SimpleNamespace(call=lambda: self._source_core)
+
+    # The same fake stands in for the SourceCore, the OracleUpdater and the
+    # Oracle; each caller only asks for what its contract has.
+    def oracle(self):
+        return SimpleNamespace(call=lambda: "0x" + "8f" * 20)
+
+    def value(self):
+        return SimpleNamespace(call=lambda: self._value)
+
+    def maxValue(self):
+        return SimpleNamespace(call=lambda: self._max_value)
 
 
 UPDATER_ROLE_HEX = vc.UPDATER_ROLE.hex()
@@ -79,13 +92,27 @@ class TestTheRoleCheck(unittest.TestCase):
     def tearDown(self):
         vc.get_contract = self._get_contract
 
-    def _chain(self, core_grants=ALL_GRANTED, updater_grants=KEY_GRANTED, **kwargs):
-        core = FakeAccessControl(core_grants)
+    def _chain(
+        self,
+        core_grants=ALL_GRANTED,
+        updater_grants=KEY_GRANTED,
+        value=10**18,
+        **kwargs
+    ):
+        core = FakeAccessControl(core_grants, value=value)
         updater = FakeAccessControl(updater_grants, **kwargs)
         vc.get_contract = lambda _w3, _address, name: (
             updater if name == "OracleUpdater" else core
         )
         return core, updater
+
+    def test_a_nav_below_the_oracle_raises(self):
+        """No value the OracleUpdater accepts exists, so every heartbeat would
+        refuse; that is worth hearing at deploy time."""
+        self._chain(value=10**18, max_value=10**18 - 1)
+
+        with self.assertRaisesRegex(Exception, "is below the oracle value"):
+            vc.validate_oracle_updater(None, source())
 
     def test_everything_granted_passes(self):
         self._chain()

@@ -209,7 +209,8 @@ class TestSourceScoping(unittest.TestCase):
         finally:
             main.plan_oracle_proposals = planned
 
-        self.assertEqual(seen, ["OTHER"])
+        # Planned more than once (the maxValue() check plans too), never for OG.
+        self.assertEqual(set(seen), {"OTHER"})
 
 
 class TestEmptyPlanNamesTheRealReason(unittest.TestCase):

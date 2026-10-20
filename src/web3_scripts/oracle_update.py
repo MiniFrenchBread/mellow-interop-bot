@@ -31,11 +31,11 @@ and say why. Lowering the value is the Safe's alone.
 try:
     from .base import *
     from .oracle_script import format_remaining_time, run_oracle_validation
-    from .tx import send_and_confirm
+    from .tx import TxReverted, send_and_confirm
 except ImportError:
     from base import *
     from oracle_script import format_remaining_time, run_oracle_validation
-    from tx import send_and_confirm
+    from tx import TxReverted, send_and_confirm
 
 from dataclasses import dataclass, field
 
@@ -91,7 +91,7 @@ class OracleUpdateResult:
         afterwards, and it was previously indistinguishable from a routine one
         in every log line and message.
         """
-        return " [forced past the guards]" if self.forced else ""
+        return " [forced past the deviation guard]" if self.forced else ""
 
 
 def signed_deviation_bps(old_value: int, new_value: int) -> float:
@@ -165,9 +165,8 @@ def bounded_write(old_value: int, new_value: int, max_value: int, tolerance: int
     own value, which still refreshes it. A reading over `max_value` is sent as
     `max_value`: that figure is read from the chain moments before the send,
     later than the reading, and a deposit priced at the stale oracle in between
-    is exactly what pulls it below. A gap past `tolerance` is noted, because the
-    Ethereum leg being worth more than the W0G locked against it has no ordinary
-    cause.
+    is exactly what pulls it below. A gap past `tolerance` is noted for the log;
+    such a deposit is its usual cause.
     """
     if max_value < old_value:
         return (
@@ -192,6 +191,50 @@ def bounded_write(old_value: int, new_value: int, max_value: int, tolerance: int
             new_value, max_value
         )
     return value, "", note
+
+
+def send_within_band(
+    updater, value, old_value, new_value, tolerance, private_key, w3, tx_options
+):
+    """Send `setValue(value)` through the OracleUpdater, as (value sent, outcome).
+
+    `value` was bounded by a `maxValue()` read moments earlier. A deposit at the
+    stale price landing before the send can still pull the NAV under it, and the
+    estimate then reverts with the NAV that now holds. That is retried once at
+    the figure the revert reported; any other revert is raised as it is.
+    """
+    try:
+        return value, send_and_confirm(
+            updater.functions.setValue(value),
+            0,
+            private_key,
+            w3=w3,
+            label=SET_VALUE_LABEL,
+            **tx_options,
+        )
+    except TxReverted as e:
+        error = e.custom_error
+        if not error or error[0] != "OracleUpdaterValueAboveNav":
+            raise
+        retry, refusal, _note = bounded_write(
+            old_value, new_value, error[1]["maxValue"], tolerance
+        )
+        if refusal or retry >= value:
+            raise
+        print_colored(
+            "setValue({}) is above the NAV {} by now; sending {}".format(
+                value, error[1]["maxValue"], retry
+            ),
+            "yellow",
+        )
+        return retry, send_and_confirm(
+            updater.functions.setValue(retry),
+            0,
+            private_key,
+            w3=w3,
+            label=SET_VALUE_LABEL,
+            **tx_options,
+        )
 
 
 def update_oracle(
@@ -273,7 +316,7 @@ def update_oracle(
         config.decrease_tolerance_wei,
     )
     if refusal:
-        result.alerts.append("refused: {} {}".format(deployment.name, refusal))
+        result.alerts.append("refused: {}: {}".format(deployment.name, refusal))
     elif not force and exceeds_deviation(
         old_value, new_value, config.max_deviation_bps
     ):
@@ -296,10 +339,9 @@ def update_oracle(
         return result
 
     if note:
-        # Written, and said, because it is the one case where the value sent is
-        # not the value read.
-        result.alerts.append("{}: {}".format(deployment.name, note))
-        print_colored(result.alerts[-1], "yellow")
+        # Logged rather than alerted: the value sent is not the value read, but
+        # the usual cause is a deposit at the stale price, which needs no one.
+        print_colored("{}: {}".format(deployment.name, note), "yellow")
     result.new_value = value
 
     tx_options = tx or source.tx.as_kwargs()
@@ -329,14 +371,17 @@ def update_oracle(
         )
         return result
 
-    outcome = send_and_confirm(
-        updater.functions.setValue(value),
-        0,
+    value, outcome = send_within_band(
+        updater,
+        value,
+        old_value,
+        new_value,
+        config.decrease_tolerance_wei,
         config.updater_private_key,
-        w3=source_w3,
-        label=SET_VALUE_LABEL,
-        **tx_options,
+        source_w3,
+        tx_options,
     )
+    result.new_value = value
     result.written = True
     result.tx_hash = outcome.tx_hash
     print_colored(
@@ -515,17 +560,18 @@ def resync_oracle(
         return result
 
     if note:
-        result.reason = note
         print_colored("{}: {}".format(deployment.name, note), "yellow")
-    result.new_value = value
-    outcome = send_and_confirm(
-        updater.functions.setValue(value),
-        0,
+    value, outcome = send_within_band(
+        updater,
+        value,
+        old_value,
+        new_value,
+        ORACLE_VALUE_TOLERANCE,
         config.updater_private_key,
-        w3=source_w3,
-        label=SET_VALUE_LABEL,
-        **(tx or source.tx.as_kwargs()),
+        source_w3,
+        tx or source.tx.as_kwargs(),
     )
+    result.new_value = value
     result.tx_hash = outcome.tx_hash
     print_colored(
         "{}: resync setValue({}) confirmed in {} (was {}, {:+.4f} bps)".format(

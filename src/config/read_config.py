@@ -628,7 +628,13 @@ def _dict_to_config(config_dict: Dict[str, Any]) -> Config:
                 source_core=dep["source_core"],
                 target_core=dep["target_core"],
                 safe_global=deployment_safe_global,
-                oracle_updater=dep.get("oracle_updater") or None,
+                # Checksummed here: a contract call given the lowercase form
+                # raises InvalidAddress.
+                oracle_updater=(
+                    Web3.to_checksum_address(dep["oracle_updater"])
+                    if dep.get("oracle_updater")
+                    else None
+                ),
             )
 
         deployments = tuple(

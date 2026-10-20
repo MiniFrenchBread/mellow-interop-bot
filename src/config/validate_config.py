@@ -111,6 +111,17 @@ def validate_oracle_updater(w3: Web3, source: SourceConfig):
                 f"from the Safe: grantRole({SET_VALUE_ROLE.to_0x_hex()}, "
                 f"{deployment.oracle_updater})"
             )
+        oracle = get_contract(w3, core.functions.oracle().call(), "Oracle")
+        current = oracle.functions.value().call()
+        max_value = updater.functions.maxValue().call()
+        if max_value < current:
+            # Nothing the OracleUpdater accepts exists, so every heartbeat will
+            # refuse until the NAV catches up or the Safe lowers the oracle.
+            raise Exception(
+                f"OracleUpdater {deployment.oracle_updater} maxValue() {max_value} "
+                f"is below the oracle value {current} ({label}); no heartbeat can "
+                f"write until the Safe lowers the oracle or the NAV catches up"
+            )
         print(
             f"Oracle updater {key} can write {deployment.name}'s oracle through {deployment.oracle_updater}"
         )

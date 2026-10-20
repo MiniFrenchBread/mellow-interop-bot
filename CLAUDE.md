@@ -40,7 +40,7 @@ Safe multisig proposals still exist but are no longer on any schedule: `cli.py o
   - `multi_send_call.py` -- Encodes multiple calls into a single `multiSend(bytes)` call for Safe contracts (supports versions 1.3.0, 1.4.1, 1.5.0).
   - `common.py` -- Shared data structures (`PendingTransactionInfo`, `ThresholdWithOwners`), validation helpers, retry utility.
 - **`src/telegram_bot/`** -- Telegram message sending with Markdown formatting and dry-run support.
-- **`abi/`** -- JSON ABI files for smart contracts: `Oracle`, `SourceCore`, `TargetCore`, `SourceHelper`, `TargetHelper`, `Safe`, `SafeMultiSend`, `Rewarder`, `AscendRouter`, `WithdrawalQueue`; and, for the daily report only, `SymbioticVault`, `RestakingStates`, `MellowMultiVault`, `MellowWithdrawalQueue`.
+- **`abi/`** -- JSON ABI files for smart contracts: `Oracle`, `OracleUpdater`, `SourceCore`, `TargetCore`, `SourceHelper`, `TargetHelper`, `Safe`, `SafeMultiSend`, `Rewarder`, `AscendRouter`, `WithdrawalQueue`; and, for the daily report only, `SymbioticVault`, `RestakingStates`, `MellowMultiVault`, `MellowWithdrawalQueue`.
 
 ### Scheduler and CLI
 
@@ -136,7 +136,7 @@ docker run --env-file .env mellow-interop-bot
 Central configuration file with `${VAR:default}` env var substitution. Structure:
 - Top-level: Telegram settings, oracle thresholds, target chain RPC + helper address
 - `sources[]`: Array of source chains, each with name, RPC, helper address, deployments[], and optional safe-global config
-- `sources[].deployments[]`: Each has name, source-core address, target-core address, and optional safe-global-overrides
+- `sources[].deployments[]`: Each has name, source-core address, target-core address, `oracle-updater` address (the OracleUpdater the heartbeat writes through), and optional safe-global-overrides
 - `sources[].safe-global`: Safe multisig config (address, proposer key, API URL, web client URL, EIP-3770 prefix)
 
 ### Key Environment Variables
@@ -149,7 +149,7 @@ so a default there would enter public history.
 | `TELEGRAM_BOT_API_KEY` | Telegram bot token | (required unless DRY_RUN) |
 | `TELEGRAM_GROUP_CHAT_ID` | Target chat ID | (required unless DRY_RUN) |
 | `TELEGRAM_OWNER_NICKNAMES` | Safe signer nicknames, optionally with addresses | (optional) |
-| `ORACLE_UPDATER_PK` | Signs `Oracle.setValue`. Must hold `SET_VALUE_ROLE` on the SourceCore — granted from the Safe, checked by `validate-config`. Separate from `OPERATOR_PK` on purpose: it is the only key that can move the share price | (required for oracle-update) |
+| `ORACLE_UPDATER_PK` | Signs `OracleUpdater.setValue`. Must hold `UPDATER_ROLE` on the deployment's OracleUpdater, which must hold `SET_VALUE_ROLE` on the SourceCore — both granted from the Safe, checked by `validate-config`. Separate from `OPERATOR_PK` on purpose: it is the only key that can move the share price | (required for oracle-update) |
 | `ORACLE_MAX_DEVIATION_BPS` | Refuse to write a value further than this from the one on chain | 100 (1%) |
 | `ORACLE_DECREASE_TOLERANCE_WEI` | Refuse to write a value that fell by more than this; below it a dip is rounding | 1e9 |
 | `ORACLE_UPDATER_MIN_BALANCE_WEI` | Warn (but still write) below this gas balance | 1e17 |
@@ -214,11 +214,15 @@ proposers for one Safe.
   `oracle_update` interval (`refusal_announced_at`), and a pure refusal does not also raise the
   half-hourly skip alert. Before this, one refusal produced a message every five minutes.
 - A resync is not a second heartbeat: it never writes an unchanged value and has no schedule.
-  It uses the deviation guard as-is but not the decrease guard, because the fall a stale-priced
-  deposit causes is what it exists to write. The floor instead is the value the last write
-  replaced (read from `ValueSet` events): a deposit at a stale price dilutes toward that price and
-  never below it, so a fall past it is a loss and is refused. It sends no Telegram; a refusal is
-  appended to rebalance's skip alert.
+  It only ever raises the value, within the deviation guard and capped at `maxValue()`; any fall is
+  refused, because the OracleUpdater refuses it. The fall it used to write -- a heartbeat that read
+  the value before a stale-priced deposit landed -- cannot recur, since every write is capped at the
+  NAV of the block it lands in. It sends no Telegram; a refusal is appended to rebalance's skip alert.
+- Writes go through `send_within_band`: if a deposit at the stale price pulls the NAV under the
+  value between reading `maxValue()` and the send, the estimate reverts with
+  `OracleUpdaterValueAboveNav`, and the write is retried once at the NAV the revert reported.
+  `estimate_gas` decodes custom errors against the called contract's ABI (`TxReverted.custom_error`),
+  so an alert names the error rather than showing its raw selector.
 - Safe transaction proposals: the bot first checks for an existing queued transaction with matching calldata before proposing a new one, to avoid duplicates.
 - Safe nonces do not advance for queued-but-unexecuted proposals, so a proposal carrying a newer
   oracle value lands on the same nonce as the pending one and voids it when executed. That is the
