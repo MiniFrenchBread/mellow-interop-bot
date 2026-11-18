@@ -283,7 +283,9 @@ took. A real discrepancy persists and is still reported, three minutes later.
 If 0G still differs for a validator the service has a scanned but not yet
 committed deposit or withdrawal for, the service is mid-block and the finding
 is yellow (the row says `landing`); should it never finish, its watermark
-stops and the lag check turns red. A mismatch on any other validator stays red. If a re-read fails,
+stops and the lag check turns red, about 35 minutes into the stall -- for a
+daily report, usually the next day's. A mismatch on any other validator stays
+red. If a re-read fails,
 the read before it is shown, with a yellow note.
 
 Run it from cron at a fixed time, for example:
