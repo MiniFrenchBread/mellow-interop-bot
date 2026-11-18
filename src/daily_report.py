@@ -168,6 +168,9 @@ class Stake:
     # must equal. The CL syncs Symbiotic events itself, not via the service,
     # and runs about one block ahead of it.
     eth_cl: Optional[int] = None
+    # The service has scanned a request for this validator past its
+    # watermark and has not finished committing it: 0G may hold part of it.
+    landing: bool = False
 
     @property
     def matches(self) -> bool:
@@ -554,27 +557,23 @@ def evaluate(
             continue
         if s.eth_relayed != s.zg:
             # The service lands a block's requests one at a time and moves its
-            # watermark after the last, so while it is still committing 0G
-            # can hold part of the next block. If it never finishes, its
-            # watermark stops and the lag check above turns red.
-            committing = (
-                chain.scanned_block is not None
-                and chain.relayed_block is not None
-                and chain.scanned_block > chain.relayed_block
-            )
+            # watermark after the last, so while it is committing one for this
+            # validator 0G can hold part of it. Only that validator is let
+            # off: a mismatch on another one is not explained by it. If the
+            # service never finishes, its watermark stops and the lag check
+            # above turns red.
             out.append(
                 Finding(
-                    YELLOW if committing else RED,
+                    YELLOW if s.landing else RED,
                     "validator {} 0G stake differs: eth {} / 0g {} at block {}{}".format(
                         s.index,
                         _og(s.eth_relayed),
                         _og(s.zg),
                         chain.relayed_block,
                         (
-                            "; the service is still committing up to block {}".format(
-                                chain.scanned_block
-                            )
-                            if committing
+                            "; the service is still committing a request for "
+                            "it, scanned up to block {}".format(chain.scanned_block)
+                            if s.landing
                             else ""
                         ),
                     ),
@@ -830,9 +829,13 @@ def render(
         )
     )
     for s in chain.stakes:
-        row = "  idx {:<6} {} {}".format(
-            s.index, _og(s.eth_relayed, 6), "ok" if s.matches else "MISMATCH"
-        )
+        if s.matches:
+            status = "ok"
+        elif s.landing and s.eth_cl == s.cl:
+            status = "landing"
+        else:
+            status = "MISMATCH"
+        row = "  idx {:<6} {} {}".format(s.index, _og(s.eth_relayed, 6), status)
         if None not in (s.eth, s.eth_relayed) and s.eth != s.eth_relayed:
             row += "  relaying {:+,.6f}".format((s.eth - s.eth_relayed) / 1e18)
         rows.append(row)
@@ -995,13 +998,20 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
             }
             return zg_bal, cl
 
-        read, rechecks, reread_error = read_stakes_settled(
-            lambda: read_stakes(
-                lambda: read_service_progress(report["restaking_db"]),
-                zg_and_cl,
-                eth,
-                vaults,
+        index_of = {
+            v["rewarder"].lower(): str(v["index"]) for v in report["validators"]
+        }
+
+        def progress():
+            relayed, scanned, rewarders = read_service_progress(report["restaking_db"])
+            return (
+                relayed,
+                scanned,
+                frozenset(index_of[r] for r in rewarders if r in index_of),
             )
+
+        read, rechecks, reread_error = read_stakes_settled(
+            lambda: read_stakes(progress, zg_and_cl, eth, vaults)
         )
         facts.relayed_block = read.relayed_block
         facts.scanned_block = read.scanned_block
@@ -1042,8 +1052,10 @@ def read_stakes(
 ) -> StakeRead:
     """One read of every validator's stake on all three sides. `vaults` maps
     a validator index to its Symbiotic vault's contract functions;
-    `read_zg_and_cl` returns 0G balances and `(cl_block, cl_balances)`."""
-    (relayed, scanned), (zg_bal, (cl_block, cl)) = read_at_stable_watermark(
+    `read_watermark` returns the service's relayed and scanned blocks and the
+    indices with requests between them; `read_zg_and_cl` returns 0G balances
+    and `(cl_block, cl_balances)`."""
+    (relayed, scanned, landing), (zg_bal, (cl_block, cl)) = read_at_stable_watermark(
         read_watermark, read_zg_and_cl, sleep=sleep
     )
     head = eth.eth.block_number
@@ -1059,6 +1071,7 @@ def read_stakes(
         s.eth_cl = vault_fns.activeStakeAt(ts[cl_block], b"").call()
         s.zg = zg_bal[index]
         s.cl = cl.get(index, 0)
+        s.landing = index in landing
         stakes.append(s)
     unexpected = sorted((i for i in cl if i not in vaults), key=int)
     return StakeRead(relayed, scanned, cl_block, head, stakes, unexpected)
@@ -1108,10 +1121,11 @@ def read_at_stable_watermark(
     raise RuntimeError("restaking service kept relaying while being read")
 
 
-def read_service_progress(db_path: str) -> Tuple[int, int]:
+def read_service_progress(db_path: str) -> Tuple[int, int, frozenset]:
     """The last Ethereum block whose restaking events the service has all
-    committed to 0G, and the last it has scanned. Its `t_progress` stores the
-    next block of each: `committed` and `sync`."""
+    committed to 0G, the last it has scanned, and the rewarders (lowercase)
+    with a deposit or withdrawal scanned between the two. Its `t_progress`
+    stores the next block of each: `committed` and `sync`."""
     if not db_path:
         raise ValueError("RESTAKING_DB is not set")
     import sqlite3
@@ -1121,14 +1135,27 @@ def read_service_progress(db_path: str) -> Tuple[int, int]:
     # takes; SQLite's busy timeout makes the service wait, not fail.
     con = sqlite3.connect("file:{}?mode=ro".format(db_path), uri=True, timeout=10)
     try:
+        # One read transaction, so the cursors and the requests agree.
+        con.execute("BEGIN")
         row = con.execute(
             "SELECT committed, sync FROM t_progress WHERE domain = 0"
         ).fetchone()
+        if row is None:
+            raise ValueError("restaking service has no Symbiotic progress")
+        relayed, scanned = int(row[0]) - 1, int(row[1]) - 1
+        # Request types 3 and 4 are Deposit and Withdraw, the ones that move
+        # a validator's stake.
+        rewarders = frozenset(
+            r.lower()
+            for (r,) in con.execute(
+                "SELECT DISTINCT rewarder FROM t_restaking WHERE domain = 0 "
+                "AND type IN (3, 4) AND block_number > ? AND block_number <= ?",
+                (relayed, scanned),
+            )
+        )
     finally:
         con.close()
-    if row is None:
-        raise ValueError("restaking service has no Symbiotic progress")
-    return int(row[0]) - 1, int(row[1]) - 1
+    return relayed, scanned, rewarders
 
 
 def read_cl_restaking(beacon_api: str) -> Tuple[int, Dict[str, int]]:

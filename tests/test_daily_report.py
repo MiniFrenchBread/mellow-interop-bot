@@ -306,24 +306,34 @@ class TestRules(unittest.TestCase):
 
     def test_zg_mismatch_at_the_relayed_block(self):
         chain = healthy_chain()
+        chain.scanned_block = chain.relayed_block
         chain.stakes[2].eth_relayed -= 1
         [f] = run_eval(chain=chain)
         self.assertEqual(f.level, RED)
         self.assertIn("validator 3 0G stake differs", f.text)
         self.assertIn("at block 26438832", f.text)
-        # Scanned up to the relayed block: nothing left to commit.
-        chain.scanned_block = chain.relayed_block
-        self.assertEqual(run_eval(chain=chain)[0].level, RED)
 
-    def test_zg_mismatch_while_the_service_is_committing_is_a_note(self):
-        """The service has scanned past its watermark and is landing that
-        block's requests one by one; 0G can hold part of it."""
+    def test_zg_mismatch_while_its_request_is_landing_is_a_note(self):
+        """The service has scanned a request for this validator past its
+        watermark and is landing it; 0G can hold part of the block."""
         chain = healthy_chain()
         chain.scanned_block = chain.relayed_block + 32
         chain.stakes[2].zg -= 1
+        chain.stakes[2].landing = True
         [f] = run_eval(chain=chain)
         self.assertEqual(f.level, YELLOW)
-        self.assertIn("still committing up to block 26438864", f.text)
+        self.assertIn("still committing a request for it", f.text)
+        self.assertIn("scanned up to block 26438864", f.text)
+
+    def test_zg_mismatch_on_another_validator_stays_red(self):
+        """A request landing for validator 3 does not explain validator 0."""
+        chain = healthy_chain()
+        chain.scanned_block = chain.relayed_block + 32
+        chain.stakes[2].landing = True
+        chain.stakes[0].zg -= 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, RED)
+        self.assertIn("validator 0 0G stake differs", f.text)
 
     def test_cl_mismatch_at_its_own_block(self):
         chain = healthy_chain()
@@ -365,10 +375,27 @@ class TestRules(unittest.TestCase):
             con.execute(
                 "CREATE TABLE t_progress (domain INTEGER, sync INTEGER, committed INTEGER)"
             )
+            con.execute(
+                "CREATE TABLE t_restaking (domain INTEGER, type INTEGER, "
+                "rewarder TEXT, block_number INTEGER, log_index INTEGER)"
+            )
             con.execute("INSERT INTO t_progress VALUES (0, 26439665, 26439633)")
+            con.executemany(
+                "INSERT INTO t_restaking VALUES (0, ?, ?, ?, ?)",
+                [
+                    (4, "0xAA", 26439632, 1),  # committed already
+                    (4, "0xBB", 26439633, 1),  # landing
+                    (3, "0xbb", 26439640, 2),  # landing, same rewarder
+                    (2, "0xCC", 26439650, 1),  # weight update: not a stake move
+                    (4, "0xDD", 26439665, 1),  # not scanned yet
+                ],
+            )
             con.commit()
             con.close()
-            self.assertEqual(dr.read_service_progress(path), (26439632, 26439664))
+            self.assertEqual(
+                dr.read_service_progress(path),
+                (26439632, 26439664, frozenset({"0xbb"})),
+            )
         with self.assertRaises(ValueError):
             dr.read_service_progress("")
 
@@ -525,7 +552,9 @@ class TestReadStakes(unittest.TestCase):
                 (100, {"0": 6 * E18, "3": 8 * E18, "9": 1}),
             )
 
-        read = dr.read_stakes(lambda: (next(marks) - 1, 131), zg_and_cl, w3, vaults)
+        read = dr.read_stakes(
+            lambda: (next(marks) - 1, 131, frozenset({"3"})), zg_and_cl, w3, vaults
+        )
         self.assertEqual(
             (read.relayed_block, read.scanned_block, read.cl_block, read.eth_head),
             (99, 131, 100, 500),
@@ -541,6 +570,7 @@ class TestReadStakes(unittest.TestCase):
             ],
         )
         self.assertEqual(read.unexpected_cl, ["9"])
+        self.assertEqual([s.landing for s in read.stakes], [False, True])
         self.assertTrue(read.consistent)
         self.assertIn(("activeStakeAt", 12, b""), log)
         self.assertIn(("activeStakeAt", 24, b""), log)
@@ -550,7 +580,10 @@ class TestReadStakes(unittest.TestCase):
     def test_a_validator_missing_from_the_cl_reads_as_zero(self):
         vaults = {"1": _Vault(E18, {7: E18}, [])}
         read = dr.read_stakes(
-            lambda: (3, 3), lambda: ({"1": E18}, (3, {})), _W3(10, {3: 7}), vaults
+            lambda: (3, 3, frozenset()),
+            lambda: ({"1": E18}, (3, {})),
+            _W3(10, {3: 7}),
+            vaults,
         )
         self.assertEqual(read.stakes[0].cl, 0)
         self.assertFalse(read.consistent)
@@ -644,6 +677,14 @@ class TestRender(unittest.TestCase):
         self.assertIn("0g at 26438832, = cl at 26438833, head 26438960", text)
         self.assertIn("4,623,989.000000 ok  relaying -0.016830", text)
         self.assertEqual(text.count("relaying"), 1)
+        chain.stakes[1].zg -= 1
+        chain.stakes[1].landing = True
+        chain.stakes[2].zg -= 1
+        rows = self.render([], chain)
+        self.assertIn("4,487,990.000000 landing", rows)
+        self.assertEqual(rows.count("MISMATCH"), 1)
+        chain.stakes[1].zg += 1
+        chain.stakes[2].zg += 1
         self.assertNotIn("re-read", text)
         chain.stake_rechecks = 2
         self.assertIn("head 26438960, re-read 2x)", self.render([], chain))
