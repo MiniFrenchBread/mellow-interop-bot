@@ -254,13 +254,39 @@ What it checks, and what it flags:
 | operator account | its nonce on either chain is ahead of the last one the bot logged -- something else signed with the key |
 | gas | operator below 20 OG / 0.05 ETH, restaking service below 2 OG |
 | source ratio | outside 0-10%, the band rebalance holds it in |
-| restaking stake | a validator's Symbiotic `activeStake`, 0G `RestakingStates` balance and CL restaking balance differ, or the CL has a restaking validator the config does not list |
+| restaking stake | a validator's 0G `RestakingStates` balance differs from its Symbiotic `activeStake` at the last Ethereum block the restaking service relayed, or its CL restaking balance differs from `activeStake` at the last block the CL synced; the service's or the CL's synced block is more than 300 blocks behind the Ethereum head; or the CL has a restaking validator the config does not list |
 | target value | it differs from stake plus in-flight Mellow withdrawals |
 | service logs | warnings (502s counted apart), failed restaking transactions, failed vault-monitor checks |
 
 Addresses are under `daily-report` in `config.json`. The beacon API and the
 log paths come from the environment: `ZG_BEACON_API` (required),
-`BOT_LOG`, `RESTAKING_LOG`, `MONITOR_LOG`, `VAULT_MONITOR_LOG`.
+`BOT_LOG`, `RESTAKING_LOG`, `MONITOR_LOG`, `VAULT_MONITOR_LOG`, and
+`RESTAKING_DB`, the restaking service's SQLite database (opened read-only).
+
+Ethereum's stake is not compared at the head. The restaking service (which
+writes 0G) and the CL each sync Symbiotic events on their own, taking a block
+only after it is finalized plus a 32-block buffer, so for 20-30 minutes after
+a deposit or withdrawal the head is ahead of both by design; comparing at the
+head flagged every rebalance that landed shortly before the report. Instead
+0G is compared at the service's commit watermark (the last block whose events
+are all on 0G), and the CL at its own `symbiotic_sync_height`, read from the
+same beacon state as its balances. The two are usually one block apart. The
+stake at each block is read with the vault's `activeStakeAt(timestamp)`
+checkpoint, so the RPC need not be an archive node. The difference still in
+flight is shown on the stake row as `relaying`.
+
+Even at the watermark 0G can disagree for a few seconds: the service lands a
+block's requests one transaction at a time and moves its watermark after the
+last one. A mismatch is therefore re-read after 60 seconds, up to three
+times, before it is reported; the stake header says how many re-reads it
+took. A real discrepancy persists and is still reported, three minutes later.
+If 0G still differs for a validator the service has a scanned but not yet
+committed deposit or withdrawal for, the service is mid-block and the finding
+is yellow (the row says `landing`); should it never finish, its watermark
+stops and the lag check turns red, about 35 minutes into the stall -- for a
+daily report, usually the next day's. A mismatch on any other validator stays
+red. If a re-read fails,
+the read before it is shown, with a yellow note.
 
 Run it from cron at a fixed time, for example:
 

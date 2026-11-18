@@ -27,6 +27,7 @@
   },
   "daily-report": {
     "beacon-api": "${ZG_BEACON_API:}",
+    "restaking-db": "${RESTAKING_DB:/data/0g-restaking-service/db}",
     "restaking-states": "0xd5AB0eD30D65f01EC6d6A4BaCA6E466F395334b6",
     "operator": "0xc0412361882961570d79CE535cB26Fc71bf363A7",
     "service-account": "0xB2718399641eC548D02C736852C7eeCc7B532be8",

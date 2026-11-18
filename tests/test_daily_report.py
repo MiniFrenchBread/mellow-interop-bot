@@ -208,10 +208,13 @@ def healthy_chain():
         chain_ids={"0G": 16661, "Ethereum": 1},
         next_nonce={16661: 102, 1: 44},
         stakes=[
-            Stake("0", 4_623_989 * E18, 4_623_989 * E18, 4_623_989 * E18),
-            Stake("1", 4_487_990 * E18, 4_487_990 * E18, 4_487_990 * E18),
-            Stake("3", 4_487_990 * E18, 4_487_990 * E18, 4_487_990 * E18),
+            Stake("0", *[4_623_989 * E18] * 5),
+            Stake("1", *[4_487_990 * E18] * 5),
+            Stake("3", *[4_487_990 * E18] * 5),
         ],
+        relayed_block=26_438_832,
+        cl_block=26_438_833,
+        eth_head=26_438_960,
     )
     c.oracle_value = int(dr.share_price(c) * E18)
     return c
@@ -292,6 +295,164 @@ class TestRules(unittest.TestCase):
         self.assertEqual(f.level, RED)
         self.assertIn("validator 1", f.text)
 
+    def test_unrelayed_ethereum_change_is_not_a_mismatch(self):
+        """A withdrawal on Ethereum the service has not relayed yet moves the
+        head but not the relayed block: 0G and the CL are judged against the
+        latter."""
+        chain = healthy_chain()
+        for s in chain.stakes:
+            s.eth -= 16_830_000_000_000_000
+        self.assertEqual(run_eval(chain=chain), [])
+
+    def test_zg_mismatch_at_the_relayed_block(self):
+        chain = healthy_chain()
+        chain.scanned_block = chain.relayed_block
+        chain.stakes[2].eth_relayed -= 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, RED)
+        self.assertIn("validator 3 0G stake differs", f.text)
+        self.assertIn("at block 26438832", f.text)
+
+    def test_zg_mismatch_while_its_request_is_landing_is_a_note(self):
+        """The service has scanned a request for this validator past its
+        watermark and is landing it; 0G can hold part of the block."""
+        chain = healthy_chain()
+        chain.scanned_block = chain.relayed_block + 32
+        chain.stakes[2].zg -= 1
+        chain.stakes[2].landing = True
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, YELLOW)
+        self.assertIn("still committing a request for it", f.text)
+        self.assertIn("scanned up to block 26438864", f.text)
+
+    def test_zg_mismatch_on_another_validator_stays_red(self):
+        """A request landing for validator 3 does not explain validator 0."""
+        chain = healthy_chain()
+        chain.scanned_block = chain.relayed_block + 32
+        chain.stakes[2].landing = True
+        chain.stakes[0].zg -= 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, RED)
+        self.assertIn("validator 0 0G stake differs", f.text)
+
+    def test_cl_mismatch_at_its_own_block(self):
+        chain = healthy_chain()
+        chain.stakes[0].cl -= 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, RED)
+        self.assertIn("validator 0 CL stake differs", f.text)
+        self.assertIn("at block 26438833", f.text)
+
+    def test_cl_one_block_ahead_of_the_service_is_not_a_mismatch(self):
+        """A withdrawal in the block the CL has synced and the service has
+        not: the CL is compared at its block, 0G at the service's."""
+        chain = healthy_chain()
+        for s in chain.stakes:
+            s.eth -= 16_830_000_000_000_000
+            s.eth_cl -= 16_830_000_000_000_000
+            s.cl -= 16_830_000_000_000_000
+        self.assertEqual(run_eval(chain=chain), [])
+
+    def test_stuck_relay_or_cl(self):
+        for attr, who in (("relayed_block", "restaking service"), ("cl_block", "CL")):
+            chain = healthy_chain()
+            chain.eth_head = 30_000_000
+            setattr(chain, "relayed_block", chain.eth_head)
+            setattr(chain, "cl_block", chain.eth_head)
+            setattr(chain, attr, chain.eth_head - dr.MAX_RELAY_LAG_BLOCKS)
+            self.assertEqual(run_eval(chain=chain), [])
+            setattr(chain, attr, getattr(chain, attr) - 1)
+            [f] = run_eval(chain=chain)
+            self.assertEqual(f.level, RED)
+            self.assertTrue(f.text.startswith(who + " has synced Ethereum"), f.text)
+
+    def test_service_progress_is_one_before_each_cursor(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "db")
+            con = sqlite3.connect(path)
+            con.execute(
+                "CREATE TABLE t_progress (domain INTEGER, sync INTEGER, committed INTEGER)"
+            )
+            con.execute(
+                "CREATE TABLE t_restaking (domain INTEGER, type INTEGER, "
+                "rewarder TEXT, block_number INTEGER, log_index INTEGER)"
+            )
+            con.execute("INSERT INTO t_progress VALUES (0, 26439665, 26439633)")
+            con.executemany(
+                "INSERT INTO t_restaking VALUES (0, ?, ?, ?, ?)",
+                [
+                    (4, "0xAA", 26439632, 1),  # committed already
+                    (4, "0xBB", 26439633, 1),  # landing
+                    (3, "0xbb", 26439640, 2),  # landing, same rewarder
+                    (2, "0xCC", 26439650, 1),  # weight update: not a stake move
+                    (4, "0xDD", 26439665, 1),  # not scanned yet
+                ],
+            )
+            con.commit()
+            con.close()
+            self.assertEqual(
+                dr.read_service_progress(path),
+                (26439632, 26439664, frozenset({"0xbb"})),
+            )
+        with self.assertRaises(ValueError):
+            dr.read_service_progress("")
+
+    def test_watermark_db_is_opened_read_only(self):
+        """A read-write open would create a missing file; read-only fails."""
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "missing")
+            with self.assertRaises(sqlite3.OperationalError):
+                dr.read_service_progress(path)
+            self.assertFalse(os.path.exists(path))
+
+    def test_read_is_retried_while_the_watermark_moves(self):
+        marks = iter([10, 11, 11, 11])
+        reads, sleeps = [], []
+        relayed, value = dr.read_at_stable_watermark(
+            lambda: next(marks),
+            lambda: reads.append(1) or len(reads),
+            sleep=sleeps.append,
+        )
+        self.assertEqual((relayed, value), (11, 2))
+        self.assertEqual(sleeps, [dr.WATERMARK_RETRY_WAIT])
+        moving = iter(range(100))
+        with self.assertRaises(RuntimeError):
+            dr.read_at_stable_watermark(
+                lambda: next(moving), lambda: None, sleep=lambda _: None
+            )
+
+    def test_cl_state_is_parsed(self):
+        amount = 4_820_479_575_580_350_000_000_000
+        state = {
+            "symbiotic_sync_height": "26440017",
+            "symbiotic_balances": [
+                [{"collateral": "0xe4", "amount": list(amount.to_bytes(32, "big"))}],
+                [],
+                [
+                    {"collateral": "0xe4", "amount": list((1).to_bytes(32, "big"))},
+                    {"collateral": "0xe5", "amount": list((2).to_bytes(32, "big"))},
+                ],
+            ],
+        }
+        self.assertEqual(
+            dr.parse_cl_restaking(state), (26440017, {"0": amount, "2": 3})
+        )
+
+    def test_config_names_the_restaking_db(self):
+        import json
+
+        with open(dr.CONFIG_PATH) as f:
+            raw = json.load(f)["daily-report"]
+        os.environ.pop("RESTAKING_DB", None)
+        self.assertEqual(
+            dr._transform_config(raw)["restaking_db"],
+            "/data/0g-restaking-service/db",
+        )
+
     def test_untracked_cl_validator(self):
         chain = healthy_chain()
         chain.unexpected_cl = ["7"]
@@ -336,12 +497,163 @@ class TestRules(unittest.TestCase):
         )
 
 
+class _Call:
+    def __init__(self, value, log, name):
+        self.value, self.log, self.name = value, log, name
+
+    def call(self):
+        self.log.append(self.name)
+        return self.value
+
+
+class _Vault:
+    """activeStake() and activeStakeAt(ts, hints) as web3 contract functions."""
+
+    def __init__(self, head, at, log):
+        self.head, self.at, self.log = head, at, log
+
+    def activeStake(self):
+        return _Call(self.head, self.log, "activeStake")
+
+    def activeStakeAt(self, ts, hints):
+        self.log.append(("activeStakeAt", ts, hints))
+        return _Call(self.at[ts], self.log, "activeStakeAt.call")
+
+
+class _Eth:
+    def __init__(self, head, timestamps):
+        self.block_number = head
+        self.timestamps = timestamps
+
+    def get_block(self, number):
+        return {"timestamp": self.timestamps[number]}
+
+
+class _W3:
+    def __init__(self, head, timestamps):
+        self.eth = _Eth(head, timestamps)
+
+
+class TestReadStakes(unittest.TestCase):
+    def test_reads_each_side_at_its_own_block(self):
+        log = []
+        # Stake at the relayed block's timestamp (12) and the CL's (24).
+        vaults = {
+            "0": _Vault(5 * E18, {12: 7 * E18, 24: 6 * E18}, log),
+            "3": _Vault(6 * E18, {12: 8 * E18, 24: 8 * E18}, log),
+        }
+        w3 = _W3(500, {99: 12, 100: 24})
+        marks = iter([100, 100])
+
+        def zg_and_cl():
+            log.append("zg_and_cl")
+            return (
+                {"0": 7 * E18, "3": 8 * E18},
+                (100, {"0": 6 * E18, "3": 8 * E18, "9": 1}),
+            )
+
+        read = dr.read_stakes(
+            lambda: (next(marks) - 1, 131, frozenset({"3"})), zg_and_cl, w3, vaults
+        )
+        self.assertEqual(
+            (read.relayed_block, read.scanned_block, read.cl_block, read.eth_head),
+            (99, 131, 100, 500),
+        )
+        self.assertEqual(
+            [
+                (s.index, s.eth, s.eth_relayed, s.zg, s.eth_cl, s.cl)
+                for s in read.stakes
+            ],
+            [
+                ("0", 5 * E18, 7 * E18, 7 * E18, 6 * E18, 6 * E18),
+                ("3", 6 * E18, 8 * E18, 8 * E18, 8 * E18, 8 * E18),
+            ],
+        )
+        self.assertEqual(read.unexpected_cl, ["9"])
+        self.assertEqual([s.landing for s in read.stakes], [False, True])
+        self.assertTrue(read.consistent)
+        self.assertIn(("activeStakeAt", 12, b""), log)
+        self.assertIn(("activeStakeAt", 24, b""), log)
+        # 0G and the CL are read before any Ethereum stake.
+        self.assertEqual(log[0], "zg_and_cl")
+
+    def test_a_validator_missing_from_the_cl_reads_as_zero(self):
+        vaults = {"1": _Vault(E18, {7: E18}, [])}
+        read = dr.read_stakes(
+            lambda: (3, 3, frozenset()),
+            lambda: ({"1": E18}, (3, {})),
+            _W3(10, {3: 7}),
+            vaults,
+        )
+        self.assertEqual(read.stakes[0].cl, 0)
+        self.assertFalse(read.consistent)
+
+
+def _stake_read(consistent):
+    s = Stake("0", E18, E18 if consistent else E18 - 1, E18, E18, E18)
+    return dr.StakeRead(1, 1, 2, 3, [s], [])
+
+
+class TestReadStakesSettled(unittest.TestCase):
+    def test_consistent_read_is_not_repeated(self):
+        sleeps = []
+        reads = iter([_stake_read(True)])
+        read, n, err = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertIsNone(err)
+        self.assertTrue(read.consistent)
+        self.assertEqual((n, sleeps), (0, []))
+
+    def test_transient_mismatch_settles_after_a_wait(self):
+        sleeps = []
+        reads = iter([_stake_read(False), _stake_read(True)])
+        read, n, err = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertIsNone(err)
+        self.assertTrue(read.consistent)
+        self.assertEqual((n, sleeps), (1, [dr.STAKE_RECHECK_WAIT]))
+
+    def test_persistent_mismatch_is_returned_after_the_last_recheck(self):
+        sleeps = []
+        reads = iter([_stake_read(False)] * (dr.STAKE_RECHECKS + 1))
+        read, n, err = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertIsNone(err)
+        self.assertFalse(read.consistent)
+        self.assertEqual(n, dr.STAKE_RECHECKS)
+        self.assertEqual(len(sleeps), dr.STAKE_RECHECKS)
+        chain = healthy_chain()
+        chain.stakes = read.stakes
+        self.assertEqual(run_eval(chain=chain)[0].level, RED)
+
+    def test_failed_reread_keeps_the_read_before_it(self):
+        first = _stake_read(False)
+
+        def reads():
+            yield first
+            raise RuntimeError("beacon down")
+
+        it = reads()
+        read, n, err = dr.read_stakes_settled(lambda: next(it), sleep=lambda _: None)
+        self.assertIs(read, first)
+        self.assertEqual((n, str(err)), (1, "beacon down"))
+        chain = healthy_chain()
+        chain.stakes = read.stakes
+        chain.stake_reread_error = str(err)
+        levels = {f.level for f in run_eval(chain=chain)}
+        self.assertEqual(levels, {RED, YELLOW})
+
+    def test_failed_first_read_raises(self):
+        def boom():
+            raise RuntimeError("db locked")
+
+        with self.assertRaises(RuntimeError):
+            dr.read_stakes_settled(boom, sleep=lambda _: None)
+
+
 class TestRender(unittest.TestCase):
-    def render(self, findings):
+    def render(self, findings, chain=None):
         return dr.render(
             findings,
             healthy_bot(),
-            healthy_chain(),
+            chain or healthy_chain(),
             PROCS,
             AGES,
             ServiceLogStats(),
@@ -357,6 +669,25 @@ class TestRender(unittest.TestCase):
         self.assertIn("✅ no issues", text)
         self.assertLessEqual(len(text), dr.TELEGRAM_LIMIT)
         self.assertEqual(text.count("```"), 2)
+
+    def test_stake_rows_show_the_relayed_block_and_what_is_in_flight(self):
+        chain = healthy_chain()
+        chain.stakes[0].eth -= 16_830_000_000_000_000
+        text = self.render([], chain)
+        self.assertIn("0g at 26438832, = cl at 26438833, head 26438960", text)
+        self.assertIn("4,623,989.000000 ok  relaying -0.016830", text)
+        self.assertEqual(text.count("relaying"), 1)
+        chain.stakes[1].zg -= 1
+        chain.stakes[1].landing = True
+        chain.stakes[2].zg -= 1
+        rows = self.render([], chain)
+        self.assertIn("4,487,990.000000 landing", rows)
+        self.assertEqual(rows.count("MISMATCH"), 1)
+        chain.stakes[1].zg += 1
+        chain.stakes[2].zg += 1
+        self.assertNotIn("re-read", text)
+        chain.stake_rechecks = 2
+        self.assertIn("head 26438960, re-read 2x)", self.render([], chain))
 
     def test_findings_lead_and_backticks_cannot_break_the_block(self):
         text = self.render([dr.Finding(RED, "bad `thing`")])
