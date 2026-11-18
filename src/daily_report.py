@@ -69,6 +69,14 @@ MIN_GAS = {"operator_og": 20.0, "operator_eth": 0.05, "service_og": 2.0}
 # normally trails the head by 100-170 blocks. This far behind (~1 h) it is
 # stuck, and the stake comparison is being made against an old block.
 MAX_RELAY_LAG_BLOCKS = 300
+# Even at the relayed block a correct stake can briefly disagree: the service
+# lands a block's requests one transaction at a time and moves its watermark
+# only after the last, so 0G can show part of a block for ~7 s per request;
+# and the CL fetches Symbiotic events on its own 30 s poll, not the service's
+# watermark. Both settle within a minute, so a mismatch is re-read after this
+# wait, up to this many times, before it is reported.
+STAKE_RECHECK_WAIT = 60
+STAKE_RECHECKS = 3
 # Sum of activeStake plus in-flight Mellow withdrawals against the target value.
 MAX_RECON_GAP = 1.0
 # Last epochs summed for "settled, not yet claimed".
@@ -185,6 +193,8 @@ class ChainFacts:
     # Last Ethereum block the restaking service relayed, and the head then.
     relayed_block: Optional[int] = None
     eth_head: Optional[int] = None
+    # Re-reads it took for the stakes to agree (or the most tried).
+    stake_rechecks: int = 0
     unexpected_cl: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
@@ -756,9 +766,14 @@ def render(
     )
 
     rows.append(
-        "Restaking stake (eth = 0g = cl at block {}, head {})".format(
+        "Restaking stake (eth = 0g = cl at block {}, head {}{})".format(
             "-" if chain.relayed_block is None else chain.relayed_block,
             "-" if chain.eth_head is None else chain.eth_head,
+            (
+                ", re-read {}x".format(chain.stake_rechecks)
+                if chain.stake_rechecks
+                else ""
+            ),
         )
     )
     for s in chain.stakes:
@@ -927,23 +942,19 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
             }
             return zg_bal, cl
 
-        relayed, (zg_bal, cl) = read_at_stable_watermark(
-            lambda: read_relayed_block(report["restaking_db"]), zg_and_cl
+        read, rechecks = read_stakes_settled(
+            lambda: read_stakes(
+                lambda: read_relayed_block(report["restaking_db"]),
+                zg_and_cl,
+                eth,
+                vaults,
+            )
         )
-        facts.relayed_block = relayed
-        facts.eth_head = eth.eth.block_number
-        # The vault checkpoints its stake by timestamp, so the value at the
-        # relayed block is read from current state -- no archive node needed.
-        # One Ethereum block per timestamp: this is the stake after that block.
-        relayed_ts = eth.eth.get_block(relayed)["timestamp"]
-        for index, vault_fns in vaults.items():
-            s = Stake(index=index)
-            s.eth = vault_fns.activeStake().call()
-            s.eth_relayed = vault_fns.activeStakeAt(relayed_ts, b"").call()
-            s.zg = zg_bal[index]
-            s.cl = cl.get(index, 0)
-            facts.stakes.append(s)
-        facts.unexpected_cl = sorted((i for i in cl if i not in vaults), key=int)
+        facts.relayed_block = read.relayed_block
+        facts.eth_head = read.eth_head
+        facts.stakes = read.stakes
+        facts.unexpected_cl = read.unexpected_cl
+        facts.stake_rechecks = rechecks
 
     attempt("vault", vault)
     attempt("withdrawal queue", queue)
@@ -951,6 +962,58 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
     attempt("gas/nonces", gas_and_nonces)
     attempt("restaking stake", stakes)
     return facts
+
+
+@dataclass
+class StakeRead:
+    relayed_block: int
+    eth_head: int
+    stakes: List[Stake]
+    unexpected_cl: List[str]
+
+    @property
+    def consistent(self) -> bool:
+        return all(s.matches for s in self.stakes)
+
+
+def read_stakes(read_watermark, read_zg_and_cl, eth, vaults) -> StakeRead:
+    """One read of every validator's stake on all three sides. `vaults` maps
+    a validator index to its Symbiotic vault's contract functions."""
+    relayed, (zg_bal, cl) = read_at_stable_watermark(read_watermark, read_zg_and_cl)
+    head = eth.eth.block_number
+    # The vault checkpoints its stake by timestamp, so the value at the
+    # relayed block is read from current state -- no archive node needed.
+    # One Ethereum block per timestamp: this is the stake after that block.
+    relayed_ts = eth.eth.get_block(relayed)["timestamp"]
+    stakes = []
+    for index, vault_fns in vaults.items():
+        s = Stake(index=index)
+        s.eth = vault_fns.activeStake().call()
+        s.eth_relayed = vault_fns.activeStakeAt(relayed_ts, b"").call()
+        s.zg = zg_bal[index]
+        s.cl = cl.get(index, 0)
+        stakes.append(s)
+    unexpected = sorted((i for i in cl if i not in vaults), key=int)
+    return StakeRead(relayed, head, stakes, unexpected)
+
+
+def read_stakes_settled(
+    read_once,
+    wait: float = STAKE_RECHECK_WAIT,
+    rechecks: int = STAKE_RECHECKS,
+    sleep=time.sleep,
+) -> Tuple[StakeRead, int]:
+    """Read the stakes; while they disagree, wait and read again. Returns the
+    last read and how many re-reads were made. A real discrepancy -- an event
+    the service never relays, a slash -- does not go away, so it is still
+    reported, only `wait * rechecks` later."""
+    read = read_once()
+    done = 0
+    while not read.consistent and done < rechecks:
+        sleep(wait)
+        read = read_once()
+        done += 1
+    return read, done
 
 
 def read_at_stable_watermark(read_watermark, read, attempts: int = 3):
@@ -972,7 +1035,9 @@ def read_relayed_block(db_path: str) -> int:
         raise ValueError("RESTAKING_DB is not set")
     import sqlite3
 
-    # Read-only, so the service's own writes are never blocked by the report.
+    # Read-only. The DB is in rollback-journal mode, so this read's shared
+    # lock can hold off the service's commit for the few milliseconds it
+    # takes; SQLite's busy timeout makes the service wait, not fail.
     con = sqlite3.connect("file:{}?mode=ro".format(db_path), uri=True, timeout=10)
     try:
         row = con.execute(

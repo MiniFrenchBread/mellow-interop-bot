@@ -390,6 +390,113 @@ class TestRules(unittest.TestCase):
         )
 
 
+class _Call:
+    def __init__(self, value, log, name):
+        self.value, self.log, self.name = value, log, name
+
+    def call(self):
+        self.log.append(self.name)
+        return self.value
+
+
+class _Vault:
+    """activeStake() and activeStakeAt(ts, hints) as web3 contract functions."""
+
+    def __init__(self, head, at, log):
+        self.head, self.at, self.log = head, at, log
+
+    def activeStake(self):
+        return _Call(self.head, self.log, "activeStake")
+
+    def activeStakeAt(self, ts, hints):
+        self.log.append(("activeStakeAt", ts, hints))
+        return _Call(self.at[ts], self.log, "activeStakeAt.call")
+
+
+class _Eth:
+    def __init__(self, head, timestamps):
+        self.block_number = head
+        self.timestamps = timestamps
+
+    def get_block(self, number):
+        return {"timestamp": self.timestamps[number]}
+
+
+class _W3:
+    def __init__(self, head, timestamps):
+        self.eth = _Eth(head, timestamps)
+
+
+class TestReadStakes(unittest.TestCase):
+    def test_reads_ethereum_at_the_relayed_blocks_timestamp(self):
+        log = []
+        vaults = {
+            "0": _Vault(5 * E18, {1_700_000_012: 7 * E18}, log),
+            "3": _Vault(6 * E18, {1_700_000_012: 8 * E18}, log),
+        }
+        w3 = _W3(500, {99: 1_700_000_012})
+        marks = iter([100, 100])
+
+        def zg_and_cl():
+            log.append("zg_and_cl")
+            return {"0": 7 * E18, "3": 8 * E18}, {"0": 7 * E18, "3": 8 * E18, "9": 1}
+
+        read = dr.read_stakes(lambda: next(marks) - 1, zg_and_cl, w3, vaults)
+        self.assertEqual((read.relayed_block, read.eth_head), (99, 500))
+        self.assertEqual(
+            [(s.index, s.eth, s.eth_relayed, s.zg, s.cl) for s in read.stakes],
+            [
+                ("0", 5 * E18, 7 * E18, 7 * E18, 7 * E18),
+                ("3", 6 * E18, 8 * E18, 8 * E18, 8 * E18),
+            ],
+        )
+        self.assertEqual(read.unexpected_cl, ["9"])
+        self.assertTrue(read.consistent)
+        self.assertIn(("activeStakeAt", 1_700_000_012, b""), log)
+        # 0G and the CL are read before any Ethereum stake.
+        self.assertEqual(log[0], "zg_and_cl")
+
+    def test_a_validator_missing_from_the_cl_reads_as_zero(self):
+        vaults = {"1": _Vault(E18, {7: E18}, [])}
+        read = dr.read_stakes(
+            lambda: 3, lambda: ({"1": E18}, {}), _W3(10, {3: 7}), vaults
+        )
+        self.assertEqual(read.stakes[0].cl, 0)
+        self.assertFalse(read.consistent)
+
+
+def _stake_read(consistent):
+    s = Stake("0", E18, E18, E18 if consistent else E18 - 1, E18)
+    return dr.StakeRead(1, 2, [s], [])
+
+
+class TestReadStakesSettled(unittest.TestCase):
+    def test_consistent_read_is_not_repeated(self):
+        sleeps = []
+        reads = iter([_stake_read(True)])
+        read, n = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertTrue(read.consistent)
+        self.assertEqual((n, sleeps), (0, []))
+
+    def test_transient_mismatch_settles_after_a_wait(self):
+        sleeps = []
+        reads = iter([_stake_read(False), _stake_read(True)])
+        read, n = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertTrue(read.consistent)
+        self.assertEqual((n, sleeps), (1, [dr.STAKE_RECHECK_WAIT]))
+
+    def test_persistent_mismatch_is_returned_after_the_last_recheck(self):
+        sleeps = []
+        reads = iter([_stake_read(False)] * (dr.STAKE_RECHECKS + 1))
+        read, n = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertFalse(read.consistent)
+        self.assertEqual(n, dr.STAKE_RECHECKS)
+        self.assertEqual(len(sleeps), dr.STAKE_RECHECKS)
+        chain = healthy_chain()
+        chain.stakes = read.stakes
+        self.assertEqual(run_eval(chain=chain)[0].level, RED)
+
+
 class TestRender(unittest.TestCase):
     def render(self, findings, chain=None):
         return dr.render(
@@ -419,6 +526,9 @@ class TestRender(unittest.TestCase):
         self.assertIn("at block 26438832, head 26438960", text)
         self.assertIn("4,623,989.000000 ok  relaying -0.016830", text)
         self.assertEqual(text.count("relaying"), 1)
+        self.assertNotIn("re-read", text)
+        chain.stake_rechecks = 2
+        self.assertIn("head 26438960, re-read 2x)", self.render([], chain))
 
     def test_findings_lead_and_backticks_cannot_break_the_block(self):
         text = self.render([dr.Finding(RED, "bad `thing`")])
