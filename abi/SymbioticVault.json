@@ -11,5 +11,29 @@
         "internalType": "uint256"
       }
     ]
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "uint48",
+        "name": "timestamp",
+        "type": "uint48"
+      },
+      {
+        "internalType": "bytes",
+        "name": "hints",
+        "type": "bytes"
+      }
+    ],
+    "name": "activeStakeAt",
+    "outputs": [
+      {
+        "internalType": "uint256",
+        "name": "",
+        "type": "uint256"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
   }
 ]

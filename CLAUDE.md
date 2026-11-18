@@ -169,6 +169,7 @@ so a default there would enter public history.
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
 | `ZG_BEACON_API` | 0G beacon API, read by the daily report for CL restaking balances | (required for daily_report) |
 | `BOT_LOG` / `RESTAKING_LOG` / `MONITOR_LOG` / `VAULT_MONITOR_LOG` | Logs the daily report reads | `/data/*.log` |
+| `RESTAKING_DB` | Restaking service SQLite DB; the daily report compares Ethereum stake at its commit watermark | `/data/0g-restaking-service/db` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
 | `FORCE_WITHDRAWAL` | Standalone `operator_bot.py` only: pull the **entire** target-chain position back. The scheduler passes `False` explicitly so a stray export cannot trigger it unattended | 0 |
 | `SOURCE_RATIO_D3` | Target source asset ratio (per mille) | 50 |

@@ -208,10 +208,12 @@ def healthy_chain():
         chain_ids={"0G": 16661, "Ethereum": 1},
         next_nonce={16661: 102, 1: 44},
         stakes=[
-            Stake("0", 4_623_989 * E18, 4_623_989 * E18, 4_623_989 * E18),
-            Stake("1", 4_487_990 * E18, 4_487_990 * E18, 4_487_990 * E18),
-            Stake("3", 4_487_990 * E18, 4_487_990 * E18, 4_487_990 * E18),
+            Stake("0", *[4_623_989 * E18] * 4),
+            Stake("1", *[4_487_990 * E18] * 4),
+            Stake("3", *[4_487_990 * E18] * 4),
         ],
+        relayed_block=26_438_832,
+        eth_head=26_438_960,
     )
     c.oracle_value = int(dr.share_price(c) * E18)
     return c
@@ -292,6 +294,58 @@ class TestRules(unittest.TestCase):
         self.assertEqual(f.level, RED)
         self.assertIn("validator 1", f.text)
 
+    def test_unrelayed_ethereum_change_is_not_a_mismatch(self):
+        """A withdrawal on Ethereum the service has not relayed yet moves the
+        head but not the relayed block: 0G and the CL are judged against the
+        latter."""
+        chain = healthy_chain()
+        for s in chain.stakes:
+            s.eth -= 16_830_000_000_000_000
+        self.assertEqual(run_eval(chain=chain), [])
+
+    def test_stake_mismatch_at_the_relayed_block(self):
+        chain = healthy_chain()
+        chain.stakes[2].eth_relayed -= 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, RED)
+        self.assertIn("validator 3 stake differs at block 26438832", f.text)
+
+    def test_stuck_relay(self):
+        chain = healthy_chain()
+        chain.eth_head = chain.relayed_block + dr.MAX_RELAY_LAG_BLOCKS
+        self.assertEqual(run_eval(chain=chain), [])
+        chain.eth_head += 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, RED)
+        self.assertIn("relayed Ethereum only to block 26438832", f.text)
+
+    def test_relayed_block_is_one_before_the_commit_watermark(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "db")
+            con = sqlite3.connect(path)
+            con.execute(
+                "CREATE TABLE t_progress (domain INTEGER, sync INTEGER, committed INTEGER)"
+            )
+            con.execute("INSERT INTO t_progress VALUES (0, 26439633, 26439633)")
+            con.commit()
+            con.close()
+            self.assertEqual(dr.read_relayed_block(path), 26439632)
+        with self.assertRaises(ValueError):
+            dr.read_relayed_block("")
+
+    def test_read_is_retried_while_the_watermark_moves(self):
+        marks = iter([10, 11, 11, 11])
+        reads = []
+        relayed, value = dr.read_at_stable_watermark(
+            lambda: next(marks), lambda: reads.append(1) or len(reads)
+        )
+        self.assertEqual((relayed, value), (11, 2))
+        moving = iter(range(100))
+        with self.assertRaises(RuntimeError):
+            dr.read_at_stable_watermark(lambda: next(moving), lambda: None)
+
     def test_untracked_cl_validator(self):
         chain = healthy_chain()
         chain.unexpected_cl = ["7"]
@@ -337,11 +391,11 @@ class TestRules(unittest.TestCase):
 
 
 class TestRender(unittest.TestCase):
-    def render(self, findings):
+    def render(self, findings, chain=None):
         return dr.render(
             findings,
             healthy_bot(),
-            healthy_chain(),
+            chain or healthy_chain(),
             PROCS,
             AGES,
             ServiceLogStats(),
@@ -357,6 +411,14 @@ class TestRender(unittest.TestCase):
         self.assertIn("✅ no issues", text)
         self.assertLessEqual(len(text), dr.TELEGRAM_LIMIT)
         self.assertEqual(text.count("```"), 2)
+
+    def test_stake_rows_show_the_relayed_block_and_what_is_in_flight(self):
+        chain = healthy_chain()
+        chain.stakes[0].eth -= 16_830_000_000_000_000
+        text = self.render([], chain)
+        self.assertIn("at block 26438832, head 26438960", text)
+        self.assertIn("4,623,989.000000 ok  relaying -0.016830", text)
+        self.assertEqual(text.count("relaying"), 1)
 
     def test_findings_lead_and_backticks_cannot_break_the_block(self):
         text = self.render([dr.Finding(RED, "bad `thing`")])

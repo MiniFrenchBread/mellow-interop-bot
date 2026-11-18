@@ -254,13 +254,23 @@ What it checks, and what it flags:
 | operator account | its nonce on either chain is ahead of the last one the bot logged -- something else signed with the key |
 | gas | operator below 20 OG / 0.05 ETH, restaking service below 2 OG |
 | source ratio | outside 0-10%, the band rebalance holds it in |
-| restaking stake | a validator's Symbiotic `activeStake`, 0G `RestakingStates` balance and CL restaking balance differ, or the CL has a restaking validator the config does not list |
+| restaking stake | a validator's Symbiotic `activeStake` at the last Ethereum block the restaking service relayed, its 0G `RestakingStates` balance and its CL restaking balance differ; the service has relayed nothing for over 300 blocks; or the CL has a restaking validator the config does not list |
 | target value | it differs from stake plus in-flight Mellow withdrawals |
 | service logs | warnings (502s counted apart), failed restaking transactions, failed vault-monitor checks |
 
 Addresses are under `daily-report` in `config.json`. The beacon API and the
 log paths come from the environment: `ZG_BEACON_API` (required),
-`BOT_LOG`, `RESTAKING_LOG`, `MONITOR_LOG`, `VAULT_MONITOR_LOG`.
+`BOT_LOG`, `RESTAKING_LOG`, `MONITOR_LOG`, `VAULT_MONITOR_LOG`, and
+`RESTAKING_DB`, the restaking service's SQLite database (opened read-only).
+
+Ethereum's stake is compared at the restaking service's commit watermark, not
+at the head. The service relays a block only after it is finalized plus a
+32-block buffer, so for 15-25 minutes after a deposit or withdrawal the head
+is ahead of 0G and the CL by design; comparing at the head flagged every
+rebalance that landed shortly before the report. The stake at that block
+is read with the vault's `activeStakeAt(timestamp)` checkpoint, so the RPC
+need not be an archive node. The difference still in flight is shown on the
+stake row as `relaying`.
 
 Run it from cron at a fixed time, for example:
 
