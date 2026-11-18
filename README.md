@@ -254,7 +254,7 @@ What it checks, and what it flags:
 | operator account | its nonce on either chain is ahead of the last one the bot logged -- something else signed with the key |
 | gas | operator below 20 OG / 0.05 ETH, restaking service below 2 OG |
 | source ratio | outside 0-10%, the band rebalance holds it in |
-| restaking stake | a validator's Symbiotic `activeStake` at the last Ethereum block the restaking service relayed, its 0G `RestakingStates` balance and its CL restaking balance differ; the service's commit watermark is more than 300 blocks behind the Ethereum head; or the CL has a restaking validator the config does not list |
+| restaking stake | a validator's 0G `RestakingStates` balance differs from its Symbiotic `activeStake` at the last Ethereum block the restaking service relayed, or its CL restaking balance differs from `activeStake` at the last block the CL synced; the service's or the CL's synced block is more than 300 blocks behind the Ethereum head; or the CL has a restaking validator the config does not list |
 | target value | it differs from stake plus in-flight Mellow withdrawals |
 | service logs | warnings (502s counted apart), failed restaking transactions, failed vault-monitor checks |
 
@@ -263,22 +263,23 @@ log paths come from the environment: `ZG_BEACON_API` (required),
 `BOT_LOG`, `RESTAKING_LOG`, `MONITOR_LOG`, `VAULT_MONITOR_LOG`, and
 `RESTAKING_DB`, the restaking service's SQLite database (opened read-only).
 
-Ethereum's stake is compared at the restaking service's commit watermark, not
-at the head. The service relays a block only after it is finalized plus a
-32-block buffer, so for 15-25 minutes after a deposit or withdrawal the head
-is ahead of 0G and the CL by design; comparing at the head flagged every
-rebalance that landed shortly before the report. The stake at that block
-is read with the vault's `activeStakeAt(timestamp)` checkpoint, so the RPC
-need not be an archive node. The difference still in flight is shown on the
-stake row as `relaying`.
+Ethereum's stake is not compared at the head. The restaking service (which
+writes 0G) and the CL each sync Symbiotic events on their own, taking a block
+only after it is finalized plus a 32-block buffer, so for 15-25 minutes after
+a deposit or withdrawal the head is ahead of both by design; comparing at the
+head flagged every rebalance that landed shortly before the report. Instead
+0G is compared at the service's commit watermark (the last block whose events
+are all on 0G), and the CL at its own `symbiotic_sync_height`, read from the
+same beacon state as its balances. The two are usually one block apart. The
+stake at each block is read with the vault's `activeStakeAt(timestamp)`
+checkpoint, so the RPC need not be an archive node. The difference still in
+flight is shown on the stake row as `relaying`.
 
-Even at that block a correct stake can disagree for a few seconds: the service
-lands a block's requests one transaction at a time and moves its watermark
-after the last one, and the CL fetches Symbiotic events on its own 30-second
-poll rather than following the service. A mismatch is therefore re-read after
-60 seconds, up to three times, before it is reported; the stake header says
-how many re-reads it took. A real discrepancy persists and is still reported,
-three minutes later.
+Even at the watermark 0G can disagree for a few seconds: the service lands a
+block's requests one transaction at a time and moves its watermark after the
+last one. A mismatch is therefore re-read after 60 seconds, up to three
+times, before it is reported; the stake header says how many re-reads it
+took. A real discrepancy persists and is still reported, three minutes later.
 
 Run it from cron at a fixed time, for example:
 

@@ -208,11 +208,12 @@ def healthy_chain():
         chain_ids={"0G": 16661, "Ethereum": 1},
         next_nonce={16661: 102, 1: 44},
         stakes=[
-            Stake("0", *[4_623_989 * E18] * 4),
-            Stake("1", *[4_487_990 * E18] * 4),
-            Stake("3", *[4_487_990 * E18] * 4),
+            Stake("0", *[4_623_989 * E18] * 5),
+            Stake("1", *[4_487_990 * E18] * 5),
+            Stake("3", *[4_487_990 * E18] * 5),
         ],
         relayed_block=26_438_832,
+        cl_block=26_438_833,
         eth_head=26_438_960,
     )
     c.oracle_value = int(dr.share_price(c) * E18)
@@ -303,21 +304,44 @@ class TestRules(unittest.TestCase):
             s.eth -= 16_830_000_000_000_000
         self.assertEqual(run_eval(chain=chain), [])
 
-    def test_stake_mismatch_at_the_relayed_block(self):
+    def test_zg_mismatch_at_the_relayed_block(self):
         chain = healthy_chain()
         chain.stakes[2].eth_relayed -= 1
         [f] = run_eval(chain=chain)
         self.assertEqual(f.level, RED)
-        self.assertIn("validator 3 stake differs at block 26438832", f.text)
+        self.assertIn("validator 3 0G stake differs", f.text)
+        self.assertIn("at block 26438832", f.text)
 
-    def test_stuck_relay(self):
+    def test_cl_mismatch_at_its_own_block(self):
         chain = healthy_chain()
-        chain.eth_head = chain.relayed_block + dr.MAX_RELAY_LAG_BLOCKS
-        self.assertEqual(run_eval(chain=chain), [])
-        chain.eth_head += 1
+        chain.stakes[0].cl -= 1
         [f] = run_eval(chain=chain)
         self.assertEqual(f.level, RED)
-        self.assertIn("relayed Ethereum only to block 26438832", f.text)
+        self.assertIn("validator 0 CL stake differs", f.text)
+        self.assertIn("at block 26438833", f.text)
+
+    def test_cl_one_block_ahead_of_the_service_is_not_a_mismatch(self):
+        """A withdrawal in the block the CL has synced and the service has
+        not: the CL is compared at its block, 0G at the service's."""
+        chain = healthy_chain()
+        for s in chain.stakes:
+            s.eth -= 16_830_000_000_000_000
+            s.eth_cl -= 16_830_000_000_000_000
+            s.cl -= 16_830_000_000_000_000
+        self.assertEqual(run_eval(chain=chain), [])
+
+    def test_stuck_relay_or_cl(self):
+        for attr, who in (("relayed_block", "restaking service"), ("cl_block", "CL")):
+            chain = healthy_chain()
+            chain.eth_head = 30_000_000
+            setattr(chain, "relayed_block", chain.eth_head)
+            setattr(chain, "cl_block", chain.eth_head)
+            setattr(chain, attr, chain.eth_head - dr.MAX_RELAY_LAG_BLOCKS)
+            self.assertEqual(run_eval(chain=chain), [])
+            setattr(chain, attr, getattr(chain, attr) - 1)
+            [f] = run_eval(chain=chain)
+            self.assertEqual(f.level, RED)
+            self.assertTrue(f.text.startswith(who + " has synced Ethereum"), f.text)
 
     def test_relayed_block_is_one_before_the_commit_watermark(self):
         import sqlite3
@@ -335,16 +359,59 @@ class TestRules(unittest.TestCase):
         with self.assertRaises(ValueError):
             dr.read_relayed_block("")
 
+    def test_watermark_db_is_opened_read_only(self):
+        """A read-write open would create a missing file; read-only fails."""
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "missing")
+            with self.assertRaises(sqlite3.OperationalError):
+                dr.read_relayed_block(path)
+            self.assertFalse(os.path.exists(path))
+
     def test_read_is_retried_while_the_watermark_moves(self):
         marks = iter([10, 11, 11, 11])
-        reads = []
+        reads, sleeps = [], []
         relayed, value = dr.read_at_stable_watermark(
-            lambda: next(marks), lambda: reads.append(1) or len(reads)
+            lambda: next(marks),
+            lambda: reads.append(1) or len(reads),
+            sleep=sleeps.append,
         )
         self.assertEqual((relayed, value), (11, 2))
+        self.assertEqual(sleeps, [dr.WATERMARK_RETRY_WAIT])
         moving = iter(range(100))
         with self.assertRaises(RuntimeError):
-            dr.read_at_stable_watermark(lambda: next(moving), lambda: None)
+            dr.read_at_stable_watermark(
+                lambda: next(moving), lambda: None, sleep=lambda _: None
+            )
+
+    def test_cl_state_is_parsed(self):
+        amount = 4_820_479_575_580_350_000_000_000
+        state = {
+            "symbiotic_sync_height": "26440017",
+            "symbiotic_balances": [
+                [{"collateral": "0xe4", "amount": list(amount.to_bytes(32, "big"))}],
+                [],
+                [
+                    {"collateral": "0xe4", "amount": list((1).to_bytes(32, "big"))},
+                    {"collateral": "0xe5", "amount": list((2).to_bytes(32, "big"))},
+                ],
+            ],
+        }
+        self.assertEqual(
+            dr.parse_cl_restaking(state), (26440017, {"0": amount, "2": 3})
+        )
+
+    def test_config_names_the_restaking_db(self):
+        import json
+
+        with open(dr.CONFIG_PATH) as f:
+            raw = json.load(f)["daily-report"]
+        os.environ.pop("RESTAKING_DB", None)
+        self.assertEqual(
+            dr._transform_config(raw)["restaking_db"],
+            "/data/0g-restaking-service/db",
+        )
 
     def test_untracked_cl_validator(self):
         chain = healthy_chain()
@@ -428,46 +495,56 @@ class _W3:
 
 
 class TestReadStakes(unittest.TestCase):
-    def test_reads_ethereum_at_the_relayed_blocks_timestamp(self):
+    def test_reads_each_side_at_its_own_block(self):
         log = []
+        # Stake at the relayed block's timestamp (12) and the CL's (24).
         vaults = {
-            "0": _Vault(5 * E18, {1_700_000_012: 7 * E18}, log),
-            "3": _Vault(6 * E18, {1_700_000_012: 8 * E18}, log),
+            "0": _Vault(5 * E18, {12: 7 * E18, 24: 6 * E18}, log),
+            "3": _Vault(6 * E18, {12: 8 * E18, 24: 8 * E18}, log),
         }
-        w3 = _W3(500, {99: 1_700_000_012})
+        w3 = _W3(500, {99: 12, 100: 24})
         marks = iter([100, 100])
 
         def zg_and_cl():
             log.append("zg_and_cl")
-            return {"0": 7 * E18, "3": 8 * E18}, {"0": 7 * E18, "3": 8 * E18, "9": 1}
+            return (
+                {"0": 7 * E18, "3": 8 * E18},
+                (100, {"0": 6 * E18, "3": 8 * E18, "9": 1}),
+            )
 
         read = dr.read_stakes(lambda: next(marks) - 1, zg_and_cl, w3, vaults)
-        self.assertEqual((read.relayed_block, read.eth_head), (99, 500))
         self.assertEqual(
-            [(s.index, s.eth, s.eth_relayed, s.zg, s.cl) for s in read.stakes],
+            (read.relayed_block, read.cl_block, read.eth_head), (99, 100, 500)
+        )
+        self.assertEqual(
             [
-                ("0", 5 * E18, 7 * E18, 7 * E18, 7 * E18),
-                ("3", 6 * E18, 8 * E18, 8 * E18, 8 * E18),
+                (s.index, s.eth, s.eth_relayed, s.zg, s.eth_cl, s.cl)
+                for s in read.stakes
+            ],
+            [
+                ("0", 5 * E18, 7 * E18, 7 * E18, 6 * E18, 6 * E18),
+                ("3", 6 * E18, 8 * E18, 8 * E18, 8 * E18, 8 * E18),
             ],
         )
         self.assertEqual(read.unexpected_cl, ["9"])
         self.assertTrue(read.consistent)
-        self.assertIn(("activeStakeAt", 1_700_000_012, b""), log)
+        self.assertIn(("activeStakeAt", 12, b""), log)
+        self.assertIn(("activeStakeAt", 24, b""), log)
         # 0G and the CL are read before any Ethereum stake.
         self.assertEqual(log[0], "zg_and_cl")
 
     def test_a_validator_missing_from_the_cl_reads_as_zero(self):
         vaults = {"1": _Vault(E18, {7: E18}, [])}
         read = dr.read_stakes(
-            lambda: 3, lambda: ({"1": E18}, {}), _W3(10, {3: 7}), vaults
+            lambda: 3, lambda: ({"1": E18}, (3, {})), _W3(10, {3: 7}), vaults
         )
         self.assertEqual(read.stakes[0].cl, 0)
         self.assertFalse(read.consistent)
 
 
 def _stake_read(consistent):
-    s = Stake("0", E18, E18, E18 if consistent else E18 - 1, E18)
-    return dr.StakeRead(1, 2, [s], [])
+    s = Stake("0", E18, E18 if consistent else E18 - 1, E18, E18, E18)
+    return dr.StakeRead(1, 2, 3, [s], [])
 
 
 class TestReadStakesSettled(unittest.TestCase):
@@ -523,7 +600,7 @@ class TestRender(unittest.TestCase):
         chain = healthy_chain()
         chain.stakes[0].eth -= 16_830_000_000_000_000
         text = self.render([], chain)
-        self.assertIn("at block 26438832, head 26438960", text)
+        self.assertIn("0g at 26438832, = cl at 26438833, head 26438960", text)
         self.assertIn("4,623,989.000000 ok  relaying -0.016830", text)
         self.assertEqual(text.count("relaying"), 1)
         self.assertNotIn("re-read", text)

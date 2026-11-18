@@ -64,19 +64,21 @@ MAX_PRICE_DRIFT_BPS = 5.0
 # net of queued withdrawals); outside them it acts on its next run.
 RATIO_BAND = (0.0, 0.10)
 MIN_GAS = {"operator_og": 20.0, "operator_eth": 0.05, "service_og": 2.0}
-# The restaking service relays an Ethereum block only once it is finalized
-# and 32 more blocks are finalized behind it, and scans every 32 blocks: it
-# normally trails the head by 100-170 blocks. This far behind (~1 h) it is
-# stuck, and the stake comparison is being made against an old block.
+# The restaking service and the CL each take an Ethereum block only once it
+# is finalized and 32 more are finalized behind it, a step of 32 blocks at a
+# time: both normally trail the head by about 100-160 blocks. Past this
+# (30-40 min more) one of them has stopped, or Ethereum is not finalizing;
+# either way its stake is being compared at an old block.
 MAX_RELAY_LAG_BLOCKS = 300
-# Even at the relayed block a correct stake can briefly disagree: the service
-# lands a block's requests one transaction at a time and moves its watermark
-# only after the last, so 0G can show part of a block for ~7 s per request;
-# and the CL fetches Symbiotic events on its own 30 s poll, not the service's
-# watermark. Both settle within a minute, so a mismatch is re-read after this
+# Even at the relayed block 0G can briefly disagree: the service lands a
+# block's requests one transaction at a time (~7 s each) and moves its
+# watermark only after the last, so 0G can already show part of the next
+# block. That settles within a minute, so a mismatch is re-read after this
 # wait, up to this many times, before it is reported.
 STAKE_RECHECK_WAIT = 60
 STAKE_RECHECKS = 3
+# Pause between reads of the service's watermark when it moved mid-read.
+WATERMARK_RETRY_WAIT = 10
 # Sum of activeStake plus in-flight Mellow withdrawals against the target value.
 MAX_RECON_GAP = 1.0
 # Last epochs summed for "settled, not yet claimed".
@@ -158,16 +160,21 @@ class Stake:
     eth: Optional[int] = None  # activeStake at the Ethereum head
     zg: Optional[int] = None
     cl: Optional[int] = None
-    # activeStake at the last Ethereum block the restaking service relayed --
-    # what 0G and the CL must equal. Differs from `eth` while a deposit or
-    # withdrawal is waiting for finality.
+    # activeStake at the last Ethereum block the restaking service relayed:
+    # what 0G must equal. Differs from `eth` while a deposit or withdrawal is
+    # waiting for finality.
     eth_relayed: Optional[int] = None
+    # activeStake at the last Ethereum block the CL has synced: what the CL
+    # must equal. The CL syncs Symbiotic events itself, not via the service,
+    # and runs about one block ahead of it.
+    eth_cl: Optional[int] = None
 
     @property
     def matches(self) -> bool:
         return (
-            None not in (self.eth_relayed, self.zg, self.cl)
-            and self.eth_relayed == self.zg == self.cl
+            None not in (self.eth_relayed, self.zg, self.eth_cl, self.cl)
+            and self.eth_relayed == self.zg
+            and self.eth_cl == self.cl
         )
 
 
@@ -190,8 +197,10 @@ class ChainFacts:
     next_nonce: Dict[int, int] = field(default_factory=dict)
     chain_ids: Dict[str, int] = field(default_factory=dict)
     stakes: List[Stake] = field(default_factory=list)
-    # Last Ethereum block the restaking service relayed, and the head then.
+    # Last Ethereum block the restaking service relayed, the last the CL
+    # synced, and the head then.
     relayed_block: Optional[int] = None
+    cl_block: Optional[int] = None
     eth_head: Optional[int] = None
     # Re-reads it took for the stakes to agree (or the most tried).
     stake_rechecks: int = 0
@@ -518,30 +527,41 @@ def evaluate(
                 )
             )
 
-    if chain.relayed_block is not None and chain.eth_head is not None:
-        lag = chain.eth_head - chain.relayed_block
+    for who, block in (
+        ("restaking service", chain.relayed_block),
+        ("CL", chain.cl_block),
+    ):
+        if block is None or chain.eth_head is None:
+            continue
+        lag = chain.eth_head - block
         if lag > MAX_RELAY_LAG_BLOCKS:
             out.append(
                 Finding(
                     RED,
-                    "restaking service has relayed Ethereum only to block {}, "
-                    "{} behind the head".format(chain.relayed_block, lag),
+                    "{} has synced Ethereum only to block {}, {} behind the "
+                    "head: it is stuck, or Ethereum is not finalizing".format(
+                        who, block, lag
+                    ),
                 )
             )
     for s in chain.stakes:
-        if None in (s.eth_relayed, s.zg, s.cl):
+        if None in (s.eth_relayed, s.zg, s.eth_cl, s.cl):
             continue
-        if not s.matches:
+        if s.eth_relayed != s.zg:
             out.append(
                 Finding(
                     RED,
-                    "validator {} stake differs at block {}: "
-                    "eth {} / 0g {} / cl {}".format(
-                        s.index,
-                        chain.relayed_block,
-                        _og(s.eth_relayed),
-                        _og(s.zg),
-                        _og(s.cl),
+                    "validator {} 0G stake differs: eth {} / 0g {} at block {}".format(
+                        s.index, _og(s.eth_relayed), _og(s.zg), chain.relayed_block
+                    ),
+                )
+            )
+        if s.eth_cl != s.cl:
+            out.append(
+                Finding(
+                    RED,
+                    "validator {} CL stake differs: eth {} / cl {} at block {}".format(
+                        s.index, _og(s.eth_cl), _og(s.cl), chain.cl_block
                     ),
                 )
             )
@@ -766,8 +786,9 @@ def render(
     )
 
     rows.append(
-        "Restaking stake (eth = 0g = cl at block {}, head {}{})".format(
+        "Restaking stake (eth = 0g at {}, = cl at {}, head {}{})".format(
             "-" if chain.relayed_block is None else chain.relayed_block,
+            "-" if chain.cl_block is None else chain.cl_block,
             "-" if chain.eth_head is None else chain.eth_head,
             (
                 ", re-read {}x".format(chain.stake_rechecks)
@@ -951,6 +972,7 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
             )
         )
         facts.relayed_block = read.relayed_block
+        facts.cl_block = read.cl_block
         facts.eth_head = read.eth_head
         facts.stakes = read.stakes
         facts.unexpected_cl = read.unexpected_cl
@@ -967,6 +989,7 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
 @dataclass
 class StakeRead:
     relayed_block: int
+    cl_block: int
     eth_head: int
     stakes: List[Stake]
     unexpected_cl: List[str]
@@ -976,25 +999,31 @@ class StakeRead:
         return all(s.matches for s in self.stakes)
 
 
-def read_stakes(read_watermark, read_zg_and_cl, eth, vaults) -> StakeRead:
+def read_stakes(
+    read_watermark, read_zg_and_cl, eth, vaults, sleep=time.sleep
+) -> StakeRead:
     """One read of every validator's stake on all three sides. `vaults` maps
-    a validator index to its Symbiotic vault's contract functions."""
-    relayed, (zg_bal, cl) = read_at_stable_watermark(read_watermark, read_zg_and_cl)
+    a validator index to its Symbiotic vault's contract functions;
+    `read_zg_and_cl` returns 0G balances and `(cl_block, cl_balances)`."""
+    relayed, (zg_bal, (cl_block, cl)) = read_at_stable_watermark(
+        read_watermark, read_zg_and_cl, sleep=sleep
+    )
     head = eth.eth.block_number
-    # The vault checkpoints its stake by timestamp, so the value at the
-    # relayed block is read from current state -- no archive node needed.
-    # One Ethereum block per timestamp: this is the stake after that block.
-    relayed_ts = eth.eth.get_block(relayed)["timestamp"]
+    # The vault checkpoints its stake by timestamp, so the value at a past
+    # block is read from current state -- no archive node needed. One
+    # Ethereum block per timestamp: this is the stake after that block.
+    ts = {b: eth.eth.get_block(b)["timestamp"] for b in {relayed, cl_block}}
     stakes = []
     for index, vault_fns in vaults.items():
         s = Stake(index=index)
         s.eth = vault_fns.activeStake().call()
-        s.eth_relayed = vault_fns.activeStakeAt(relayed_ts, b"").call()
+        s.eth_relayed = vault_fns.activeStakeAt(ts[relayed], b"").call()
+        s.eth_cl = vault_fns.activeStakeAt(ts[cl_block], b"").call()
         s.zg = zg_bal[index]
         s.cl = cl.get(index, 0)
         stakes.append(s)
     unexpected = sorted((i for i in cl if i not in vaults), key=int)
-    return StakeRead(relayed, head, stakes, unexpected)
+    return StakeRead(relayed, cl_block, head, stakes, unexpected)
 
 
 def read_stakes_settled(
@@ -1006,7 +1035,8 @@ def read_stakes_settled(
     """Read the stakes; while they disagree, wait and read again. Returns the
     last read and how many re-reads were made. A real discrepancy -- an event
     the service never relays, a slash -- does not go away, so it is still
-    reported, only `wait * rechecks` later."""
+    reported, only `wait * rechecks` later. A read that raises is not retried:
+    the error is reported as it is."""
     read = read_once()
     done = 0
     while not read.consistent and done < rechecks:
@@ -1016,11 +1046,20 @@ def read_stakes_settled(
     return read, done
 
 
-def read_at_stable_watermark(read_watermark, read, attempts: int = 3):
+def read_at_stable_watermark(
+    read_watermark,
+    read,
+    attempts: int = 3,
+    wait: float = WATERMARK_RETRY_WAIT,
+    sleep=time.sleep,
+):
     """Run `read` between two reads of the service's watermark and return
     both. If the watermark moved, a relay landed in between and `read` may
-    already include a block past the one it is compared at, so try again."""
-    for _ in range(attempts):
+    already include a block past the one it is compared at, so pause and try
+    again: the service moves its watermark in bursts between receipt waits."""
+    for attempt in range(attempts):
+        if attempt:
+            sleep(wait)
         before = read_watermark()
         value = read()
         if read_watermark() == before:
@@ -1050,20 +1089,30 @@ def read_relayed_block(db_path: str) -> int:
     return int(row[0]) - 1
 
 
-def read_cl_restaking(beacon_api: str) -> Dict[str, int]:
+def read_cl_restaking(beacon_api: str) -> Tuple[int, Dict[str, int]]:
+    """The CL's restaking balances and the last Ethereum block it has synced
+    Symbiotic events through, both from one head state so they agree."""
     if not beacon_api:
         raise ValueError("ZG_BEACON_API is not set")
-    url = beacon_api.rstrip("/") + "/eth/v1/beacon/states/head/validator_balances"
+    url = beacon_api.rstrip("/") + "/eth/v2/debug/beacon/states/head"
     # The beacon node sits on a private address; a proxy configured for the
     # host must not be used to reach it.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(url, timeout=30) as resp:
-        data = json.load(resp)["data"]
-    return {
-        str(v["index"]): sum(int(e["amount"]) for e in v["symbiotic_balance"])
-        for v in data
-        if v.get("symbiotic_balance")
+        state = json.load(resp)["data"]
+    return parse_cl_restaking(state)
+
+
+def parse_cl_restaking(state: dict) -> Tuple[int, Dict[str, int]]:
+    # `symbiotic_balances` is indexed by validator; each amount is a 32-byte
+    # big-endian integer. `symbiotic_sync_height` is inclusive: a block body
+    # carries the Symbiotic requests of (previous height, new height].
+    balances = {
+        str(index): sum(int.from_bytes(bytes(e["amount"]), "big") for e in entries)
+        for index, entries in enumerate(state["symbiotic_balances"])
+        if entries
     }
+    return int(state["symbiotic_sync_height"]), balances
 
 
 def load_report_config(config: Config) -> dict:
