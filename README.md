@@ -265,7 +265,7 @@ log paths come from the environment: `ZG_BEACON_API` (required),
 
 Ethereum's stake is not compared at the head. The restaking service (which
 writes 0G) and the CL each sync Symbiotic events on their own, taking a block
-only after it is finalized plus a 32-block buffer, so for 15-25 minutes after
+only after it is finalized plus a 32-block buffer, so for 20-30 minutes after
 a deposit or withdrawal the head is ahead of both by design; comparing at the
 head flagged every rebalance that landed shortly before the report. Instead
 0G is compared at the service's commit watermark (the last block whose events
@@ -280,6 +280,10 @@ block's requests one transaction at a time and moves its watermark after the
 last one. A mismatch is therefore re-read after 60 seconds, up to three
 times, before it is reported; the stake header says how many re-reads it
 took. A real discrepancy persists and is still reported, three minutes later.
+If 0G still differs while the service has scanned blocks it has not finished
+committing, the service is mid-block and the finding is yellow; should it never
+finish, its watermark stops and the lag check turns red. If a re-read fails,
+the read before it is shown, with a yellow note.
 
 Run it from cron at a fixed time, for example:
 

@@ -202,6 +202,11 @@ class ChainFacts:
     relayed_block: Optional[int] = None
     cl_block: Optional[int] = None
     eth_head: Optional[int] = None
+    # Last block the service has scanned. Above `relayed_block` it still has
+    # requests to land on 0G, and may have landed some of them already.
+    scanned_block: Optional[int] = None
+    # Why a re-read failed; the stakes shown are from the read before it.
+    stake_reread_error: Optional[str] = None
     # Re-reads it took for the stakes to agree (or the most tried).
     stake_rechecks: int = 0
     unexpected_cl: List[str] = field(default_factory=list)
@@ -548,11 +553,30 @@ def evaluate(
         if None in (s.eth_relayed, s.zg, s.eth_cl, s.cl):
             continue
         if s.eth_relayed != s.zg:
+            # The service lands a block's requests one at a time and moves its
+            # watermark after the last, so while it is still committing 0G
+            # can hold part of the next block. If it never finishes, its
+            # watermark stops and the lag check above turns red.
+            committing = (
+                chain.scanned_block is not None
+                and chain.relayed_block is not None
+                and chain.scanned_block > chain.relayed_block
+            )
             out.append(
                 Finding(
-                    RED,
-                    "validator {} 0G stake differs: eth {} / 0g {} at block {}".format(
-                        s.index, _og(s.eth_relayed), _og(s.zg), chain.relayed_block
+                    YELLOW if committing else RED,
+                    "validator {} 0G stake differs: eth {} / 0g {} at block {}{}".format(
+                        s.index,
+                        _og(s.eth_relayed),
+                        _og(s.zg),
+                        chain.relayed_block,
+                        (
+                            "; the service is still committing up to block {}".format(
+                                chain.scanned_block
+                            )
+                            if committing
+                            else ""
+                        ),
                     ),
                 )
             )
@@ -570,6 +594,14 @@ def evaluate(
             Finding(
                 RED,
                 "CL validator {} has restaking stake but is not tracked".format(idx),
+            )
+        )
+    if chain.stake_reread_error:
+        out.append(
+            Finding(
+                YELLOW,
+                "restaking stake re-read failed, showing the read before it: "
+                "{}".format(chain.stake_reread_error),
             )
         )
     gap = recon_gap(chain)
@@ -963,20 +995,25 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
             }
             return zg_bal, cl
 
-        read, rechecks = read_stakes_settled(
+        read, rechecks, reread_error = read_stakes_settled(
             lambda: read_stakes(
-                lambda: read_relayed_block(report["restaking_db"]),
+                lambda: read_service_progress(report["restaking_db"]),
                 zg_and_cl,
                 eth,
                 vaults,
             )
         )
         facts.relayed_block = read.relayed_block
+        facts.scanned_block = read.scanned_block
         facts.cl_block = read.cl_block
         facts.eth_head = read.eth_head
         facts.stakes = read.stakes
         facts.unexpected_cl = read.unexpected_cl
         facts.stake_rechecks = rechecks
+        if reread_error is not None:
+            facts.stake_reread_error = mask_all_sensitive_config_data(
+                str(reread_error), config
+            )[:160]
 
     attempt("vault", vault)
     attempt("withdrawal queue", queue)
@@ -989,6 +1026,7 @@ def collect_chain(config: Config, report: dict, now: float) -> ChainFacts:
 @dataclass
 class StakeRead:
     relayed_block: int
+    scanned_block: int
     cl_block: int
     eth_head: int
     stakes: List[Stake]
@@ -1005,7 +1043,7 @@ def read_stakes(
     """One read of every validator's stake on all three sides. `vaults` maps
     a validator index to its Symbiotic vault's contract functions;
     `read_zg_and_cl` returns 0G balances and `(cl_block, cl_balances)`."""
-    relayed, (zg_bal, (cl_block, cl)) = read_at_stable_watermark(
+    (relayed, scanned), (zg_bal, (cl_block, cl)) = read_at_stable_watermark(
         read_watermark, read_zg_and_cl, sleep=sleep
     )
     head = eth.eth.block_number
@@ -1023,7 +1061,7 @@ def read_stakes(
         s.cl = cl.get(index, 0)
         stakes.append(s)
     unexpected = sorted((i for i in cl if i not in vaults), key=int)
-    return StakeRead(relayed, cl_block, head, stakes, unexpected)
+    return StakeRead(relayed, scanned, cl_block, head, stakes, unexpected)
 
 
 def read_stakes_settled(
@@ -1031,19 +1069,22 @@ def read_stakes_settled(
     wait: float = STAKE_RECHECK_WAIT,
     rechecks: int = STAKE_RECHECKS,
     sleep=time.sleep,
-) -> Tuple[StakeRead, int]:
+) -> Tuple[StakeRead, int, Optional[Exception]]:
     """Read the stakes; while they disagree, wait and read again. Returns the
-    last read and how many re-reads were made. A real discrepancy -- an event
-    the service never relays, a slash -- does not go away, so it is still
-    reported, only `wait * rechecks` later. A read that raises is not retried:
-    the error is reported as it is."""
+    last good read, how many re-reads were made, and the error that stopped
+    them, if one did. A real discrepancy -- an event the service never
+    relays, a slash -- does not go away, so it is still reported, only
+    `wait * rechecks` later. The first read's error is raised as it is."""
     read = read_once()
     done = 0
     while not read.consistent and done < rechecks:
         sleep(wait)
-        read = read_once()
         done += 1
-    return read, done
+        try:
+            read = read_once()
+        except Exception as e:
+            return read, done, e
+    return read, done, None
 
 
 def read_at_stable_watermark(
@@ -1067,9 +1108,10 @@ def read_at_stable_watermark(
     raise RuntimeError("restaking service kept relaying while being read")
 
 
-def read_relayed_block(db_path: str) -> int:
-    """Last Ethereum block whose restaking events the service has committed
-    to 0G: its `t_progress.committed` is the next block to commit."""
+def read_service_progress(db_path: str) -> Tuple[int, int]:
+    """The last Ethereum block whose restaking events the service has all
+    committed to 0G, and the last it has scanned. Its `t_progress` stores the
+    next block of each: `committed` and `sync`."""
     if not db_path:
         raise ValueError("RESTAKING_DB is not set")
     import sqlite3
@@ -1080,13 +1122,13 @@ def read_relayed_block(db_path: str) -> int:
     con = sqlite3.connect("file:{}?mode=ro".format(db_path), uri=True, timeout=10)
     try:
         row = con.execute(
-            "SELECT committed FROM t_progress WHERE domain = 0"
+            "SELECT committed, sync FROM t_progress WHERE domain = 0"
         ).fetchone()
     finally:
         con.close()
     if row is None:
         raise ValueError("restaking service has no Symbiotic progress")
-    return int(row[0]) - 1
+    return int(row[0]) - 1, int(row[1]) - 1
 
 
 def read_cl_restaking(beacon_api: str) -> Tuple[int, Dict[str, int]]:

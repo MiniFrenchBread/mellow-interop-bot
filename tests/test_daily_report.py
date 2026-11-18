@@ -311,6 +311,19 @@ class TestRules(unittest.TestCase):
         self.assertEqual(f.level, RED)
         self.assertIn("validator 3 0G stake differs", f.text)
         self.assertIn("at block 26438832", f.text)
+        # Scanned up to the relayed block: nothing left to commit.
+        chain.scanned_block = chain.relayed_block
+        self.assertEqual(run_eval(chain=chain)[0].level, RED)
+
+    def test_zg_mismatch_while_the_service_is_committing_is_a_note(self):
+        """The service has scanned past its watermark and is landing that
+        block's requests one by one; 0G can hold part of it."""
+        chain = healthy_chain()
+        chain.scanned_block = chain.relayed_block + 32
+        chain.stakes[2].zg -= 1
+        [f] = run_eval(chain=chain)
+        self.assertEqual(f.level, YELLOW)
+        self.assertIn("still committing up to block 26438864", f.text)
 
     def test_cl_mismatch_at_its_own_block(self):
         chain = healthy_chain()
@@ -343,7 +356,7 @@ class TestRules(unittest.TestCase):
             self.assertEqual(f.level, RED)
             self.assertTrue(f.text.startswith(who + " has synced Ethereum"), f.text)
 
-    def test_relayed_block_is_one_before_the_commit_watermark(self):
+    def test_service_progress_is_one_before_each_cursor(self):
         import sqlite3
 
         with tempfile.TemporaryDirectory() as d:
@@ -352,12 +365,12 @@ class TestRules(unittest.TestCase):
             con.execute(
                 "CREATE TABLE t_progress (domain INTEGER, sync INTEGER, committed INTEGER)"
             )
-            con.execute("INSERT INTO t_progress VALUES (0, 26439633, 26439633)")
+            con.execute("INSERT INTO t_progress VALUES (0, 26439665, 26439633)")
             con.commit()
             con.close()
-            self.assertEqual(dr.read_relayed_block(path), 26439632)
+            self.assertEqual(dr.read_service_progress(path), (26439632, 26439664))
         with self.assertRaises(ValueError):
-            dr.read_relayed_block("")
+            dr.read_service_progress("")
 
     def test_watermark_db_is_opened_read_only(self):
         """A read-write open would create a missing file; read-only fails."""
@@ -366,7 +379,7 @@ class TestRules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "missing")
             with self.assertRaises(sqlite3.OperationalError):
-                dr.read_relayed_block(path)
+                dr.read_service_progress(path)
             self.assertFalse(os.path.exists(path))
 
     def test_read_is_retried_while_the_watermark_moves(self):
@@ -512,9 +525,10 @@ class TestReadStakes(unittest.TestCase):
                 (100, {"0": 6 * E18, "3": 8 * E18, "9": 1}),
             )
 
-        read = dr.read_stakes(lambda: next(marks) - 1, zg_and_cl, w3, vaults)
+        read = dr.read_stakes(lambda: (next(marks) - 1, 131), zg_and_cl, w3, vaults)
         self.assertEqual(
-            (read.relayed_block, read.cl_block, read.eth_head), (99, 100, 500)
+            (read.relayed_block, read.scanned_block, read.cl_block, read.eth_head),
+            (99, 131, 100, 500),
         )
         self.assertEqual(
             [
@@ -536,7 +550,7 @@ class TestReadStakes(unittest.TestCase):
     def test_a_validator_missing_from_the_cl_reads_as_zero(self):
         vaults = {"1": _Vault(E18, {7: E18}, [])}
         read = dr.read_stakes(
-            lambda: 3, lambda: ({"1": E18}, (3, {})), _W3(10, {3: 7}), vaults
+            lambda: (3, 3), lambda: ({"1": E18}, (3, {})), _W3(10, {3: 7}), vaults
         )
         self.assertEqual(read.stakes[0].cl, 0)
         self.assertFalse(read.consistent)
@@ -544,34 +558,61 @@ class TestReadStakes(unittest.TestCase):
 
 def _stake_read(consistent):
     s = Stake("0", E18, E18 if consistent else E18 - 1, E18, E18, E18)
-    return dr.StakeRead(1, 2, 3, [s], [])
+    return dr.StakeRead(1, 1, 2, 3, [s], [])
 
 
 class TestReadStakesSettled(unittest.TestCase):
     def test_consistent_read_is_not_repeated(self):
         sleeps = []
         reads = iter([_stake_read(True)])
-        read, n = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        read, n, err = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertIsNone(err)
         self.assertTrue(read.consistent)
         self.assertEqual((n, sleeps), (0, []))
 
     def test_transient_mismatch_settles_after_a_wait(self):
         sleeps = []
         reads = iter([_stake_read(False), _stake_read(True)])
-        read, n = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        read, n, err = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertIsNone(err)
         self.assertTrue(read.consistent)
         self.assertEqual((n, sleeps), (1, [dr.STAKE_RECHECK_WAIT]))
 
     def test_persistent_mismatch_is_returned_after_the_last_recheck(self):
         sleeps = []
         reads = iter([_stake_read(False)] * (dr.STAKE_RECHECKS + 1))
-        read, n = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        read, n, err = dr.read_stakes_settled(lambda: next(reads), sleep=sleeps.append)
+        self.assertIsNone(err)
         self.assertFalse(read.consistent)
         self.assertEqual(n, dr.STAKE_RECHECKS)
         self.assertEqual(len(sleeps), dr.STAKE_RECHECKS)
         chain = healthy_chain()
         chain.stakes = read.stakes
         self.assertEqual(run_eval(chain=chain)[0].level, RED)
+
+    def test_failed_reread_keeps_the_read_before_it(self):
+        first = _stake_read(False)
+
+        def reads():
+            yield first
+            raise RuntimeError("beacon down")
+
+        it = reads()
+        read, n, err = dr.read_stakes_settled(lambda: next(it), sleep=lambda _: None)
+        self.assertIs(read, first)
+        self.assertEqual((n, str(err)), (1, "beacon down"))
+        chain = healthy_chain()
+        chain.stakes = read.stakes
+        chain.stake_reread_error = str(err)
+        levels = {f.level for f in run_eval(chain=chain)}
+        self.assertEqual(levels, {RED, YELLOW})
+
+    def test_failed_first_read_raises(self):
+        def boom():
+            raise RuntimeError("db locked")
+
+        with self.assertRaises(RuntimeError):
+            dr.read_stakes_settled(boom, sleep=lambda _: None)
 
 
 class TestRender(unittest.TestCase):

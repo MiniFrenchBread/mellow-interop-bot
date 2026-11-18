@@ -167,7 +167,7 @@ so a default there would enter public history.
 | `POST_ASCEND_GAP_SECONDS` | Wait between ascend and the oracle write. Deposits in it price against the old share price, so keep it short; it must exceed `SECURE_INTERVAL` (15s) or the write reads a pre-distribution block. ≤15 is rejected | 20 |
 | `ALERT_AFTER_FAILURES` | Consecutive failures before a Telegram alert, and how often it repeats after that | 3 |
 | `SCHEDULER_STATE_FILE` | Where the scheduler records each task's last run, so a restart cannot skip a due slot | `.scheduler-state.json` |
-| `ZG_BEACON_API` | 0G beacon API, read by the daily report for CL restaking balances | (required for daily_report) |
+| `ZG_BEACON_API` | 0G beacon API. The daily report reads the head state's `symbiotic_balances` and `symbiotic_sync_height` from its debug endpoint | (required for daily_report) |
 | `BOT_LOG` / `RESTAKING_LOG` / `MONITOR_LOG` / `VAULT_MONITOR_LOG` | Logs the daily report reads | `/data/*.log` |
 | `RESTAKING_DB` | Restaking service SQLite DB; the daily report compares Ethereum stake at its commit watermark | `/data/0g-restaking-service/db` |
 | `DEPLOYMENTS` | Comma-separated SOURCE:SYMBOL pairs | (required for operator_bot) |
